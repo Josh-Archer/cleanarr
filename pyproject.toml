@@ -23,8 +23,5 @@ dependencies = [
 [project.optional-dependencies]
 dev = ["flake8>=7.1"]
 
-[tool.setuptools]
-py-modules = ["cleanarr", "cleanarr_webhook"]
-
 [tool.setuptools.packages.find]
 where = ["."]

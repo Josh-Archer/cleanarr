@@ -3,7 +3,7 @@ import os
 import unittest
 from unittest.mock import MagicMock, patch
 
-# Mock external dependencies before importing cleanarr
+# Mock external dependencies before importing the runtime package
 sys.modules["plexapi"] = MagicMock()
 sys.modules["plexapi.server"] = MagicMock()
 sys.modules["transmission_rpc"] = MagicMock()
@@ -19,7 +19,7 @@ repo_root = os.path.dirname(current_dir)
 if repo_root not in sys.path:
     sys.path.append(repo_root)
 
-import cleanarr
+from cleanarr_runtime import cleanup as cleanarr
 
 class TestCleanarrFeature(unittest.TestCase):
     def setUp(self):

@@ -13,6 +13,7 @@ This repository is intended to be public-safe. Cluster-specific manifests, secre
 - `ghcr.io/<owner>/cleanarr-runtime-webhook`
 
 Stable releases use semver tags such as `v0.1.0`. Release publishing should happen from semver tags after the documented review gates are approved.
+Public pull requests stay on GitHub-hosted runners. Pushes and releases can opt into self-hosted runners by setting `USE_SELF_HOSTED=true` and `SELF_HOSTED_RUNNER_LABEL=<label>`.
 
 ## Quick Start
 
@@ -54,7 +55,7 @@ Private downstream repo:
 - `vMAJOR.MINOR` convenience tags
 - `sha-<commit>` immutable build tags
 
-Breaking changes to environment variables, image names, or harness behavior require a major release.
+Breaking changes to environment variables, image names, or harness behavior require a major release. The package version is sourced from `pyproject.toml` and exposed at runtime via package metadata.
 
 ## Documentation
 

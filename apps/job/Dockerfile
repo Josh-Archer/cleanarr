@@ -9,7 +9,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libffi-dev \
     && rm -rf /var/lib/apt/lists/*
 
-COPY pyproject.toml README.md cleanarr.py cleanarr_webhook.py ./
+COPY pyproject.toml README.md ./
 COPY cleanarr_runtime ./cleanarr_runtime
 COPY apps/job ./apps/job
 

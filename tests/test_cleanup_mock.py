@@ -4,13 +4,13 @@ import sys
 import os
 import tempfile
 
-# Ensure we can import cleanarr
+# Ensure we can import the runtime package
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 # Set env var for log file to avoid permission error
 os.environ['CLEANARR_LOG_FILE'] = os.path.join(tempfile.gettempdir(), 'cleanarr_test.log')
 
-import cleanarr
+from cleanarr_runtime import cleanup as cleanarr
 
 class TestMediaCleanup(unittest.TestCase):
 

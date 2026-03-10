@@ -12,7 +12,7 @@ if repo_root not in sys.path:
 # Set env var for log file to avoid permission error
 os.environ['CLEANARR_LOG_FILE'] = os.path.join(tempfile.gettempdir(), 'cleanarr_test.log')
 
-import cleanarr
+from cleanarr_runtime import cleanup as cleanarr
 
 class TestMediaCleanup(unittest.TestCase):
 

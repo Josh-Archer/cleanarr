@@ -21,11 +21,15 @@ jobs:
         shell: bash
         env:
           USE_SELF_HOSTED: ${{ vars.USE_SELF_HOSTED }}
+          SELF_HOSTED_RUNNER_LABEL: ${{ vars.SELF_HOSTED_RUNNER_LABEL }}
+          EVENT_NAME: ${{ github.event_name }}
         run: |
           set -euo pipefail
 
-          if [ "${USE_SELF_HOSTED}" = "true" ]; then
-            echo "runner-label=home-gh-runner-cleanarr-runtime" >> "$GITHUB_OUTPUT"
+          if [ "${EVENT_NAME}" = "pull_request" ]; then
+            echo "runner-label=ubuntu-latest" >> "$GITHUB_OUTPUT"
+          elif [ "${USE_SELF_HOSTED}" = "true" ] && [ -n "${SELF_HOSTED_RUNNER_LABEL}" ]; then
+            echo "runner-label=${SELF_HOSTED_RUNNER_LABEL}" >> "$GITHUB_OUTPUT"
           else
             echo "runner-label=ubuntu-latest" >> "$GITHUB_OUTPUT"
           fi

@@ -536,19 +536,17 @@ def healthz():
 def plex_webhook():
     # Verify authentication token if configured
     if WEBHOOK_SECRET:
-        token_qs = request.args.get('token')
         token_header = request.headers.get('X-Cleanarr-Webhook-Token') or request.headers.get('X-Webhook-Token')
         token_ok = (
-            (token_qs == WEBHOOK_SECRET)
-            or (token_header == WEBHOOK_SECRET)
-            or (WEBHOOK_SECRET_PREVIOUS and (token_qs == WEBHOOK_SECRET_PREVIOUS or token_header == WEBHOOK_SECRET_PREVIOUS))
+            (token_header == WEBHOOK_SECRET)
+            or (WEBHOOK_SECRET_PREVIOUS and token_header == WEBHOOK_SECRET_PREVIOUS)
         )
         if not token_ok:
             logger.warning(f"Unauthorized webhook attempt from {request.remote_addr}")
             return jsonify({"status": "error", "message": "Unauthorized"}), 401
 
-    # Do not log raw request bodies. Plex sends multipart data and query-string
-    # secrets can show up in infra-level request logs.
+    # Do not log raw request bodies. Plex sends multipart data and webhook secrets
+    # should only arrive via headers, not query parameters that bleed into access logs.
     logger.info(
         "Received request: %s %s from %s content_type=%s content_length=%s",
         request.method,

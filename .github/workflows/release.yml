@@ -4,6 +4,11 @@ on:
   push:
     tags: ["v*.*.*"]
   workflow_dispatch:
+    inputs:
+      release_tag:
+        description: Existing semver tag to publish, for example v0.1.0
+        required: true
+        type: string
 
 permissions:
   contents: read
@@ -20,9 +25,9 @@ jobs:
     needs: runner
     runs-on: ${{ needs.runner.outputs.runner-label }}
     env:
-      RELEASE_TAG: ${{ github.ref_name }}
-      ARCH_OK: ${{ vars.ARCHITECTURE_REVIEW_APPROVED }}
-      SEC_OK: ${{ vars.SECURITY_REVIEW_APPROVED }}
+      RELEASE_TAG: ${{ inputs.release_tag || github.ref_name }}
+      ARCH_REVIEW_TAG: ${{ vars.ARCHITECTURE_REVIEW_TAG }}
+      SEC_REVIEW_TAG: ${{ vars.SECURITY_REVIEW_TAG }}
     strategy:
       fail-fast: false
       matrix:
@@ -33,6 +38,8 @@ jobs:
             dockerfile: apps/webhook/Dockerfile
     steps:
       - uses: actions/checkout@v6
+        with:
+          ref: ${{ env.RELEASE_TAG }}
       - uses: actions/setup-python@v6
         with:
           python-version: "3.14"
@@ -40,8 +47,9 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          test "${ARCH_OK}" = "true"
-          test "${SEC_OK}" = "true"
+          [[ "${RELEASE_TAG}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]
+          test "${ARCH_REVIEW_TAG}" = "${RELEASE_TAG}"
+          test "${SEC_REVIEW_TAG}" = "${RELEASE_TAG}"
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
