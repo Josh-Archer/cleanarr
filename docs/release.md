@@ -4,6 +4,7 @@
 2. Complete the architecture and security review gates.
 3. Set repository variables `ARCHITECTURE_REVIEW_APPROVED=true` and `SECURITY_REVIEW_APPROVED=true`.
 4. Set `USE_SELF_HOSTED=true` if the repo should use the same self-hosted runner class as `home`.
+   The runner selector falls back to `ubuntu-latest` until the repository has access to an online self-hosted runner.
 5. Tag a release with `vMAJOR.MINOR.PATCH` that matches `pyproject.toml`.
 6. Let `release.yml` publish:
    - `vMAJOR.MINOR.PATCH`
