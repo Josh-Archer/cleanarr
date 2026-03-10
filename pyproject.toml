@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "cleanarr-runtime"
+version = "0.1.0"
+description = "Reusable Plex/Sonarr/Radarr cleanup runtime with cronjob and webhook harnesses."
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+authors = [{ name = "Cleanarr Runtime Contributors" }]
+dependencies = [
+  "flask>=3.0",
+  "loguru>=0.7",
+  "plexapi>=4.17",
+  "python-dotenv>=1.0",
+  "python-logging-loki>=0.3.1",
+  "requests>=2.32",
+  "transmission-rpc>=7.0",
+]
+
+[project.optional-dependencies]
+dev = ["flake8>=7.1"]
+
+[tool.setuptools]
+py-modules = ["cleanarr", "cleanarr_webhook"]
+
+[tool.setuptools.packages.find]
+where = ["."]

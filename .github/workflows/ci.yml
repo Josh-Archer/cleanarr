@@ -1,0 +1,64 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+jobs:
+  runner:
+    uses: ./.github/workflows/runner-selector.yml
+
+  test:
+    needs: runner
+    runs-on: ${{ needs.runner.outputs.runner-label }}
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.14"
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e .[dev]
+      - name: Public safety scan
+        run: python scripts/check_public_safety.py
+      - name: Run unit tests
+        run: python -m unittest discover -s tests
+      - name: Run flake8
+        run: flake8 cleanarr_runtime apps tests --count --select=E9,F63,F7,F82 --show-source --statistics
+      - name: Update job summary
+        if: always()
+        env:
+          JOB_TITLE: ${{ job.name || github.job }}
+          JOB_STATUS: ${{ job.status }}
+          EVENT_NAME: ${{ github.event_name }}
+          REF: ${{ github.ref }}
+          SHA: ${{ github.sha }}
+          RUN_NUMBER: ${{ github.run_number }}
+        run: bash .github/scripts/write_job_summary.sh
+
+  docker-build:
+    needs: runner
+    runs-on: ${{ needs.runner.outputs.runner-label }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - image: cleanarr-runtime-job
+            file: apps/job/Dockerfile
+          - image: cleanarr-runtime-webhook
+            file: apps/webhook/Dockerfile
+    steps:
+      - uses: actions/checkout@v6
+      - uses: docker/setup-qemu-action@v4
+      - uses: docker/setup-buildx-action@v4
+      - name: Build image
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: ${{ matrix.file }}
+          push: false
+          tags: ${{ matrix.image }}:ci
+          cache-from: type=gha
+          cache-to: type=gha,mode=max

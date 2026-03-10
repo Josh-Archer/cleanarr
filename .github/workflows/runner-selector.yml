@@ -1,0 +1,24 @@
+name: Runner Selector
+
+on:
+  workflow_call:
+    outputs:
+      runner-label:
+        description: Runner label for this repository.
+        value: ${{ jobs.select-runner.outputs.runner-label }}
+
+jobs:
+  select-runner:
+    runs-on: ubuntu-latest
+    outputs:
+      runner-label: ${{ steps.set-runner.outputs.runner-label }}
+    steps:
+      - id: set-runner
+        shell: bash
+        run: |
+          if [ "${{ vars.USE_SELF_HOSTED }}" = "true" ]; then
+            echo "runner-label=home-gh-runner" >> "$GITHUB_OUTPUT"
+          else
+            echo "runner-label=ubuntu-latest" >> "$GITHUB_OUTPUT"
+          fi
+

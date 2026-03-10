@@ -1,0 +1,53 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: cleanarr-webhook
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: cleanarr-webhook
+  template:
+    metadata:
+      labels:
+        app: cleanarr-webhook
+    spec:
+      containers:
+      - name: cleanarr-webhook
+        image: ghcr.io/example/cleanarr-runtime-webhook:v0.1.0
+        imagePullPolicy: IfNotPresent
+        ports:
+        - containerPort: 8000
+          name: http
+        env:
+        - name: PORT
+          value: "8000"
+        - name: PLEX_WEBHOOK_PATH
+          value: "/plex/webhook"
+        envFrom:
+        - secretRef:
+            name: cleanarr-runtime-secrets
+        - configMapRef:
+            name: cleanarr-runtime-config
+        volumeMounts:
+        - name: logs
+          mountPath: /logs
+        readinessProbe:
+          httpGet:
+            path: /healthz
+            port: http
+      volumes:
+      - name: logs
+        emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: cleanarr-webhook
+spec:
+  selector:
+    app: cleanarr-webhook
+  ports:
+  - name: http
+    port: 8000
+    targetPort: http

@@ -1,0 +1,27 @@
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: cleanarr-job
+spec:
+  schedule: "0 */6 * * *"
+  concurrencyPolicy: Forbid
+  jobTemplate:
+    spec:
+      template:
+        spec:
+          restartPolicy: Never
+          containers:
+          - name: cleanarr-job
+            image: ghcr.io/example/cleanarr-runtime-job:v0.1.0
+            imagePullPolicy: IfNotPresent
+            envFrom:
+            - secretRef:
+                name: cleanarr-runtime-secrets
+            - configMapRef:
+                name: cleanarr-runtime-config
+            volumeMounts:
+            - name: logs
+              mountPath: /logs
+          volumes:
+          - name: logs
+            emptyDir: {}
