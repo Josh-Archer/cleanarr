@@ -34,6 +34,7 @@ class TestMediaCleanup(unittest.TestCase):
             "disable_torrent_cleanup": False,
             "remove_orphan_incomplete_downloads": True,
             "remove_stale_torrents": True,
+            "torrent_cleanup_allowed_categories": set(),
             "transmission_io_error_cleanup_enabled": True,
             "transmission_io_error_threshold": 2,
             "transmission_io_error_state_file": os.path.join(
@@ -181,6 +182,7 @@ class TestMediaCleanup(unittest.TestCase):
         mock_torrent = MagicMock()
         mock_torrent.id = 123
         mock_torrent.name = "Test.Torrent"
+        mock_torrent.download_dir = "/media/downloads/sonarr"
         mock_torrent.rate_download = 0
         mock_torrent.files.return_value = [{'name': 'Test.Torrent/Test.Movie.mkv'}]
         mock_torrent.status = 6  # Seeding
@@ -194,6 +196,24 @@ class TestMediaCleanup(unittest.TestCase):
 
         self.assertTrue(result)
         self.cleanup.transmission.remove_torrent.assert_called_with(123, delete_data=True)
+
+    def test_remove_torrent_by_file_path_skips_disallowed_category(self):
+        """Torrent removal should skip torrents outside the configured category allowlist."""
+        cleanarr.CONFIG["torrent_cleanup_allowed_categories"] = {"sonarr"}
+
+        mock_torrent = MagicMock()
+        mock_torrent.id = 124
+        mock_torrent.name = "Readarr.Torrent"
+        mock_torrent.download_dir = "/media/downloads/readarr"
+        mock_torrent.rate_download = 0
+        mock_torrent.files.return_value = [{'name': 'Readarr.Torrent/Book.epub'}]
+
+        self.cleanup.transmission.get_torrents.return_value = [mock_torrent]
+
+        result = self.cleanup.remove_torrent_by_file_path("/media/downloads/readarr/Readarr.Torrent/Book.epub")
+
+        self.assertFalse(result)
+        self.cleanup.transmission.remove_torrent.assert_not_called()
 
     def test_normalize_tag_label(self):
         """Test the tag normalization helper."""
@@ -247,6 +267,41 @@ class TestMediaCleanup(unittest.TestCase):
 
         self.cleanup.transmission.remove_torrent.assert_called_once_with(11, delete_data=False)
         mock_save_state.assert_called_once_with({})
+
+    def test_clean_failed_downloads_skips_disallowed_categories(self):
+        """Errored torrents outside the allowlist should not be removed."""
+        cleanarr.CONFIG["torrent_cleanup_allowed_categories"] = {"sonarr"}
+
+        mock_torrent = MagicMock()
+        mock_torrent.id = 200
+        mock_torrent.name = "Readarr broken"
+        mock_torrent.download_dir = "/media/downloads/readarr"
+        mock_torrent.error = 1
+        mock_torrent.error_string = "broken"
+
+        self.cleanup.transmission.get_torrents.return_value = [mock_torrent]
+        self.cleanup.clean_failed_downloads()
+
+        self.cleanup.transmission.remove_torrent.assert_not_called()
+
+    def test_remove_stale_torrents_skips_disallowed_categories(self):
+        """Stale torrent cleanup should only apply to allowed categories."""
+        cleanarr.CONFIG["torrent_cleanup_allowed_categories"] = {"sonarr"}
+
+        mock_torrent = MagicMock()
+        mock_torrent.id = 201
+        mock_torrent.name = "Readarr stale"
+        mock_torrent.download_dir = "/media/downloads/readarr"
+        mock_torrent.added_date = datetime.now(timezone.utc) - timedelta(hours=24)
+        mock_torrent.percent_done = 1.0
+        mock_torrent.rate_download = 0
+        mock_torrent.status = 0
+        mock_torrent.peers_connected = 0
+
+        self.cleanup.transmission.get_torrents.return_value = [mock_torrent]
+        self.cleanup.remove_stale_torrents()
+
+        self.cleanup.transmission.remove_torrent.assert_not_called()
 
     def test_process_watched_episodes_does_not_delete_unwatched_episodes_just_because_later_episodes_exist(self):
         watched_episode = {

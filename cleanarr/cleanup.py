@@ -44,6 +44,15 @@ def _env_flag(*keys, default="false"):
     return _get_env(*keys, default=default).lower() in ("true", "1", "yes")
 
 
+def _env_csv_set(*keys, default=""):
+    raw = _get_env(*keys, default=default) or ""
+    return {
+        value.strip().lower()
+        for value in raw.split(",")
+        if value.strip()
+    }
+
+
 CONFIG = {
     "plex": {
         "baseurl": _get_env(
@@ -87,6 +96,10 @@ CONFIG = {
         default=_get_env("CLEANARR_REMOVE_FAILED_DOWNLOADS", default="false"),
     ),
     "remove_stale_torrents": _env_flag("CLEANARR_REMOVE_STALE_TORRENTS", default="true"),
+    "torrent_cleanup_allowed_categories": _env_csv_set(
+        "CLEANARR_TORRENT_CLEANUP_ALLOWED_CATEGORIES",
+        default="",
+    ),
     "transmission_io_error_cleanup_enabled": _env_flag(
         "CLEANARR_TRANSMISSION_IO_ERROR_CLEANUP_ENABLED",
         default="false",
@@ -152,6 +165,22 @@ def _iter_expected_incomplete_names(torrent):
         names.add(path_obj.name)
 
     return names
+
+
+def _get_torrent_download_dir(torrent):
+    for attr in ("download_dir", "downloadDir"):
+        download_dir = getattr(torrent, attr, None)
+        if download_dir:
+            return download_dir
+    return None
+
+
+def _get_torrent_category(torrent):
+    download_dir = _get_torrent_download_dir(torrent)
+    if not download_dir:
+        return None
+    category = Path(download_dir).name.strip().lower()
+    return category or None
 
 # Setup logger
 logger.remove()
@@ -291,6 +320,22 @@ class MediaCleanup:
             lines,
             priority="high" if deletion_count else "default",
         )
+
+    def _torrent_cleanup_allowed(self, torrent, reason):
+        allowed_categories = CONFIG.get("torrent_cleanup_allowed_categories") or set()
+        if not allowed_categories:
+            return True
+
+        category = _get_torrent_category(torrent)
+        if category in allowed_categories:
+            return True
+
+        logger.info(
+            f"Skipping torrent cleanup for {getattr(torrent, 'name', 'unknown torrent')} "
+            f"during {reason}: category '{category or 'unknown'}' is not in "
+            f"{sorted(allowed_categories)}"
+        )
+        return False
 
     def _load_io_error_state(self):
         """Load repeated Transmission I/O error counters from the shared logs volume."""
@@ -903,6 +948,8 @@ class MediaCleanup:
                     norm_file_path = os.path.normpath(file_path)
                     if norm_file_path.endswith(norm_tf_path) or norm_tf_path.endswith(norm_file_path):
                         logger.info(f"Found matching torrent: {torrent.name}")
+                        if not self._torrent_cleanup_allowed(torrent, "file-path cleanup"):
+                            continue
                         
                         # Check if torrent is actively downloading before removal
                         if torrent.rate_download > 0:
@@ -939,6 +986,8 @@ class MediaCleanup:
             if remove_failed_downloads:
                 for torrent in torrents:
                     if torrent.error != 0:
+                        if not self._torrent_cleanup_allowed(torrent, "failed-download cleanup"):
+                            continue
                         logger.info(f"Found errored torrent: {torrent.name} (ID: {torrent.id}, Error: {torrent.error_string})")
                         if CONFIG["dry_run"]:
                             logger.info(f"[DRY RUN] Would remove errored torrent: {torrent.name}")
@@ -1035,6 +1084,8 @@ class MediaCleanup:
 
             for torrent in torrents:
                 try:
+                    if not self._torrent_cleanup_allowed(torrent, "stale-torrent cleanup"):
+                        continue
                     # Convert added_date to UTC-aware datetime
                     if isinstance(torrent.added_date, int):
                         # Unix timestamp to UTC datetime
