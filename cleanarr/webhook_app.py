@@ -1543,8 +1543,8 @@ if __name__ == '__main__':
     port = int(os.environ.get('PORT') or os.environ.get('PLEX_WEBHOOK_PORT', '8000'))
     APP.run(host='0.0.0.0', port=port)
 
-# Start background threads immediately (guarded) so health monitor runs under Flask dev server
-_start_background_threads()
+
 
 app = APP
+
 
