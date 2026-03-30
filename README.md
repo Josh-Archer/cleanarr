@@ -50,11 +50,20 @@ The webhook app exposes a Plex webhook endpoint and health endpoint:
 It can:
 
 - record incoming Plex events
+- enqueue actionable webhook events to SQS when staged queue mode is enabled
+- process queued webhook events from SQS in the job runtime when polling is enabled
 - optionally trigger deletion handling for `media.scrobble`, `media.stop`, and removal-style events
 - optionally sync watch state to another Plex server
 - expose dependency health for probes and monitoring
 
 The webhook is intentionally opt-in for destructive behavior. Running the webhook does not imply deletions are enabled.
+
+For issue #629 staged operation, set `CLEANARR_WEBHOOK_QUEUE_MODE=sqs` and enable:
+
+- `CLEANARR_WEBHOOK_QUEUE_ENQUEUING=true` on the webhook runtime
+- `CLEANARR_WEBHOOK_QUEUE_POLLING=true` on the consumer/job runtime
+
+Automatic fallback can revert queue mode to `direct` when budget guardrails trigger.
 
 ## Architecture
 
@@ -173,6 +182,14 @@ Transmission is optional unless you want torrent maintenance or torrent removal 
 | `PLEX_WEBHOOK_ENABLE_DELETIONS` | `false` | Allows webhook events to trigger deletion handling |
 | `WEBHOOK_SECRET` | unset | Shared secret accepted in `X-Cleanarr-Webhook-Token` or `X-Webhook-Token` |
 | `WEBHOOK_SECRET_PREVIOUS` | unset | Previous secret accepted during token rotation |
+| `CLEANARR_WEBHOOK_QUEUE_MODE` | `direct` | Event handling mode: `direct` (immediate) or `sqs` (staged enqueue + poll) |
+| `CLEANARR_WEBHOOK_QUEUE_URL` | unset | SQS queue URL used in staged mode |
+| `CLEANARR_WEBHOOK_QUEUE_REGION` | unset | AWS region for SQS client initialization |
+| `CLEANARR_WEBHOOK_QUEUE_ENQUEUING` | `false` unless queue mode is `sqs` | Enables webhook-side enqueue behavior |
+| `CLEANARR_WEBHOOK_QUEUE_POLLING` | `false` | Enables job-side queue polling and event processing |
+| `CLEANARR_WEBHOOK_QUEUE_MAX_MESSAGES` | `50` | Maximum SQS messages consumed in one poll cycle |
+| `CLEANARR_WEBHOOK_QUEUE_WAIT_SECONDS` | `1` | Long-poll wait time for SQS receives |
+| `CLEANARR_WEBHOOK_QUEUE_VISIBILITY_TIMEOUT` | `0` | Optional visibility timeout override for consumed messages |
 
 ### Cross-Plex Sync Flags
 

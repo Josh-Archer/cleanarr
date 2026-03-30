@@ -2,7 +2,7 @@ FROM mirror.gcr.io/library/python:3.11-slim
 
 LABEL org.opencontainers.image.source="https://github.com/Josh-Archer/cleanarr"
 
-COPY --from=public.ecr.aws/awsguru/aws-lambda-adapter:0.9.0 /opt/extensions/ /opt/extensions/
+COPY --from=public.ecr.aws/awsguru/aws-lambda-adapter:0.9.0 /lambda-adapter /opt/extensions/lambda-adapter
 
 WORKDIR /app
 

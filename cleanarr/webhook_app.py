@@ -67,9 +67,35 @@ _MC = None
 _MC_LOCK = threading.Lock()
 logger = logging.getLogger(__name__)
 
+
+def _env_bool(name: str, default: bool = False) -> bool:
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    return str(value).strip().lower() in ('1', 'true', 'yes', 'on')
+
+
+def _env_int(name: str, default: int) -> int:
+    raw = os.environ.get(name)
+    if raw is None or str(raw).strip() == '':
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        logger.warning("Invalid integer for %s=%r, using default=%s", name, raw, default)
+        return default
+
 # If set to 'true', webhook will attempt to run the same deletion logic as cleanarr
 # Use an opt-in environment variable to avoid surprising deletions.
 ENABLE_WEBHOOK_DELETIONS = os.environ.get('PLEX_WEBHOOK_ENABLE_DELETIONS', 'false').lower() in ('1','true','yes')
+WEBHOOK_QUEUE_MODE = (os.environ.get('CLEANARR_WEBHOOK_QUEUE_MODE', 'direct') or 'direct').strip().lower()
+WEBHOOK_QUEUE_URL = (os.environ.get('CLEANARR_WEBHOOK_QUEUE_URL') or '').strip()
+WEBHOOK_QUEUE_REGION = (os.environ.get('CLEANARR_WEBHOOK_QUEUE_REGION') or '').strip()
+WEBHOOK_QUEUE_ENQUEUING = _env_bool('CLEANARR_WEBHOOK_QUEUE_ENQUEUING', default=(WEBHOOK_QUEUE_MODE == 'sqs'))
+WEBHOOK_QUEUE_POLLING = _env_bool('CLEANARR_WEBHOOK_QUEUE_POLLING', default=False)
+WEBHOOK_QUEUE_MAX_MESSAGES = max(1, _env_int('CLEANARR_WEBHOOK_QUEUE_MAX_MESSAGES', 50))
+WEBHOOK_QUEUE_WAIT_SECONDS = max(0, _env_int('CLEANARR_WEBHOOK_QUEUE_WAIT_SECONDS', 1))
+WEBHOOK_QUEUE_VISIBILITY_TIMEOUT = max(0, _env_int('CLEANARR_WEBHOOK_QUEUE_VISIBILITY_TIMEOUT', 0))
 _THREADS_STARTED = False
 _HEALTH_LOCK = threading.Lock()
 _HEALTH_STATUS = {
@@ -215,6 +241,10 @@ _AUTH_LAST_NOTIFY = {
     'sonarr': 0.0,
     'transmission': 0.0,
 }
+
+_SQS_CLIENT = None
+_SQS_CLIENT_LOCK = threading.Lock()
+_SQS_IMPORT_FAILED = False
 
 
 def _send_ntfy(message: str, title: str = 'cleanarr-webhook', priority: str = 'default'):
@@ -413,10 +443,234 @@ except Exception:
 
 
 def _append_event(ev: dict):
-    os.makedirs(os.path.dirname(EVENTS_FILE), exist_ok=True)
+    events_dir = os.path.dirname(EVENTS_FILE)
+    if events_dir:
+        os.makedirs(events_dir, exist_ok=True)
     # Store JSON array lines; append entries separated by newlines for easy streaming
     with open(EVENTS_FILE, "a", encoding="utf-8") as f:
         f.write(json.dumps(ev, default=str, ensure_ascii=False) + "\n")
+
+
+def _queue_mode_is_sqs() -> bool:
+    return WEBHOOK_QUEUE_MODE == 'sqs'
+
+
+def _queue_enqueuing_enabled() -> bool:
+    return _queue_mode_is_sqs() and WEBHOOK_QUEUE_ENQUEUING and bool(WEBHOOK_QUEUE_URL)
+
+
+def _queue_polling_enabled() -> bool:
+    return _queue_mode_is_sqs() and WEBHOOK_QUEUE_POLLING and bool(WEBHOOK_QUEUE_URL)
+
+
+def _get_sqs_client():
+    global _SQS_CLIENT
+    global _SQS_IMPORT_FAILED
+    if _SQS_CLIENT is not None:
+        return _SQS_CLIENT
+    if _SQS_IMPORT_FAILED:
+        return None
+
+    with _SQS_CLIENT_LOCK:
+        if _SQS_CLIENT is not None:
+            return _SQS_CLIENT
+        if _SQS_IMPORT_FAILED:
+            return None
+
+        try:
+            import boto3
+        except Exception:
+            _SQS_IMPORT_FAILED = True
+            logger.exception('SQS mode requested but boto3 is unavailable')
+            return None
+
+        try:
+            kwargs = {}
+            if WEBHOOK_QUEUE_REGION:
+                kwargs['region_name'] = WEBHOOK_QUEUE_REGION
+            _SQS_CLIENT = boto3.client('sqs', **kwargs)
+            return _SQS_CLIENT
+        except Exception:
+            logger.exception('Failed to initialize SQS client')
+            return None
+
+
+def _enqueue_webhook_event(ev: dict) -> bool:
+    client = _get_sqs_client()
+    if client is None:
+        logger.warning('SQS enqueue is enabled but SQS client is unavailable; using direct handling for this event')
+        return False
+
+    try:
+        message_body = json.dumps(ev, default=str, ensure_ascii=False)
+        client.send_message(
+            QueueUrl=WEBHOOK_QUEUE_URL,
+            MessageBody=message_body,
+        )
+        return True
+    except Exception:
+        logger.exception('Failed to enqueue webhook event to SQS; using direct handling for this event')
+        return False
+
+
+def _compute_event_flags(ev: dict):
+    evt = (ev.get('event') or '').lower() if ev.get('event') else ''
+    act = (ev.get('action') or '').lower() if ev.get('action') else ''
+
+    is_finished = False
+    is_removed = False
+
+    # Only treat explicit watched events as finished.
+    # Do not infer watched state from media.play/media.stop to avoid accidental promotion.
+    # Also support Tautulli 'mark_watched' action.
+    if evt == 'media.scrobble' or act == 'mark_watched':
+        is_finished = True
+    elif evt == 'library.remove':
+        is_removed = True
+
+    is_paused = (evt == 'media.pause')
+    is_stopped = (evt == 'media.stop')
+
+    ev['finished'] = bool(is_finished)
+    ev['removed'] = bool(is_removed)
+    ev['paused'] = is_paused
+    ev['stopped'] = is_stopped
+
+    return evt, act, is_finished, is_removed, is_paused, is_stopped
+
+
+def _process_webhook_event_actions(ev: dict, async_mode: bool = True, force_deletions: bool = False):
+    evt, act, is_finished, is_removed, is_paused, is_stopped = _compute_event_flags(ev)
+
+    logger.info(
+        "Webhook received: event='%s', action='%s', is_finished=%s, is_removed=%s, is_paused=%s, is_stopped=%s",
+        evt,
+        act,
+        is_finished,
+        is_removed,
+        is_paused,
+        is_stopped,
+    )
+    payload = ev.get('payload')
+    if isinstance(payload, dict) and payload.get('Player'):
+        logger.info(f"Player state: {payload.get('Player')}")
+
+    actionable = bool(is_finished or is_removed or is_paused or is_stopped)
+    recorded = bool(is_finished or is_removed)
+
+    if recorded:
+        _append_event(ev)
+
+    deletions_enabled = ENABLE_WEBHOOK_DELETIONS or force_deletions
+
+    if deletions_enabled and (is_finished or is_removed):
+        try:
+            if async_mode:
+                if is_finished:
+                    threading.Thread(target=_background_process_finished, args=(ev,), daemon=True).start()
+                elif is_removed:
+                    threading.Thread(target=_background_process_removed, args=(ev,), daemon=True).start()
+            else:
+                if is_finished:
+                    _background_process_finished(ev)
+                elif is_removed:
+                    _background_process_removed(ev)
+        except Exception:
+            logger.exception("Failed to process webhook deletion action")
+
+    # Sync watch/progress state to target Plex if configured.
+    # Progress sync uses pause/stop events and is monotonic; watched sync uses scrobble only.
+    if TARGET_PLEX_BASEURL and (is_finished or is_paused or is_stopped):
+        try:
+            if async_mode:
+                threading.Thread(target=_background_sync_watch_state, args=(ev,), daemon=True).start()
+            else:
+                _background_sync_watch_state(ev)
+        except Exception:
+            logger.exception("Failed to process webhook sync action")
+
+    return {
+        'actionable': actionable,
+        'recorded': recorded,
+        'event': evt,
+        'action': act,
+        'finished': is_finished,
+        'removed': is_removed,
+        'paused': is_paused,
+        'stopped': is_stopped,
+    }
+
+
+def process_sqs_queue_messages(max_messages: int | None = None, force_deletions: bool = True):
+    """Poll and process queued webhook events.
+
+    Returns a summary dictionary suitable for logging and diagnostics.
+    """
+    summary = {
+        'enabled': False,
+        'queue_mode': WEBHOOK_QUEUE_MODE,
+        'received': 0,
+        'processed': 0,
+        'deleted': 0,
+        'failed': 0,
+        'reason': '',
+    }
+
+    if not _queue_polling_enabled():
+        summary['reason'] = 'queue polling disabled'
+        return summary
+
+    client = _get_sqs_client()
+    if client is None:
+        summary['reason'] = 'sqs client unavailable'
+        return summary
+
+    summary['enabled'] = True
+
+    budget = max_messages if max_messages is not None else WEBHOOK_QUEUE_MAX_MESSAGES
+    budget = max(1, int(budget))
+
+    while (summary['processed'] + summary['failed']) < budget:
+        remaining = budget - (summary['processed'] + summary['failed'])
+        batch_size = min(10, remaining)
+
+        receive_args = {
+            'QueueUrl': WEBHOOK_QUEUE_URL,
+            'MaxNumberOfMessages': batch_size,
+            'WaitTimeSeconds': WEBHOOK_QUEUE_WAIT_SECONDS,
+        }
+        if WEBHOOK_QUEUE_VISIBILITY_TIMEOUT > 0:
+            receive_args['VisibilityTimeout'] = WEBHOOK_QUEUE_VISIBILITY_TIMEOUT
+
+        response = client.receive_message(**receive_args)
+        messages = response.get('Messages') or []
+        if not messages:
+            break
+
+        summary['received'] += len(messages)
+
+        for message in messages:
+            receipt_handle = message.get('ReceiptHandle')
+            try:
+                body = message.get('Body') or '{}'
+                parsed = json.loads(body)
+                if isinstance(parsed, dict) and isinstance(parsed.get('webhook_event'), dict):
+                    parsed = parsed['webhook_event']
+                if not isinstance(parsed, dict):
+                    raise ValueError('SQS message body must be a JSON object')
+
+                parsed.setdefault('queue_message_id', message.get('MessageId'))
+                _process_webhook_event_actions(parsed, async_mode=False, force_deletions=force_deletions)
+
+                summary['processed'] += 1
+                if receipt_handle:
+                    client.delete_message(QueueUrl=WEBHOOK_QUEUE_URL, ReceiptHandle=receipt_handle)
+                    summary['deleted'] += 1
+            except Exception:
+                summary['failed'] += 1
+                logger.exception('Failed to process queued webhook event')
+
+    return summary
 
 
 # Start background threads (health monitor) after all definitions to avoid NameError race
@@ -527,6 +781,12 @@ def healthz():
             "initialized": bool(_HEALTH_STATUS.get("initialized", False)),
             "last_checked_unix": _HEALTH_STATUS.get("last_checked_unix"),
             "dependencies": dict(_HEALTH_STATUS.get("dependencies") or {}),
+            "queue": {
+                "mode": WEBHOOK_QUEUE_MODE,
+                "enqueuing": bool(_queue_enqueuing_enabled()),
+                "polling": bool(_queue_polling_enabled()),
+                "configured": bool(WEBHOOK_QUEUE_URL),
+            },
         }
     # If the monitor hasn't run yet, treat as OK so we don't flap on startup.
     http_status = 200 if status["ok"] or not status["initialized"] else 500
@@ -625,65 +885,38 @@ def plex_webhook():
     'grandparentTitle': meta.get('grandparentTitle') if isinstance(meta, dict) else None,
     } if meta else None
 
-    # Only persist final/watch-complete events. Plex uses 'media.scrobble' when an item is
-    # finished and 'media.play' for start/play; we only track completed watches for deletion logic.
-    # Also handle library.remove events for when items are deleted from Plex
-    evt = (ev.get('event') or '').lower() if ev.get('event') else ''
-    act = (ev.get('action') or '').lower() if ev.get('action') else ''
-    is_finished = False
-    is_removed = False
-    
-    # Only treat explicit watched events as finished.
-    # Do not infer watched state from media.play/media.stop to avoid accidental promotion.
-    # Also support Tautulli 'mark_watched' action.
-    if evt == 'media.scrobble' or act == 'mark_watched':
-        is_finished = True
-    elif evt == 'library.remove':
-        is_removed = True
+    evt, act, is_finished, is_removed, is_paused, is_stopped = _compute_event_flags(ev)
+    actionable = bool(is_finished or is_removed or is_paused or is_stopped)
+    recorded = bool(is_finished or is_removed)
 
-    ev['finished'] = bool(is_finished)
-    ev['removed'] = bool(is_removed)
-    is_paused = (evt == 'media.pause')
-    is_stopped = (evt == 'media.stop')
-    ev['paused'] = is_paused
-    ev['stopped'] = is_stopped
-    
-    # Debug logging for all webhook events to troubleshoot manual webhook issues
-    logger.info(
-        "Webhook received: event='%s', action='%s', is_finished=%s, is_removed=%s, is_paused=%s, is_stopped=%s",
-        evt,
-        act,
-        is_finished,
-        is_removed,
-        is_paused,
-        is_stopped,
-    )
-    if isinstance(payload, dict) and payload.get('Player'):
-        logger.info(f"Player state: {payload.get('Player')}")
-    
-    if is_finished or is_removed or is_paused:
-        if is_finished or is_removed:
-            _append_event(ev)
-        
-        # If deletions are enabled, process the finished or removed event in background
-        if ENABLE_WEBHOOK_DELETIONS and (is_finished or is_removed):
-            try:
-                if is_finished:
-                    threading.Thread(target=_background_process_finished, args=(ev,), daemon=True).start()
-                elif is_removed:
-                    threading.Thread(target=_background_process_removed, args=(ev,), daemon=True).start()
-            except Exception:
-                logger.exception("Failed to start background deletion thread")
+    if actionable and _queue_enqueuing_enabled():
+        logger.info(
+            "Queue mode active; enqueuing webhook event='%s' action='%s' (mode=%s)",
+            evt,
+            act,
+            WEBHOOK_QUEUE_MODE,
+        )
+        if _enqueue_webhook_event(ev):
+            return jsonify({
+                "status": "ok",
+                "recorded": recorded,
+                "queued": True,
+                "queue_mode": WEBHOOK_QUEUE_MODE,
+            })
 
-        # Sync watch/progress state to target Plex if configured.
-        # Progress sync uses pause/stop events and is monotonic; watched sync uses scrobble only.
-        if TARGET_PLEX_BASEURL and (is_finished or is_paused or is_stopped):
-            try:
-                threading.Thread(target=_background_sync_watch_state, args=(ev,), daemon=True).start()
-            except Exception:
-                logger.exception("Failed to start background sync thread")
+        logger.warning(
+            "Queue enqueue failed for event='%s' action='%s'; falling back to direct processing",
+            evt,
+            act,
+        )
 
-    return jsonify({"status": "ok", "recorded": bool(is_finished or is_removed)})
+    event_result = _process_webhook_event_actions(ev, async_mode=True, force_deletions=False)
+    return jsonify({
+        "status": "ok",
+        "recorded": bool(event_result.get('recorded')),
+        "queued": False,
+        "queue_mode": WEBHOOK_QUEUE_MODE,
+    })
 
 def _background_sync_watch_state(ev: dict):
     """Sync watch status or progress to a secondary Plex server."""
