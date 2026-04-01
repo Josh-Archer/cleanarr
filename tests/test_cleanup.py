@@ -279,6 +279,56 @@ class TestMediaCleanup(unittest.TestCase):
 
         mock_delete.assert_not_called()
 
+    def test_delete_episode_and_cleanup_records_tv_deletion_only_on_success(self):
+        """Episode summaries should not report both deletion and failure for one delete."""
+        with patch.object(self.cleanup, 'delete_sonarr_episode_file', return_value=True), \
+             patch.object(self.cleanup, 'unmonitor_sonarr_episode') as mock_unmonitor, \
+             patch.object(self.cleanup, 'remove_torrent_by_file_path') as mock_remove_torrent, \
+             patch.object(self.cleanup, 'remove_from_plex_watchlist') as mock_remove_watchlist:
+            result = self.cleanup._delete_episode_and_cleanup(
+                "Memory of a Killer S1E9",
+                "standard watched",
+                6864,
+                16728,
+                file_path="/media/tv/Memory of a Killer/Season 1/Memory of a Killer - S01E09 - Shoot the Piano Player WEBDL-2160p.mkv",
+                rating_key="12345",
+            )
+
+        self.assertTrue(result)
+        self.assertEqual(
+            self.cleanup.run_summary["tv_deletions"],
+            ["Memory of a Killer S1E9 [standard watched]"],
+        )
+        self.assertEqual(self.cleanup.run_summary["errors"], [])
+        mock_unmonitor.assert_called_once_with(16728)
+        mock_remove_torrent.assert_called_once()
+        mock_remove_watchlist.assert_called_once_with("12345")
+
+    def test_delete_episode_and_cleanup_records_error_without_tv_deletion_on_failure(self):
+        """Episode summaries should only report an error when the Sonarr delete fails."""
+        with patch.object(self.cleanup, 'delete_sonarr_episode_file', return_value=False), \
+             patch.object(self.cleanup, 'unmonitor_sonarr_episode') as mock_unmonitor, \
+             patch.object(self.cleanup, 'remove_torrent_by_file_path') as mock_remove_torrent, \
+             patch.object(self.cleanup, 'remove_from_plex_watchlist') as mock_remove_watchlist:
+            result = self.cleanup._delete_episode_and_cleanup(
+                "Memory of a Killer S1E9",
+                "standard watched",
+                6864,
+                16728,
+                file_path="/media/tv/Memory of a Killer/Season 1/Memory of a Killer - S01E09 - Shoot the Piano Player WEBDL-2160p.mkv",
+                rating_key="12345",
+            )
+
+        self.assertFalse(result)
+        self.assertEqual(self.cleanup.run_summary["tv_deletions"], [])
+        self.assertEqual(
+            self.cleanup.run_summary["errors"],
+            ["Memory of a Killer S1E9 delete failed [standard watched]"],
+        )
+        mock_unmonitor.assert_not_called()
+        mock_remove_torrent.assert_not_called()
+        mock_remove_watchlist.assert_not_called()
+
     def test_remove_torrent_by_file_path(self):
         """Test removing torrent by file path."""
         mock_torrent = MagicMock()

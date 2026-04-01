@@ -878,8 +878,8 @@ class MediaCleanup:
 
     def _delete_episode_and_cleanup(self, episode_label, reason, file_id, episode_id, file_path=None, rating_key=None):
         logger.info(f"Deleting {episode_label} via {reason}")
-        self._record_summary("tv_deletions", f"{episode_label} [{reason}]")
         if self.delete_sonarr_episode_file(file_id):
+            self._record_summary("tv_deletions", f"{episode_label} [{reason}]")
             self.unmonitor_sonarr_episode(episode_id)
             if file_path:
                 self.remove_torrent_by_file_path(file_path)
