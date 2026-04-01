@@ -27,8 +27,14 @@ def lambda_handler(event, context):
             "statusCode": 200,
             "body": json.dumps("Cleanup successful")
         }
-    except Exception as e:
-        logger.error(f"Handler error: {e}")
+    except SystemExit as e:
+        logger.exception(f"Handler attempted to exit process: {e}")
+        return {
+            "statusCode": 500,
+            "body": json.dumps(f"SystemExit: {e}")
+        }
+    except BaseException as e:
+        logger.exception(f"Handler fatal error: {e}")
         return {
             "statusCode": 500,
             "body": json.dumps(str(e))
