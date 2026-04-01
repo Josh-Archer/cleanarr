@@ -470,22 +470,7 @@ class MediaCleanup:
         # Use session but ensure API key is present (headers.update merges)
         self.sonarr_session.headers.update({"X-Api-Key": CONFIG["sonarr"]["apikey"]})
 
-        try:
-            if method == "GET":
-                response = self.sonarr_session.get(url)
-            elif method == "DELETE":
-                response = self.sonarr_session.delete(url)
-            elif method in ["POST", "PUT"]:
-                self.sonarr_session.headers.update({"Content-Type": "application/json"})
-                response = self.sonarr_session.request(method, url, data=json.dumps(data))
-            response.raise_for_status()
-            return response.json() if response.text else None
-        except requests.exceptions.HTTPError as e:
-            logger.error(f"Sonarr API HTTP error ({method} {endpoint}): {e.response.status_code} - {e.response.text}")
-            return None
-        except Exception as e:
-            logger.error(f"Sonarr API error ({method} {endpoint}): {str(e)}")
-            return None
+        return self._arr_request("Sonarr", self.sonarr_session, url, endpoint, method, data)
 
     def _radarr_request(self, endpoint, method="GET", data=None):
         """Make a request to the Radarr API."""
@@ -495,22 +480,76 @@ class MediaCleanup:
         url = urljoin(CONFIG["radarr"]["baseurl"], endpoint)
         self.radarr_session.headers.update({"X-Api-Key": CONFIG["radarr"]["apikey"]})
 
-        try:
-            if method == "GET":
-                response = self.radarr_session.get(url)
-            elif method == "DELETE":
-                response = self.radarr_session.delete(url)
-            elif method in ["POST", "PUT"]:
-                self.radarr_session.headers.update({"Content-Type": "application/json"})
-                response = self.radarr_session.request(method, url, data=json.dumps(data))
-            response.raise_for_status()
-            return response.json() if response.text else None
-        except requests.exceptions.HTTPError as e:
-            logger.error(f"Radarr API HTTP error ({method} {endpoint}): {e.response.status_code} - {e.response.text}")
-            return None
-        except Exception as e:
-            logger.error(f"Radarr API error ({method} {endpoint}): {str(e)}")
-            return None
+        return self._arr_request("Radarr", self.radarr_session, url, endpoint, method, data)
+
+    def _arr_request(self, service_name, session, url, endpoint, method="GET", data=None):
+        """Make an ARR API request with light retrying for edge and upstream flakiness."""
+        method = (method or "GET").upper()
+        transient_statuses = {429, 500, 502, 503, 504}
+        max_attempts = 3
+        backoff_seconds = 1.5
+
+        for attempt in range(1, max_attempts + 1):
+            try:
+                request_kwargs = {"timeout": 30}
+                if method == "GET":
+                    response = session.get(url, **request_kwargs)
+                elif method == "DELETE":
+                    response = session.delete(url, **request_kwargs)
+                elif method in {"POST", "PUT"}:
+                    session.headers.update({"Content-Type": "application/json"})
+                    request_kwargs["data"] = json.dumps(data)
+                    response = session.request(method, url, **request_kwargs)
+                else:
+                    response = session.request(method, url, **request_kwargs)
+                if response.status_code in transient_statuses and attempt < max_attempts:
+                    logger.warning(
+                        f"{service_name} API transient response ({method} {endpoint}): "
+                        f"{response.status_code}; retrying ({attempt}/{max_attempts})"
+                    )
+                    time.sleep(backoff_seconds * attempt)
+                    continue
+
+                response.raise_for_status()
+                if not response.text or not response.text.strip():
+                    # Treat empty 2xx responses as success. Sonarr/Radarr DELETEs commonly
+                    # return an empty body, and callers should not interpret that as failure.
+                    return {}
+                try:
+                    return response.json()
+                except ValueError:
+                    return response.text
+            except requests.exceptions.HTTPError as exc:
+                response = exc.response
+                status_code = response.status_code if response is not None else "unknown"
+                response_text = response.text if response is not None else ""
+                if status_code in transient_statuses and attempt < max_attempts:
+                    logger.warning(
+                        f"{service_name} API transient HTTP error ({method} {endpoint}): "
+                        f"{status_code}; retrying ({attempt}/{max_attempts})"
+                    )
+                    time.sleep(backoff_seconds * attempt)
+                    continue
+                logger.error(
+                    f"{service_name} API HTTP error ({method} {endpoint}): "
+                    f"{status_code} - {response_text}"
+                )
+                return None
+            except requests.exceptions.RequestException as exc:
+                if attempt < max_attempts:
+                    logger.warning(
+                        f"{service_name} API request error ({method} {endpoint}): {exc}; "
+                        f"retrying ({attempt}/{max_attempts})"
+                    )
+                    time.sleep(backoff_seconds * attempt)
+                    continue
+                logger.error(f"{service_name} API error ({method} {endpoint}): {exc}")
+                return None
+            except Exception as exc:
+                logger.error(f"{service_name} API error ({method} {endpoint}): {exc}")
+                return None
+
+        return None
 
     def get_watched_movies(self):
         """Get all watched movies from Plex."""
@@ -742,6 +781,13 @@ class MediaCleanup:
             t = re.sub(r"[^a-z0-9]", "", t)
             return t.strip()
 
+        def tokenize(t):
+            return {
+                token
+                for token in re.split(r"[^a-z0-9]+", (t or "").lower())
+                if len(token) >= 3 and token not in {"the", "and"}
+            }
+
         # Try exact match first (with year)
         for m in movie_list:
             if m["title"].lower() == movie["title"].lower() and m["year"] == movie["year"]:
@@ -763,12 +809,21 @@ class MediaCleanup:
                     }
 
         # Final fallback: containment matching (with year)
+        target_tokens = tokenize(movie["title"])
         for m in movie_list:
             if m["year"] == movie["year"]:
-                m_norm = normalize(m["title"])
-                # Check if one title contains the other
-                if target_norm in m_norm or m_norm in target_norm:
-                    logger.info(f"Matched by containment: Radarr='{m['title']}' for Plex='{movie['title']}'")
+                candidate_tokens = tokenize(m["title"])
+                if (
+                    len(target_tokens) >= 2
+                    and len(candidate_tokens) >= 2
+                    and (
+                        target_tokens.issubset(candidate_tokens)
+                        or candidate_tokens.issubset(target_tokens)
+                    )
+                ):
+                    logger.info(
+                        f"Matched by token subset: Radarr='{m['title']}' for Plex='{movie['title']}'"
+                    )
                     return {
                         "movie": m,
                         "file_id": m.get("movieFile", {}).get("id")
@@ -828,8 +883,8 @@ class MediaCleanup:
 
     def _delete_episode_and_cleanup(self, episode_label, reason, file_id, episode_id, file_path=None, rating_key=None):
         logger.info(f"Deleting {episode_label} via {reason}")
-        self._record_summary("tv_deletions", f"{episode_label} [{reason}]")
         if self.delete_sonarr_episode_file(file_id):
+            self._record_summary("tv_deletions", f"{episode_label} [{reason}]")
             self.unmonitor_sonarr_episode(episode_id)
             if file_path:
                 self.remove_torrent_by_file_path(file_path)
@@ -1380,6 +1435,13 @@ class MediaCleanup:
                 continue
             user_tags = self.get_user_tags(radarr_tags, movie_tags)
             if self.should_delete_media(movie, user_tags, movie["watched_by"]):
+                if not radarr_match["file_id"]:
+                    logger.info(
+                        f"Skipping deletion for {movie['title']} ({movie['year']}): "
+                        f"matched Radarr entry '{radarr_match['movie'].get('title')}' "
+                        "has no movie file id"
+                    )
+                    continue
                 if self.delete_radarr_movie_file(radarr_match["file_id"]):
                     self._record_summary("movie_deletions", f"{movie['title']} ({movie['year']}) [standard watched]")
                     self.unmonitor_radarr_movie(radarr_match["movie"]["id"])

@@ -109,13 +109,15 @@ class TestMediaCleanup(unittest.TestCase):
         """Test successful Sonarr API call."""
         mock_response = MagicMock()
         mock_response.status_code = 200
+        mock_response.text = '{"data":"test"}'
         mock_response.json.return_value = {'data': 'test'}
         self.mock_session.get.return_value = mock_response
 
         result = self.cleanup._sonarr_request('test-endpoint')
         self.assertEqual(result, {'data': 'test'})
         self.mock_session.get.assert_called_with(
-            'http://mock-sonarr:8989/test-endpoint'
+            'http://mock-sonarr:8989/test-endpoint',
+            timeout=30,
         )
 
     def test_match_episode_to_sonarr(self):
@@ -123,9 +125,9 @@ class TestMediaCleanup(unittest.TestCase):
         # Mock Sonarr series list
         self.mock_session.get.side_effect = [
             # First call: get series
-            MagicMock(status_code=200, json=lambda: [{'title': 'Test Show', 'id': 100}]),
+            MagicMock(status_code=200, text='[{"title":"Test Show","id":100}]', json=lambda: [{'title': 'Test Show', 'id': 100}]),
             # Second call: get episodes for series 100
-            MagicMock(status_code=200, json=lambda: [
+            MagicMock(status_code=200, text='[{"seasonNumber":1,"episodeNumber":1,"id":500,"episodeFileId":999}]', json=lambda: [
                 {'seasonNumber': 1, 'episodeNumber': 1, 'id': 500, 'episodeFileId': 999}
             ])
         ]
@@ -148,6 +150,7 @@ class TestMediaCleanup(unittest.TestCase):
         # Mock Radarr movie list
         self.mock_session.get.return_value = MagicMock(
             status_code=200,
+            text='[{"title":"The Avengers","year":2012,"id":1,"movieFile":{"id":10}}]',
             json=lambda: [
                 {'title': 'The Avengers', 'year': 2012, 'id': 1, 'movieFile': {'id': 10}}
             ]
