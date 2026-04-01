@@ -51,7 +51,7 @@ It can:
 
 - record incoming Plex events
 - enqueue actionable webhook events to SQS when staged queue mode is enabled
-- process queued webhook events from SQS in the job runtime when polling is enabled
+- process queued webhook events in the consumer/job runtime, either by direct SQS event records from Lambda event source mappings or by explicit queue polling when polling is enabled
 - optionally trigger deletion handling for `media.scrobble`, `media.stop`, and removal-style events
 - optionally sync watch state to another Plex server
 - expose dependency health for probes and monitoring
@@ -62,6 +62,8 @@ For issue #629 staged operation, set `CLEANARR_WEBHOOK_QUEUE_MODE=sqs` and enabl
 
 - `CLEANARR_WEBHOOK_QUEUE_ENQUEUING=true` on the webhook runtime
 - `CLEANARR_WEBHOOK_QUEUE_POLLING=true` on the consumer/job runtime
+- add an AWS Lambda SQS event source mapping to the consumer runtime if you want queue-driven invokes instead of periodic polling
+- keep the SQS queue visibility timeout greater than or equal to the consumer Lambda timeout
 
 Automatic fallback can revert queue mode to `direct` when budget guardrails trigger.
 
@@ -186,7 +188,7 @@ Transmission is optional unless you want torrent maintenance or torrent removal 
 | `CLEANARR_WEBHOOK_QUEUE_URL` | unset | SQS queue URL used in staged mode |
 | `CLEANARR_WEBHOOK_QUEUE_REGION` | unset | AWS region for SQS client initialization |
 | `CLEANARR_WEBHOOK_QUEUE_ENQUEUING` | `false` unless queue mode is `sqs` | Enables webhook-side enqueue behavior |
-| `CLEANARR_WEBHOOK_QUEUE_POLLING` | `false` | Enables job-side queue polling and event processing |
+| `CLEANARR_WEBHOOK_QUEUE_POLLING` | `false` | Enables consumer-side queue polling for manual or scheduled runs; Lambda SQS event source mappings can deliver records directly without polling |
 | `CLEANARR_WEBHOOK_QUEUE_MAX_MESSAGES` | `50` | Maximum SQS messages consumed in one poll cycle |
 | `CLEANARR_WEBHOOK_QUEUE_WAIT_SECONDS` | `1` | Long-poll wait time for SQS receives |
 | `CLEANARR_WEBHOOK_QUEUE_VISIBILITY_TIMEOUT` | `0` | Optional visibility timeout override for consumed messages |

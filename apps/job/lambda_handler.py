@@ -14,9 +14,13 @@ def _queue_max_messages_from_env():
 def lambda_handler(event, context):
     try:
         from cleanarr.cleanup import MediaCleanup
-        from cleanarr.webhook_app import process_sqs_queue_messages
+        from cleanarr.webhook_app import process_sqs_event_records, process_sqs_queue_messages
 
-        queue_summary = process_sqs_queue_messages(max_messages=_queue_max_messages_from_env(), force_deletions=True)
+        records = event.get('Records') if isinstance(event, dict) else None
+        if records:
+            queue_summary = process_sqs_event_records(records, force_deletions=True)
+        else:
+            queue_summary = process_sqs_queue_messages(max_messages=_queue_max_messages_from_env(), force_deletions=True)
         if queue_summary.get('enabled'):
             print(f"Processed queued webhook events: {queue_summary}")
 

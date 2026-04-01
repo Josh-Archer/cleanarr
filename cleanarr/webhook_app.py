@@ -650,25 +650,53 @@ def process_sqs_queue_messages(max_messages: int | None = None, force_deletions:
         summary['received'] += len(messages)
 
         for message in messages:
-            receipt_handle = message.get('ReceiptHandle')
             try:
-                body = message.get('Body') or '{}'
-                parsed = json.loads(body)
-                if isinstance(parsed, dict) and isinstance(parsed.get('webhook_event'), dict):
-                    parsed = parsed['webhook_event']
-                if not isinstance(parsed, dict):
-                    raise ValueError('SQS message body must be a JSON object')
-
-                parsed.setdefault('queue_message_id', message.get('MessageId'))
-                _process_webhook_event_actions(parsed, async_mode=False, force_deletions=force_deletions)
-
+                _process_sqs_message(message, force_deletions=force_deletions)
                 summary['processed'] += 1
+                receipt_handle = message.get('ReceiptHandle')
                 if receipt_handle:
                     client.delete_message(QueueUrl=WEBHOOK_QUEUE_URL, ReceiptHandle=receipt_handle)
                     summary['deleted'] += 1
             except Exception:
                 summary['failed'] += 1
                 logger.exception('Failed to process queued webhook event')
+
+    return summary
+
+
+def _process_sqs_message(message: dict, force_deletions: bool = True):
+    body = message.get('Body') or message.get('body') or '{}'
+    parsed = json.loads(body)
+    if isinstance(parsed, dict) and isinstance(parsed.get('webhook_event'), dict):
+        parsed = parsed['webhook_event']
+    if not isinstance(parsed, dict):
+        raise ValueError('SQS message body must be a JSON object')
+
+    parsed.setdefault('queue_message_id', message.get('MessageId') or message.get('messageId'))
+    _process_webhook_event_actions(parsed, async_mode=False, force_deletions=force_deletions)
+    return parsed
+
+
+def process_sqs_event_records(records, force_deletions: bool = True):
+    """Process SQS event source mapping records delivered to Lambda."""
+    summary = {
+        'enabled': True,
+        'queue_mode': WEBHOOK_QUEUE_MODE,
+        'received': 0,
+        'processed': 0,
+        'deleted': 0,
+        'failed': 0,
+        'reason': '',
+    }
+
+    for record in records or []:
+        summary['received'] += 1
+        try:
+            _process_sqs_message(record, force_deletions=force_deletions)
+            summary['processed'] += 1
+        except Exception:
+            summary['failed'] += 1
+            logger.exception('Failed to process event source mapping SQS record')
 
     return summary
 

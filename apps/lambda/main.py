@@ -2,7 +2,7 @@ import os
 import json
 from loguru import logger
 from cleanarr.cleanup import MediaCleanup
-from cleanarr.webhook_app import process_sqs_queue_messages
+from cleanarr.webhook_app import process_sqs_event_records, process_sqs_queue_messages
 
 
 def _queue_max_messages_from_env():
@@ -17,7 +17,11 @@ def _queue_max_messages_from_env():
 def lambda_handler(event, context):
     try:
         logger.info("Starting Lambda execution for Cleanarr cleanup")
-        queue_summary = process_sqs_queue_messages(max_messages=_queue_max_messages_from_env(), force_deletions=True)
+        records = event.get("Records") if isinstance(event, dict) else None
+        if records:
+            queue_summary = process_sqs_event_records(records, force_deletions=True)
+        else:
+            queue_summary = process_sqs_queue_messages(max_messages=_queue_max_messages_from_env(), force_deletions=True)
         if queue_summary.get('enabled'):
             logger.info(f"Processed queued webhook events: {queue_summary}")
 

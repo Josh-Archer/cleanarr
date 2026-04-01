@@ -107,6 +107,31 @@ class TestWebhookQueueMode(unittest.TestCase):
         self.assertFalse(summary['enabled'])
         self.assertEqual(summary['reason'], 'queue polling disabled')
 
+    def test_process_sqs_event_records_processes_delivered_records(self):
+        records = [
+            {
+                'messageId': 'msg-2',
+                'MessageId': 'msg-2',
+                'body': json.dumps({'event': 'media.stop', 'metadata': {'guid': 'plex://episode/2'}}),
+                'Body': json.dumps({'event': 'media.stop', 'metadata': {'guid': 'plex://episode/2'}}),
+            }
+        ]
+
+        with patch.object(webhook_app, '_process_webhook_event_actions') as process_actions:
+            summary = webhook_app.process_sqs_event_records(records, force_deletions=True)
+
+        self.assertTrue(summary['enabled'])
+        self.assertEqual(summary['received'], 1)
+        self.assertEqual(summary['processed'], 1)
+        self.assertEqual(summary['deleted'], 0)
+        self.assertEqual(summary['failed'], 0)
+        process_actions.assert_called_once()
+
+        args, kwargs = process_actions.call_args
+        self.assertEqual(kwargs.get('async_mode'), False)
+        self.assertEqual(kwargs.get('force_deletions'), True)
+        self.assertEqual(args[0]['queue_message_id'], 'msg-2')
+
 
 if __name__ == '__main__':
     unittest.main()
