@@ -15,11 +15,11 @@
      - `vMAJOR.MINOR.PATCH`
      - `vMAJOR.MINOR`
      - `sha-<commit>`
-   - AWS ECR tags for Lambda consumers:
+   - AWS ECR tags for Lambda consumers (legacy repo name `cleanarr-job` is preserved):
      - `cleanarr-webhook:vMAJOR.MINOR.PATCH`
      - `cleanarr-webhook:latest`
-     - `cleanarr-job:vMAJOR.MINOR.PATCH`
-     - `cleanarr-job:latest`
+     - `cleanarr-job:vMAJOR.MINOR.PATCH` *(legacy Lambda consumer repo/image name)*
+     - `cleanarr-job:latest` *(legacy Lambda consumer repo/image name)*
 8. Verify the workflow artifacts and summary:
    - each matrix job writes GHCR and ECR digests to the job summary
    - the workflow uploads a `release-metadata` artifact containing `release-metadata.json`
@@ -34,7 +34,7 @@ Current image names:
 Current AWS ECR repositories for Lambda consumers:
 
 - `<account>.dkr.ecr.<region>.amazonaws.com/cleanarr-webhook`
-- `<account>.dkr.ecr.<region>.amazonaws.com/cleanarr-job`
+- `<account>.dkr.ecr.<region>.amazonaws.com/cleanarr-job` *(legacy Lambda consumer repository name)*
 
 Do not consume `latest` in downstream clusters.
 

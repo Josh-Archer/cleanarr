@@ -17,5 +17,5 @@ Queue decoupling (issue #629):
 
 - In `direct` mode, webhook events are processed immediately by the webhook runtime.
 - In `sqs` mode, webhook runtime enqueues actionable events and returns quickly.
-- Consumer/job runtime polls SQS and executes event actions (deletion + sync) out of band.
+- SQS webhook consumer runtime polls SQS and executes event actions (deletion + sync) out of band.
 - Downstream infrastructure can switch back to `direct` mode for automatic fallback when budget alarms trigger.

@@ -51,7 +51,7 @@ It can:
 
 - record incoming Plex events
 - enqueue actionable webhook events to SQS when staged queue mode is enabled
-- process queued webhook events in the consumer/job runtime, either by direct SQS event records from Lambda event source mappings or by explicit queue polling when polling is enabled
+- process queued webhook events in the SQS consumer runtime, either by direct SQS event records from Lambda event source mappings or by explicit queue polling when polling is enabled
 - optionally trigger deletion handling for `media.scrobble`, `media.stop`, and removal-style events
 - optionally sync watch state to another Plex server
 - expose dependency health for probes and monitoring
@@ -61,7 +61,7 @@ The webhook is intentionally opt-in for destructive behavior. Running the webhoo
 For issue #629 staged operation, set `CLEANARR_WEBHOOK_QUEUE_MODE=sqs` and enable:
 
 - `CLEANARR_WEBHOOK_QUEUE_ENQUEUING=true` on the webhook runtime
-- `CLEANARR_WEBHOOK_QUEUE_POLLING=true` on the consumer/job runtime
+- `CLEANARR_WEBHOOK_QUEUE_POLLING=true` on the SQS consumer runtime
 - add an AWS Lambda SQS event source mapping to the consumer runtime if you want queue-driven invokes instead of periodic polling
 - keep the SQS queue visibility timeout greater than or equal to the consumer Lambda timeout
 
