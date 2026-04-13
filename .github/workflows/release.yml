@@ -79,6 +79,8 @@ jobs:
         run: python -m unittest discover -s tests
       - uses: docker/setup-qemu-action@v4
       - uses: docker/setup-buildx-action@v4
+        with:
+          driver-opts: image=public.ecr.aws/vend/moby/buildkit:buildx-stable-1
       - uses: docker/login-action@v4
         with:
           registry: ghcr.io
@@ -93,6 +95,20 @@ jobs:
             type=ref,event=tag
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
+      - name: Detect AWS promotion configuration
+        id: aws-release-config
+        shell: bash
+        env:
+          AWS_OIDC_ROLE_ARN: ${{ secrets.AWS_OIDC_ROLE_ARN }}
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        run: |
+          set -euo pipefail
+          if [[ -n "${AWS_OIDC_ROLE_ARN}" && -n "${AWS_ACCESS_KEY_ID}" && -n "${AWS_SECRET_ACCESS_KEY}" ]]; then
+            echo "enabled=true" >> "${GITHUB_OUTPUT}"
+          else
+            echo "enabled=false" >> "${GITHUB_OUTPUT}"
+          fi
       - name: Build and push
         id: build
         uses: docker/build-push-action@v7
@@ -109,7 +125,7 @@ jobs:
         shell: bash
         run: mkdir -p .release-metadata
       - name: Configure AWS credentials
-        if: ${{ matrix.ecr_repository != '' }}
+        if: ${{ matrix.ecr_repository != '' && steps.aws-release-config.outputs.enabled == 'true' }}
         uses: aws-actions/configure-aws-credentials@v6
         with:
           role-to-assume: ${{ secrets.AWS_OIDC_ROLE_ARN }}
@@ -117,11 +133,11 @@ jobs:
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region: ${{ env.AWS_REGION }}
       - name: Login to Amazon ECR
-        if: ${{ matrix.ecr_repository != '' }}
+        if: ${{ matrix.ecr_repository != '' && steps.aws-release-config.outputs.enabled == 'true' }}
         id: login-ecr
         uses: aws-actions/amazon-ecr-login@v2
       - name: Promote release image to Amazon ECR
-        if: ${{ matrix.ecr_repository != '' }}
+        if: ${{ matrix.ecr_repository != '' && steps.aws-release-config.outputs.enabled == 'true' }}
         id: promote
         shell: bash
         env:
@@ -219,6 +235,7 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
       - name: Notify ntfy
         if: always()
+        continue-on-error: true
         env:
           NTFY_TOKEN: ${{ secrets.NTFY_TOKEN }}
           NTFY_TOPIC: gha
