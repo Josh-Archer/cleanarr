@@ -1,6 +1,8 @@
+import cgi
 import datetime
 import hashlib
 import hmac
+import io
 import json
 import logging
 import os
@@ -32,6 +34,45 @@ _CREDENTIAL_CACHE = {
     "expires_at": datetime.datetime.min,
 }
 _CREDENTIAL_LOCK = threading.Lock()
+
+
+def _queue_url() -> str:
+    return os.environ.get("CLEANARR_WEBHOOK_QUEUE_URL", "").strip()
+
+
+def _queue_region() -> str:
+    return (os.environ.get("CLEANARR_WEBHOOK_QUEUE_REGION") or AWS_REGION).strip() or AWS_REGION
+
+
+def _forward_url() -> str:
+    return os.environ.get("CLEANARR_WEBHOOK_FORWARD_URL", "").strip().rstrip("/")
+
+
+def _proxy_sink_mode() -> str:
+    if _queue_url():
+        return "sqs"
+    if _forward_url():
+        return "lambda"
+    return "none"
+
+
+def _compute_event_flags(event_name: str, action_name: str) -> dict:
+    evt = (event_name or "").lower()
+    act = (action_name or "").lower()
+
+    is_finished = evt == "media.scrobble" or act == "mark_watched"
+    is_removed = evt == "library.remove"
+    is_paused = evt == "media.pause"
+    is_stopped = evt == "media.stop"
+
+    return {
+        "finished": is_finished,
+        "removed": is_removed,
+        "paused": is_paused,
+        "stopped": is_stopped,
+        "actionable": bool(is_finished or is_removed or is_paused or is_stopped),
+        "recorded": bool(is_finished or is_removed),
+    }
 
 def _hmac(key: bytes, value: str) -> bytes:
     return hmac.new(key, value.encode("utf-8"), hashlib.sha256).digest()
@@ -125,6 +166,27 @@ def _get_signing_credentials() -> dict:
         _CREDENTIAL_CACHE.update(refreshed)
         return _CREDENTIAL_CACHE.copy()
 
+
+def _get_queue_client():
+    try:
+        import boto3
+    except Exception:
+        LOG.exception("SQS sink requested but boto3 is unavailable")
+        return None
+
+    try:
+        credentials = _get_signing_credentials()
+        return boto3.client(
+            "sqs",
+            region_name=_queue_region(),
+            aws_access_key_id=credentials["access_key"],
+            aws_secret_access_key=credentials["secret_key"],
+            aws_session_token=credentials["session_token"],
+        )
+    except Exception:
+        LOG.exception("Failed to initialize SQS client")
+        return None
+
 def sign_headers(url: str, body: bytes, content_type: str, token: str = "") -> dict:
     credentials = _get_signing_credentials()
     parsed = urlsplit(url)
@@ -202,6 +264,132 @@ def sign_headers(url: str, body: bytes, content_type: str, token: str = "") -> d
         headers["X-Amz-Security-Token"] = credentials["session_token"]
     return headers
 
+
+def _parse_webhook_event(body: bytes, content_type: str, query_string: str, remote_addr: str, method: str) -> dict:
+    payload = None
+    event_name = None
+    action_name = None
+    parsed_query = dict(parse_qsl(query_string, keep_blank_values=True))
+
+    if method == "POST":
+        content_type_lower = (content_type or "").lower()
+        if "application/json" in content_type_lower:
+            payload = json.loads(body.decode("utf-8")) if body else None
+        elif "multipart/form-data" in content_type_lower or "application/x-www-form-urlencoded" in content_type_lower:
+            form = cgi.FieldStorage(
+                fp=io.BytesIO(body),
+                environ={
+                    "REQUEST_METHOD": "POST",
+                    "CONTENT_TYPE": content_type,
+                    "CONTENT_LENGTH": str(len(body)),
+                },
+                keep_blank_values=True,
+            )
+            event_name = form.getfirst("event") or parsed_query.get("event")
+            action_name = form.getfirst("action") or parsed_query.get("action")
+            payload_raw = form.getfirst("payload")
+            if payload_raw:
+                payload = json.loads(payload_raw)
+        else:
+            try:
+                payload = json.loads(body.decode("utf-8")) if body else None
+            except json.JSONDecodeError:
+                payload = None
+
+    if isinstance(payload, dict):
+        event_name = event_name or payload.get("event")
+        action_name = action_name or payload.get("action")
+        account = payload.get("Account") or payload.get("account")
+        meta = payload.get("Metadata") or payload.get("metadata")
+    else:
+        account = None
+        meta = None
+
+    if not account and isinstance(payload, dict) and payload.get("user"):
+        account = {"title": payload.get("user")}
+    if not meta and isinstance(payload, dict) and payload.get("rating_key"):
+        meta = {"ratingKey": payload.get("rating_key")}
+
+    return {
+        "received_at": datetime.datetime.utcnow().isoformat() + "Z",
+        "remote_addr": remote_addr,
+        "method": method,
+        "event": event_name,
+        "action": action_name,
+        **_compute_event_flags(event_name, action_name),
+        "payload": payload,
+        "account": {
+            "id": account.get("id") if isinstance(account, dict) else None,
+            "title": account.get("title") if isinstance(account, dict) else None,
+        }
+        if account
+        else None,
+        "metadata": {
+            "guid": meta.get("guid") if isinstance(meta, dict) else None,
+            "ratingKey": meta.get("ratingKey") if isinstance(meta, dict) else None,
+            "title": meta.get("title") if isinstance(meta, dict) else None,
+            "type": meta.get("type") if isinstance(meta, dict) else None,
+            "parentTitle": meta.get("parentTitle") if isinstance(meta, dict) else None,
+            "index": meta.get("index") if isinstance(meta, dict) else None,
+            "parentIndex": meta.get("parentIndex") if isinstance(meta, dict) else None,
+            "grandparentTitle": meta.get("grandparentTitle") if isinstance(meta, dict) else None,
+        }
+        if meta
+        else None,
+    }
+
+
+def _publish_webhook_event_to_sqs(ev: dict) -> bool:
+    queue_url = _queue_url()
+    if not queue_url:
+        return False
+
+    client = _get_queue_client()
+    if client is None:
+        return False
+
+    try:
+        client.send_message(
+            QueueUrl=queue_url,
+            MessageBody=json.dumps(ev, default=str, ensure_ascii=False),
+        )
+        return True
+    except Exception:
+        LOG.exception("Failed to publish webhook event to SQS")
+        return False
+
+
+def _forward_webhook_request(body: bytes, content_type: str, token: str):
+    lambda_url = _forward_url()
+    if not lambda_url:
+        return None
+
+    target = f"{lambda_url}/plex/webhook"
+    headers = sign_headers(target, body, content_type, token)
+    req = Request(target, data=body, headers=headers, method="POST")
+
+    try:
+        with urlopen(req, timeout=30) as resp:
+            payload = resp.read()
+            return {
+                "status": resp.status,
+                "content_type": resp.headers.get("Content-Type", "application/json"),
+                "payload": payload,
+            }
+    except HTTPError as exc:
+        return {
+            "status": exc.code,
+            "content_type": exc.headers.get("Content-Type", "application/json"),
+            "payload": exc.read(),
+        }
+    except URLError:
+        LOG.exception("Upstream invocation failed")
+        return {
+            "status": 502,
+            "content_type": "application/json",
+            "payload": b'{"error":"upstream_unreachable"}\n',
+        }
+
 class ProxyHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         if self.path != "/healthz":
@@ -235,46 +423,61 @@ class ProxyHandler(BaseHTTPRequestHandler):
             or WEBHOOK_SECRET
         )
 
-        lambda_url = os.environ.get("CLEANARR_WEBHOOK_FORWARD_URL", "").rstrip("/")
-        if not lambda_url:
+        if _queue_url():
+            try:
+                webhook_event = _parse_webhook_event(
+                    body,
+                    content_type,
+                    parsed_url.query,
+                    self.client_address[0] if self.client_address else "",
+                    self.command,
+                )
+            except Exception:
+                LOG.exception("Failed to normalize webhook event for SQS sink")
+                webhook_event = None
+
+            publish_failed = False
+            if webhook_event is not None and _publish_webhook_event_to_sqs(webhook_event):
+                response = json.dumps(
+                    {
+                        "status": "ok",
+                        "queued": True,
+                        "sink": _proxy_sink_mode(),
+                        "recorded": bool(webhook_event.get("recorded")),
+                    }
+                ).encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(response + b"\n")
+                return
+            publish_failed = True
+
+            if _forward_url():
+                LOG.info("Falling back to Lambda forwarding after SQS sink failure")
+            elif publish_failed:
+                self.send_response(502)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(b'{"error":"sqs_publish_failed"}\n')
+                return
+
+        forwarded = _forward_webhook_request(body, content_type, token)
+        if forwarded is None:
             self.send_response(500)
+            self.send_header("Content-Type", "application/json")
             self.end_headers()
             self.wfile.write(b'{"error":"CLEANARR_WEBHOOK_FORWARD_URL not set"}\n')
             return
 
-        target = f"{lambda_url}/plex/webhook"
-        headers = sign_headers(target, body, content_type, token)
-        req = Request(target, data=body, headers=headers, method="POST")
-
-        try:
-            with urlopen(req, timeout=30) as resp:
-                payload = resp.read()
-                self.send_response(resp.status)
-                self.send_header(
-                    "Content-Type",
-                    resp.headers.get("Content-Type", "application/json"),
-                )
-                self.end_headers()
-                self.wfile.write(payload)
-        except HTTPError as exc:
-            payload = exc.read()
-            self.send_response(exc.code)
-            self.send_header(
-                "Content-Type",
-                exc.headers.get("Content-Type", "application/json"),
-            )
-            self.end_headers()
-            self.wfile.write(payload)
-        except URLError:
-            LOG.exception("Upstream invocation failed")
-            self.send_response(502)
-            self.send_header("Content-Type", "application/json")
-            self.end_headers()
-            self.wfile.write(b'{"error":"upstream_unreachable"}\n')
+        self.send_response(forwarded["status"])
+        self.send_header("Content-Type", forwarded["content_type"])
+        self.end_headers()
+        self.wfile.write(forwarded["payload"])
 
     def log_message(self, format, *args):
         LOG.info("%s - %s", self.address_string(), format % args)
 
 def run_proxy(port: int):
-    LOG.info("Starting cleanarr webhook proxy on :%s", port)
+    LOG.info("Starting cleanarr webhook proxy on :%s (sink=%s)", port, _proxy_sink_mode())
     HTTPServer(("0.0.0.0", port), ProxyHandler).serve_forever()

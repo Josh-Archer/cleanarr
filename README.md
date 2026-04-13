@@ -50,8 +50,11 @@ The webhook app exposes a Plex webhook endpoint and health endpoint:
 It can:
 
 - record incoming Plex events
+- process Plex webhook events directly when you run the webhook app as the ingress endpoint
 - enqueue actionable webhook events to SQS when staged queue mode is enabled
 - process queued webhook events in the SQS consumer runtime, either by direct SQS event records from Lambda event source mappings or by explicit queue polling when polling is enabled
+- let the in-cluster proxy publish directly to SQS when `CLEANARR_WEBHOOK_QUEUE_URL` is configured
+- keep Lambda URL forwarding available as a compatibility fallback when `CLEANARR_WEBHOOK_FORWARD_URL` is set
 - optionally trigger deletion handling for `media.scrobble`, `media.stop`, and removal-style events
 - optionally sync watch state to another Plex server
 - expose dependency health for probes and monitoring
@@ -84,6 +87,9 @@ Downstream repos are expected to own:
 - secret injection
 - ingress, Cloud Run, or service exposure
 - image pinning and rollout strategy
+- AWS IAM, queues, Lambda event wiring, and rollout orchestration for a given environment
+
+The proxy harness code stays in this repository because it is part of the reusable webhook runtime contract. Environment-specific deployment decisions, including whether that proxy runs in-cluster and which queue or IAM role it targets, belong in the downstream repo.
 
 ### Flow
 
@@ -99,6 +105,13 @@ Plex watch state / webhook events
             +--> Plex watchlist cleanup
             +--> ntfy summaries / health notifications
 ```
+
+Webhook ingress can be wired in either of these supported shapes:
+
+- direct: Plex -> `apps/webhook` runtime -> cleanup logic
+- decoupled: Plex -> in-cluster proxy -> SQS -> webhook consumer runtime
+
+In the decoupled shape, the proxy can publish directly to SQS. Lambda URL forwarding is retained only as a compatibility fallback during rollout or recovery.
 
 ## Images
 
@@ -200,6 +213,7 @@ Transmission is optional unless you want torrent maintenance or torrent removal 
 | `CLEANARR_WEBHOOK_QUEUE_MAX_MESSAGES` | `50` | Maximum SQS messages consumed in one poll cycle |
 | `CLEANARR_WEBHOOK_QUEUE_WAIT_SECONDS` | `1` | Long-poll wait time for SQS receives |
 | `CLEANARR_WEBHOOK_QUEUE_VISIBILITY_TIMEOUT` | `0` | Optional visibility timeout override for consumed messages |
+| `CLEANARR_WEBHOOK_FORWARD_URL` | unset | Optional Lambda URL fallback for the proxy harness when direct SQS publishing is unavailable |
 
 ### Cross-Plex Sync Flags
 
