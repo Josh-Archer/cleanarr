@@ -73,6 +73,27 @@ class TestWebhookQueueMode(unittest.TestCase):
         self.assertTrue(data['recorded'])
         process_actions.assert_called_once()
 
+    def test_webhook_processes_directly_when_queue_mode_disabled(self):
+        payload = {
+            'event': 'media.scrobble',
+            'Metadata': {'guid': 'plex://movie/789', 'ratingKey': '789'},
+            'Account': {'id': 3, 'title': 'carol'},
+        }
+
+        with patch.object(webhook_app, 'WEBHOOK_SECRET', None), \
+             patch.object(webhook_app, '_start_background_threads'), \
+             patch.object(webhook_app, '_queue_enqueuing_enabled', return_value=False), \
+             patch.object(webhook_app, '_enqueue_webhook_event') as enqueue_event, \
+             patch.object(webhook_app, '_process_webhook_event_actions', return_value={'recorded': True}) as process_actions:
+            response = self.client.post('/plex/webhook', json=payload)
+
+        self.assertEqual(response.status_code, 200)
+        data = response.get_json()
+        self.assertFalse(data['queued'])
+        self.assertTrue(data['recorded'])
+        enqueue_event.assert_not_called()
+        process_actions.assert_called_once()
+
     def test_process_sqs_queue_messages_processes_and_deletes(self):
         fake_client = _FakeSqsClient([
             {
@@ -125,12 +146,31 @@ class TestWebhookQueueMode(unittest.TestCase):
         self.assertEqual(summary['processed'], 1)
         self.assertEqual(summary['deleted'], 0)
         self.assertEqual(summary['failed'], 0)
+        self.assertEqual(summary['failed_message_ids'], [])
         process_actions.assert_called_once()
 
         args, kwargs = process_actions.call_args
         self.assertEqual(kwargs.get('async_mode'), False)
         self.assertEqual(kwargs.get('force_deletions'), True)
         self.assertEqual(args[0]['queue_message_id'], 'msg-2')
+
+    def test_process_sqs_event_records_tracks_failed_message_ids(self):
+        records = [
+            {
+                'messageId': 'msg-3',
+                'MessageId': 'msg-3',
+                'body': json.dumps({'event': 'media.scrobble'}),
+                'Body': json.dumps({'event': 'media.scrobble'}),
+            }
+        ]
+
+        with patch.object(webhook_app, '_process_webhook_event_actions', side_effect=RuntimeError('boom')):
+            summary = webhook_app.process_sqs_event_records(records, force_deletions=True)
+
+        self.assertEqual(summary['received'], 1)
+        self.assertEqual(summary['processed'], 0)
+        self.assertEqual(summary['failed'], 1)
+        self.assertEqual(summary['failed_message_ids'], ['msg-3'])
 
 
 if __name__ == '__main__':
