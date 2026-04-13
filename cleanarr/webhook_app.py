@@ -686,6 +686,7 @@ def process_sqs_event_records(records, force_deletions: bool = True):
         'processed': 0,
         'deleted': 0,
         'failed': 0,
+        'failed_message_ids': [],
         'reason': '',
     }
 
@@ -696,6 +697,9 @@ def process_sqs_event_records(records, force_deletions: bool = True):
             summary['processed'] += 1
         except Exception:
             summary['failed'] += 1
+            message_id = record.get('messageId') or record.get('MessageId')
+            if message_id:
+                summary['failed_message_ids'].append(str(message_id))
             logger.exception('Failed to process event source mapping SQS record')
 
     return summary
