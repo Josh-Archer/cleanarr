@@ -343,6 +343,13 @@ class MediaCleanup:
                 for lbl in (getattr(torrent, "labels", None) or [])
                 if lbl and lbl.strip()
             }
+            # Readarr currently lacks the ability to send labels to Transmission.
+            # As a fallback, if the download directory name matches a required label,
+            # we consider it a match.
+            category = _get_torrent_category(torrent)
+            if category and category in required_labels:
+                torrent_labels.add(category)
+
             if not torrent_labels.intersection(required_labels):
                 logger.info(
                     f"Skipping torrent cleanup for {torrent_name} "
