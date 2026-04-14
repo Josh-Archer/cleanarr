@@ -1,4 +1,4 @@
-﻿#!/usr/bin/env python3
+#!/usr/bin/env python3
 """Core Cleanarr cleanup logic shared by the job and webhook harnesses."""
 
 import os
