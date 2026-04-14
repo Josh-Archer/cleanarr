@@ -48,6 +48,11 @@ def _forward_url() -> str:
     return os.environ.get("CLEANARR_WEBHOOK_FORWARD_URL", "").strip().rstrip("/")
 
 
+def _ignored_libraries() -> set[str]:
+    raw = os.environ.get("CLEANARR_WEBHOOK_IGNORED_LIBRARIES", "")
+    return {item.strip().casefold() for item in raw.split(",") if item.strip()}
+
+
 def _proxy_sink_mode() -> str:
     if _queue_url():
         return "sqs"
@@ -329,6 +334,8 @@ def _parse_webhook_event(body: bytes, content_type: str, query_string: str, remo
             "ratingKey": meta.get("ratingKey") if isinstance(meta, dict) else None,
             "title": meta.get("title") if isinstance(meta, dict) else None,
             "type": meta.get("type") if isinstance(meta, dict) else None,
+            "librarySectionTitle": meta.get("librarySectionTitle") if isinstance(meta, dict) else None,
+            "sectionTitle": meta.get("sectionTitle") if isinstance(meta, dict) else None,
             "parentTitle": meta.get("parentTitle") if isinstance(meta, dict) else None,
             "index": meta.get("index") if isinstance(meta, dict) else None,
             "parentIndex": meta.get("parentIndex") if isinstance(meta, dict) else None,
@@ -357,6 +364,41 @@ def _publish_webhook_event_to_sqs(ev: dict) -> bool:
     except Exception:
         LOG.exception("Failed to publish webhook event to SQS")
         return False
+
+
+def _library_name_from_event(webhook_event: dict | None) -> str:
+    if not isinstance(webhook_event, dict):
+        return ""
+
+    metadata = webhook_event.get("metadata")
+    if isinstance(metadata, dict):
+        for key in ("librarySectionTitle", "sectionTitle", "library"):
+            value = metadata.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+
+    payload = webhook_event.get("payload")
+    if isinstance(payload, dict):
+        meta = payload.get("Metadata") or payload.get("metadata")
+        if isinstance(meta, dict):
+            for key in ("librarySectionTitle", "sectionTitle", "library"):
+                value = meta.get(key)
+                if isinstance(value, str) and value.strip():
+                    return value.strip()
+
+    return ""
+
+
+def _should_ignore_event(webhook_event: dict | None) -> bool:
+    ignored = _ignored_libraries()
+    if not ignored:
+        return False
+
+    library_name = _library_name_from_event(webhook_event)
+    if not library_name:
+        return False
+
+    return library_name.casefold() in ignored
 
 
 def _forward_webhook_request(body: bytes, content_type: str, token: str):
@@ -435,6 +477,23 @@ class ProxyHandler(BaseHTTPRequestHandler):
             except Exception:
                 LOG.exception("Failed to normalize webhook event for SQS sink")
                 webhook_event = None
+
+            if _should_ignore_event(webhook_event):
+                library_name = _library_name_from_event(webhook_event)
+                LOG.info("Ignoring webhook event from filtered Plex library '%s'", library_name)
+                response = json.dumps(
+                    {
+                        "status": "ignored",
+                        "reason": "ignored_library",
+                        "library": library_name,
+                        "sink": _proxy_sink_mode(),
+                    }
+                ).encode("utf-8")
+                self.send_response(202)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(response + b"\n")
+                return
 
             publish_failed = False
             if webhook_event is not None and _publish_webhook_event_to_sqs(webhook_event):
