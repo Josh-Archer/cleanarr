@@ -172,6 +172,89 @@ class TestWebhookQueueMode(unittest.TestCase):
         self.assertEqual(summary['failed'], 1)
         self.assertEqual(summary['failed_message_ids'], ['msg-3'])
 
+    def test_finished_episode_cleanup_sends_ntfy_after_successful_delete_and_unmonitor(self):
+        event = {
+            'metadata': {'type': 'episode', 'ratingKey': '123'},
+            'account': {'title': 'alice'},
+        }
+        plex_item = type(
+            'PlexEpisode',
+            (),
+            {
+                'type': 'episode',
+                'grandparentTitle': "Margo's Got Money Troubles",
+                'parentTitle': "Margo's Got Money Troubles",
+                'seasonNumber': 1,
+                'parentIndex': 1,
+                'index': 1,
+                'title': 'Pilot',
+                'locations': ['/tv/margo-s01e01.mkv'],
+                'guid': 'plex://episode/123',
+                'ratingKey': '123',
+            },
+        )()
+        mc = unittest.mock.MagicMock()
+        mc.plex.fetchItem.return_value = plex_item
+        mc.match_episode_to_sonarr.return_value = {
+            'file_id': 7032,
+            'series': {'tags': [10]},
+            'episode': {'id': 16057, 'tags': []},
+        }
+        mc.get_sonarr_tags.return_value = [{'id': 10, 'label': '1-josharcher354'}]
+        mc.get_user_tags.return_value = ['josharcher354']
+        mc.should_delete_media.return_value = True
+        mc.delete_sonarr_episode_file.return_value = True
+        mc.unmonitor_sonarr_episode.return_value = True
+
+        with patch.object(webhook_app, '_get_media_cleanup', return_value=mc), \
+             patch.object(webhook_app, '_send_ntfy') as send_ntfy:
+            webhook_app._background_process_finished(event)
+
+        send_ntfy.assert_called_once_with(
+            "Webhook: Cleaned up Margo's Got Money Troubles S1E1 - Pilot",
+            title="Cleanarr Webhook: Episode Cleaned Up",
+        )
+
+    def test_finished_episode_cleanup_skips_ntfy_when_unmonitor_fails(self):
+        event = {
+            'metadata': {'type': 'episode', 'ratingKey': '123'},
+            'account': {'title': 'alice'},
+        }
+        plex_item = type(
+            'PlexEpisode',
+            (),
+            {
+                'type': 'episode',
+                'grandparentTitle': "Margo's Got Money Troubles",
+                'parentTitle': "Margo's Got Money Troubles",
+                'seasonNumber': 1,
+                'parentIndex': 1,
+                'index': 1,
+                'title': 'Pilot',
+                'locations': ['/tv/margo-s01e01.mkv'],
+                'guid': 'plex://episode/123',
+                'ratingKey': '123',
+            },
+        )()
+        mc = unittest.mock.MagicMock()
+        mc.plex.fetchItem.return_value = plex_item
+        mc.match_episode_to_sonarr.return_value = {
+            'file_id': 7032,
+            'series': {'tags': [10]},
+            'episode': {'id': 16057, 'tags': []},
+        }
+        mc.get_sonarr_tags.return_value = [{'id': 10, 'label': '1-josharcher354'}]
+        mc.get_user_tags.return_value = ['josharcher354']
+        mc.should_delete_media.return_value = True
+        mc.delete_sonarr_episode_file.return_value = True
+        mc.unmonitor_sonarr_episode.return_value = False
+
+        with patch.object(webhook_app, '_get_media_cleanup', return_value=mc), \
+             patch.object(webhook_app, '_send_ntfy') as send_ntfy:
+            webhook_app._background_process_finished(event)
+
+        send_ntfy.assert_not_called()
+
 
 if __name__ == '__main__':
     unittest.main()

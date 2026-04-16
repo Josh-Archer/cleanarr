@@ -1164,6 +1164,12 @@ def _background_process_finished(ev: dict):
     rating_key = meta.get('ratingKey')
     logger.info(f"Processing finished event for rating key: {rating_key}")
 
+    def _notify_episode_cleanup_success(ep: dict):
+        _send_ntfy(
+            f"Webhook: Cleaned up {ep['show_title']} S{ep['season']}E{ep['episode']} - {ep.get('title') or 'episode'}",
+            title="Cleanarr Webhook: Episode Cleaned Up"
+        )
+
     try:
         # Try to fetch the Plex item by rating key if available
         plex_item = None
@@ -1270,7 +1276,8 @@ def _background_process_finished(ev: dict):
                         # For finished events without Plex item, assume it should be deleted if watched
                         logger.info(f"Webhook-triggered deletion (fallback): deleting {ep['show_title']} S{ep['season']}E{ep['episode']}")
                         if mc.delete_sonarr_episode_file(sonarr_match.get('file_id')):
-                            mc.unmonitor_sonarr_episode(sonarr_match['episode']['id'])
+                            if mc.unmonitor_sonarr_episode(sonarr_match['episode']['id']):
+                                _notify_episode_cleanup_success(ep)
                             if ep.get('rating_key'):
                                 mc.remove_from_plex_watchlist(ep.get('rating_key'))
                         return
@@ -1364,7 +1371,8 @@ def _background_process_finished(ev: dict):
             if should_delete:
                 logger.info(f"Webhook-triggered deletion: deleting {ep['show_title']} S{ep['season']}E{ep['episode']}")
                 if mc.delete_sonarr_episode_file(sonarr_match.get('file_id')):
-                    mc.unmonitor_sonarr_episode(sonarr_match['episode']['id'])
+                    if mc.unmonitor_sonarr_episode(sonarr_match['episode']['id']):
+                        _notify_episode_cleanup_success(ep)
                     if ep['file']:
                         mc.remove_torrent_by_file_path(ep['file'])
                     if ep.get('rating_key'):

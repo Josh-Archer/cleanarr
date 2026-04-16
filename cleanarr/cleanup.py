@@ -966,7 +966,7 @@ class MediaCleanup:
         """Unmonitor an episode in Sonarr."""
         if CONFIG["dry_run"]:
             logger.info(f"[DRY RUN] Would unmonitor episode {episode_id} in Sonarr")
-            return
+            return True
         logger.info(f"Attempting to unmonitor episode {episode_id} in Sonarr")
         episode = self._sonarr_request(f"episode/{episode_id}")
         if episode:
@@ -974,16 +974,19 @@ class MediaCleanup:
             result = self._sonarr_request(f"episode/{episode_id}", method="PUT", data=episode)
             if result is not None:
                 logger.info(f"Unmonitored episode {episode_id}")
+                return True
             else:
                 logger.error(f"Failed to unmonitor episode {episode_id}")
+                return False
         else:
             logger.error(f"Failed to retrieve episode {episode_id} for unmonitoring")
+            return False
 
     def unmonitor_radarr_movie(self, movie_id):
         """Unmonitor a movie in Radarr."""
         if CONFIG["dry_run"]:
             logger.info(f"[DRY RUN] Would unmonitor movie {movie_id} in Radarr")
-            return
+            return True
         logger.info(f"Attempting to unmonitor movie {movie_id} in Radarr")
         movie = self._radarr_request(f"movie/{movie_id}")
         if movie:
@@ -991,10 +994,13 @@ class MediaCleanup:
             result = self._radarr_request("movie", method="PUT", data=movie)
             if result is not None:
                 logger.info(f"Unmonitored movie {movie_id}")
+                return True
             else:
                 logger.error(f"Failed to unmonitor movie {movie_id}")
+                return False
         else:
             logger.error(f"Failed to retrieve movie {movie_id} for unmonitoring")
+            return False
 
     def delete_sonarr_series(self, series_id):
         """Delete an entire series from Sonarr."""
