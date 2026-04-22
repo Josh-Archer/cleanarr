@@ -1,18 +1,11 @@
-[build-system]
+﻿[build-system]
 requires = ["setuptools>=69", "wheel"]
 build-backend = "setuptools.build_meta"
 
-<<<<<<< HEAD
 [project]
 name = "cleanarr"
-version = "0.2.30"
+version = "0.2.31"
 description = "Reusable Plex/Sonarr/Radarr cleanup runtime with cronjob and webhook harnesses."
-=======
-[project]
-name = "cleanarr"
-version = "0.2.30"
-description = "Reusable Plex/Sonarr/Radarr cleanup runtime with cronjob and webhook harnesses."
->>>>>>> d187b423be982255ea14735a43c07454212efa3c
 readme = "README.md"
 requires-python = ">=3.11"
 license = { text = "MIT" }
@@ -33,4 +26,3 @@ dev = ["flake8>=7.1"]
 
 [tool.setuptools.packages.find]
 where = ["."]
-
