@@ -99,7 +99,7 @@ def _compute_event_flags(event_name: str, action_name: str, platform: str = "ple
     act = (action_name or "").lower()
 
     if platform == "jellyfin":
-        is_finished = evt == "itemmarkplayed" or evt == "playbackstopped"
+        is_finished = evt == "itemmarkplayed" or evt == "playbackstopped" or evt == "userdatasaved" or evt == "userdatasaved"
         is_removed = False # Jellyfin doesn't typically send library.remove via standard webhooks
         is_paused = evt == "playbackpaused"
         is_stopped = evt == "playbackstopped"
@@ -656,3 +656,4 @@ class ProxyHandler(BaseHTTPRequestHandler):
 def run_proxy(port: int):
     LOG.info("Starting cleanarr webhook proxy on :%s (sink=%s)", port, _proxy_sink_mode())
     HTTPServer(("0.0.0.0", port), ProxyHandler).serve_forever()
+

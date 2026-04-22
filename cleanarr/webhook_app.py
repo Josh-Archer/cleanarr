@@ -894,7 +894,7 @@ def jellyfin_webhook():
     }
 
     # Compute flags for Jellyfin
-    is_finished = event_name.lower() in ("itemmarkplayed", "playbackstopped")
+    is_finished = event_name.lower() in ("itemmarkplayed", "playbackstopped", "userdatasaved")
     is_paused = event_name.lower() == "playbackpaused"
     is_stopped = event_name.lower() == "playbackstopped"
     

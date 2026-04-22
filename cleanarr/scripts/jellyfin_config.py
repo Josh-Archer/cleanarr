@@ -1,4 +1,4 @@
-﻿import json
+import json
 import os
 import sys
 import xml.etree.ElementTree as ET
@@ -72,7 +72,7 @@ def configure_jellyfin_webhook():
   "NotificationUsername": "{{NotificationUsername}}",
   "UserId": "{{UserId}}",
   "ItemType": "{{ItemType}}",
-  "ProviderIds": {{{ProviderIds}}},
+  "ProviderIds": {{{json_encode ProviderIds}}},
   "Name": "{{Name}}"
 }"""
 
