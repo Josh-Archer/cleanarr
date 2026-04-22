@@ -215,6 +215,14 @@ class MediaCleanup:
             "protected_skips": [],
             "errors": [],
         }
+        self._arr_cache = {
+            "sonarr_tags": None,
+            "radarr_tags": None,
+            "sonarr_series": None,
+            "radarr_movies": None,
+            "sonarr_episodes_by_series_id": {},
+            "radarr_managed_movie_roots": None,
+        }
         if not CONFIG["plex"]["token"]:
             logger.error("Missing Plex token. Set CLEANARR_PLEX_TOKEN or PLEX_TOKEN.")
             sys.exit(1)
@@ -732,32 +740,145 @@ class MediaCleanup:
     def get_sonarr_tags(self):
         """Get all tags from Sonarr. Returns None on error."""
         logger.debug("Getting Sonarr tags")
-        return self._sonarr_request("tag")
+        if self._arr_cache["sonarr_tags"] is not None:
+            return self._arr_cache["sonarr_tags"]
+
+        tags = self._sonarr_request("tag")
+        if tags is not None:
+            self._arr_cache["sonarr_tags"] = tags
+        return tags
 
     def get_radarr_tags(self):
         """Get all tags from Radarr. Returns None on error."""
         logger.debug("Getting Radarr tags")
-        return self._radarr_request("tag")
+        if self._arr_cache["radarr_tags"] is not None:
+            return self._arr_cache["radarr_tags"]
+
+        tags = self._radarr_request("tag")
+        if tags is not None:
+            self._arr_cache["radarr_tags"] = tags
+        return tags
 
     def get_sonarr_series(self):
         """Get all series from Sonarr."""
         logger.debug("Getting Sonarr series")
-        return self._sonarr_request("series") or []
+        if self._arr_cache["sonarr_series"] is not None:
+            return self._arr_cache["sonarr_series"]
+
+        series = self._sonarr_request("series")
+        if series is not None:
+            self._arr_cache["sonarr_series"] = series or []
+            return self._arr_cache["sonarr_series"]
+        return []
 
     def get_radarr_movies(self):
         """Get all movies from Radarr."""
         logger.debug("Getting Radarr movies")
-        return self._radarr_request("movie") or []
+        if self._arr_cache["radarr_movies"] is not None:
+            return self._arr_cache["radarr_movies"]
+
+        movies = self._radarr_request("movie")
+        if movies is not None:
+            self._arr_cache["radarr_movies"] = movies or []
+            return self._arr_cache["radarr_movies"]
+        return []
+
+    def get_sonarr_episodes_for_series(self, series_id):
+        """Get Sonarr episodes for a series, cached per series ID."""
+        cache = self._arr_cache["sonarr_episodes_by_series_id"]
+        if series_id in cache:
+            return cache[series_id]
+
+        episodes = self._sonarr_request(f"episode?seriesId={series_id}") or []
+        cache[series_id] = episodes
+        return episodes
 
     def get_sonarr_episode(self, series_id, season_number, episode_number):
         """Get episode from Sonarr by series ID, season, and episode numbers."""
         logger.debug(f"Getting Sonarr episode: series={series_id}, S{season_number}E{episode_number}")
-        episodes = self._sonarr_request(f"episode?seriesId={series_id}")
+        episodes = self.get_sonarr_episodes_for_series(series_id)
         if episodes:
             for episode in episodes:
                 if episode["seasonNumber"] == season_number and episode["episodeNumber"] == episode_number:
                     return episode
         return None
+
+    def _extract_radarr_movie_external_ids(self, movie):
+        """Build a normalized external-id set for a Radarr movie."""
+        if not isinstance(movie, dict):
+            return set()
+        ids = set()
+
+        for key, prefix in (("imdbId", "imdb"), ("tmdbId", "tmdb"), ("tvdbId", "tvdb")):
+            value = movie.get(key)
+            if value:
+                ids.add(f"{prefix}:{str(value).strip().lower()}")
+
+        if not ids:
+            # Plex sometimes references TVDB through external IDs in nested metadata.
+            external_ids = movie.get("ids", {})
+            if isinstance(external_ids, dict):
+                for key, value in external_ids.items():
+                    if value:
+                        ids.add(f"{str(key).lower()}:{str(value).strip().lower()}")
+
+        return ids
+
+    def _extract_plex_movie_external_ids(self, movie):
+        """Build a normalized external-id set for a Plex movie item."""
+        if not isinstance(movie, dict):
+            return set()
+        ids = set()
+
+        guid = movie.get("guid") or ""
+        for match in re.finditer(r"([a-z0-9]+)://([^/?]+)", str(guid), re.IGNORECASE):
+            source = match.group(1).lower()
+            value = match.group(2).strip()
+            if value:
+                ids.add(f"{source}:{value}")
+
+        for key in ("imdbId", "tmdbId", "tvdbId", "tvmazeId"):
+            value = movie.get(key)
+            if value:
+                ids.add(f"{key[:-2].lower()}:{str(value).strip().lower()}")
+
+        return ids
+
+    def _radarr_managed_movie_roots(self):
+        """Return cached Radarr-managed movie paths for fast membership checks."""
+        cached_roots = self._arr_cache["radarr_managed_movie_roots"]
+        if cached_roots is not None:
+            return cached_roots
+
+        movies = self.get_radarr_movies()
+        roots = []
+        for movie in movies if isinstance(movies, list) else []:
+            path = movie.get("path") if isinstance(movie, dict) else None
+            if not path:
+                continue
+            root = os.path.normpath(str(path))
+            if root and root not in roots:
+                roots.append(root)
+
+        self._arr_cache["radarr_managed_movie_roots"] = roots
+        return roots
+
+    def _is_movie_file_in_radarr_path(self, file_path):
+        """Return True when a movie file path is within cached Radarr-managed movie paths."""
+        if not file_path:
+            return False
+
+        normalized_file = os.path.normcase(os.path.normpath(file_path))
+        for root in self._radarr_managed_movie_roots():
+            normalized_root = os.path.normcase(os.path.normpath(root))
+            if not normalized_root:
+                continue
+            if normalized_file == normalized_root:
+                return True
+            prefix = normalized_root + os.sep
+            if normalized_file.startswith(prefix):
+                return True
+        return False
 
     def match_episode_to_sonarr(self, episode):
         """Match a Plex episode to Sonarr."""
@@ -854,6 +975,8 @@ class MediaCleanup:
 
         # Final fallback: containment matching (with year)
         target_tokens = tokenize(movie["title"])
+        plex_external_ids = self._extract_plex_movie_external_ids(movie)
+        candidate_matches = []
         for m in movie_list:
             if m["year"] == movie["year"]:
                 candidate_tokens = tokenize(m["title"])
@@ -865,13 +988,24 @@ class MediaCleanup:
                         or candidate_tokens.issubset(target_tokens)
                     )
                 ):
-                    logger.info(
-                        f"Matched by token subset: Radarr='{m['title']}' for Plex='{movie['title']}'"
-                    )
-                    return {
-                        "movie": m,
-                        "file_id": m.get("movieFile", {}).get("id")
-                    }
+                    candidate_matches.append(m)
+
+        for candidate in candidate_matches:
+            radarr_external_ids = self._extract_radarr_movie_external_ids(candidate)
+            if plex_external_ids and radarr_external_ids and plex_external_ids.intersection(radarr_external_ids):
+                logger.info(
+                    f"Matched by token subset + external IDs: Radarr='{candidate['title']}' for Plex='{movie['title']}'"
+                )
+                return {
+                    "movie": candidate,
+                    "file_id": candidate.get("movieFile", {}).get("id")
+                }
+
+        if candidate_matches:
+            logger.debug(
+                "Skipping token-subset movie match because external IDs do not overlap: "
+                f"Plex='{movie['title']}' ({movie['year']})"
+            )
 
         logger.warning(f"Movie not found in Radarr: {movie['title']} ({movie['year']})")
         return None
@@ -1354,7 +1488,7 @@ class MediaCleanup:
 
         for series in sonarr_series_list:
             show_title = series["title"]
-            episodes = self._sonarr_request(f"episode?seriesId={series['id']}") or []
+            episodes = self.get_sonarr_episodes_for_series(series["id"]) or []
             # Build a mapping: (season, episode) -> episode dict
             all_eps = {(ep["seasonNumber"], ep["episodeNumber"]): ep for ep in episodes}
             # For each user, check for watched ahead
@@ -1466,6 +1600,7 @@ class MediaCleanup:
         if radarr_tags is None:
             logger.error("Failed to fetch Radarr tags; aborting watched movie processing to prevent accidental deletions.")
             return
+        radarr_managed_roots = self._radarr_managed_movie_roots()
         
         for movie in watched_movies:
             if not movie["file"]:
@@ -1473,6 +1608,17 @@ class MediaCleanup:
                 continue
             radarr_match = self.match_movie_to_radarr(movie)
             if not radarr_match:
+                if radarr_managed_roots and not self._is_movie_file_in_radarr_path(movie["file"]):
+                    logger.info(
+                        f"Skipping watched movie outside Radarr-managed paths: {movie['title']} ({movie['year']}) "
+                        f"path={movie['file']}"
+                    )
+                    logger.debug(
+                        "Movie was not matched in Radarr and was outside cached managed paths: "
+                        f"{movie['file']} not in {radarr_managed_roots}"
+                    )
+                else:
+                    logger.warning(f"Movie not found in Radarr: {movie['title']} ({movie['year']})")
                 continue
             movie_tags = radarr_match["movie"].get("tags", [])
             kids_tag = next((tag for tag in radarr_tags if _normalize_tag_label(tag.get("label")) == "kids"), None)

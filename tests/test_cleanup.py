@@ -222,16 +222,46 @@ class TestMediaCleanup(unittest.TestCase):
                     "title": "Marvel Studios' The Fantastic Four: First Steps - World Premiere",
                     "year": 2025,
                     "id": 2,
+                    "tmdbId": "12345",
                     "movieFile": {"id": 12},
                 }
             ],
         )
 
-        plex_movie = {'title': 'The Fantastic Four: First Steps', 'year': 2025}
+        plex_movie = {
+            'title': 'The Fantastic Four: First Steps',
+            'year': 2025,
+            'guid': 'tmdb://12345',
+        }
         match = self.cleanup.match_movie_to_radarr(plex_movie)
 
         self.assertIsNotNone(match)
         self.assertEqual(match['movie']['id'], 2)
+
+    def test_match_movie_to_radarr_rejects_world_premiere_variant_without_external_id_match(self):
+        """Token-subset fallback should not match title variants with no shared external IDs."""
+        self.mock_session.get.return_value = MagicMock(
+            status_code=200,
+            text="ok",
+            json=lambda: [
+                {
+                    "title": "Marvel Studios' The Fantastic Four: First Steps - World Premiere",
+                    "year": 2025,
+                    "id": 3,
+                    "tmdbId": "99999",
+                    "movieFile": {"id": 13},
+                }
+            ],
+        )
+
+        plex_movie = {
+            'title': 'The Fantastic Four: First Steps',
+            'year': 2025,
+            'guid': 'tmdb://12345',
+        }
+        match = self.cleanup.match_movie_to_radarr(plex_movie)
+
+        self.assertIsNone(match)
 
     def test_match_movie_to_radarr_ignores_generic_single_word_candidate(self):
         """Single-word candidates should not match unrelated long Plex titles."""
@@ -266,6 +296,63 @@ class TestMediaCleanup(unittest.TestCase):
         self.assertIn('user2', user_tags)
         self.assertNotIn('safe', user_tags)
 
+    def test_radarr_movie_delete_empty_body_is_success(self):
+        """Delete responses with empty body from Radarr should count as success."""
+        with patch.object(self.cleanup, '_radarr_request', return_value={}) as mock_request:
+            result = self.cleanup.delete_radarr_movie_file(321)
+
+        self.assertTrue(result)
+        mock_request.assert_called_once_with("moviefile/321", method="DELETE")
+
+    def test_sonarr_tags_cached_for_single_run(self):
+        """Sonarr tags should be fetched once per run and then reused."""
+        with patch.object(self.cleanup, "_sonarr_request", return_value=[{"id": 1, "label": "safe"}]) as mock_request:
+            first = self.cleanup.get_sonarr_tags()
+            second = self.cleanup.get_sonarr_tags()
+
+        self.assertEqual(first, second)
+        mock_request.assert_called_once_with("tag")
+
+    def test_radarr_tags_cached_for_single_run(self):
+        """Radarr tags should be fetched once per run and then reused."""
+        with patch.object(self.cleanup, "_radarr_request", return_value=[{"id": 1, "label": "safe"}]) as mock_request:
+            first = self.cleanup.get_radarr_tags()
+            second = self.cleanup.get_radarr_tags()
+
+        self.assertEqual(first, second)
+        mock_request.assert_called_once_with("tag")
+
+    def test_sonarr_series_cached_for_single_run(self):
+        """Sonarr series list should be fetched once per run and then reused."""
+        with patch.object(self.cleanup, "_sonarr_request", return_value=[{"id": 10, "title": "Test"}]) as mock_request:
+            first = self.cleanup.get_sonarr_series()
+            second = self.cleanup.get_sonarr_series()
+
+        self.assertEqual(first, second)
+        mock_request.assert_called_once_with("series")
+
+    def test_radarr_movies_cached_for_single_run(self):
+        """Radarr movie catalog should be fetched once per run and then reused."""
+        with patch.object(self.cleanup, "_radarr_request", return_value=[{"id": 5, "title": "Movie", "year": 2024, "path": "/media/movies"}]) as mock_request:
+            first = self.cleanup.get_radarr_movies()
+            second = self.cleanup.get_radarr_movies()
+
+        self.assertEqual(first, second)
+        mock_request.assert_called_once_with("movie")
+
+    def test_sonarr_episodes_cached_per_series_id_for_single_run(self):
+        """Sonarr episode lists should be cached per series ID."""
+        episodes = [
+            {"seasonNumber": 1, "episodeNumber": 1},
+            {"seasonNumber": 1, "episodeNumber": 2},
+        ]
+        with patch.object(self.cleanup, "_sonarr_request", return_value=episodes) as mock_request:
+            first = self.cleanup.get_sonarr_episodes_for_series(7)
+            second = self.cleanup.get_sonarr_episodes_for_series(7)
+
+        self.assertEqual(first, second)
+        mock_request.assert_called_once_with("episode?seriesId=7")
+
     def test_process_watched_movies_skips_matched_items_without_movie_file_id(self):
         """Matched Radarr entries without a movie file should not attempt deletion."""
         movie = {
@@ -287,6 +374,33 @@ class TestMediaCleanup(unittest.TestCase):
             self.cleanup.process_watched_movies()
 
         mock_delete.assert_not_called()
+
+    def test_process_watched_movies_unmanaged_path_skips_without_warning(self):
+        """Watched movies outside Radarr-managed paths should log info instead of warning."""
+        movie = {
+            'title': 'External Movie',
+            'year': 2025,
+            'file': '/external/plex/External Movie (2025).mkv',
+            'watched_by': {'owner-user': True},
+            'rating_key': '999',
+            'guid': 'tmdb://98765',
+        }
+
+        with patch.object(self.cleanup, 'get_watched_movies', return_value=[movie]), \
+             patch.object(self.cleanup, 'get_radarr_tags', return_value=[]), \
+             patch.object(self.cleanup, 'get_radarr_movies', return_value=[{'path': '/radarr/movies'}]), \
+             patch.object(self.cleanup, 'match_movie_to_radarr', return_value=None), \
+             patch.object(cleanarr.logger, 'warning') as mock_warning, \
+             patch.object(cleanarr.logger, 'info') as mock_info:
+            self.cleanup.process_watched_movies()
+
+        self.assertEqual(mock_warning.call_count, 0)
+        self.assertTrue(
+            any(
+                "outside Radarr-managed paths" in str(call.args[0])
+                for call in mock_info.call_args_list
+            )
+        )
 
     def test_delete_episode_and_cleanup_records_tv_deletion_only_on_success(self):
         """Episode summaries should not report both deletion and failure for one delete."""

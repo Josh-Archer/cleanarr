@@ -183,6 +183,8 @@ SYNC_PROGRESS_EVENTS = os.environ.get('PLEX_SYNC_PROGRESS_EVENTS', 'false').lowe
 SYNC_PROGRESS_MIN_ADVANCE_MS = int(os.environ.get('PLEX_SYNC_PROGRESS_MIN_ADVANCE_MS', '15000'))
 WEBHOOK_SECRET = os.environ.get('WEBHOOK_SECRET')
 WEBHOOK_SECRET_PREVIOUS = os.environ.get('WEBHOOK_SECRET_PREVIOUS')
+JELLYFIN_WEBHOOK_SECRET = os.environ.get('JELLYFIN_WEBHOOK_SECRET')
+JELLYFIN_WEBHOOK_SECRET_PREVIOUS = os.environ.get('JELLYFIN_WEBHOOK_SECRET_PREVIOUS')
 _TARGET_PLEX = None
 _TARGET_PLEX_BY_TOKEN = {}
 _TARGET_PLEX_OWNER_KEYS_BY_TOKEN = {}
@@ -827,9 +829,13 @@ def healthz():
 @APP.route("/jellyfin/webhook", methods=["POST"])
 def jellyfin_webhook():
     # Verify authentication token if configured
-    if JELLYFIN_WEBHOOK_SECRET:
+    if JELLYFIN_WEBHOOK_SECRET or JELLYFIN_WEBHOOK_SECRET_PREVIOUS:
         token_val = request.headers.get('X-Cleanarr-Webhook-Token') or request.headers.get('X-Webhook-Token') or request.args.get('token')
-        if token_val != JELLYFIN_WEBHOOK_SECRET:
+        token_ok = (
+            token_val == JELLYFIN_WEBHOOK_SECRET
+            or (JELLYFIN_WEBHOOK_SECRET_PREVIOUS and token_val == JELLYFIN_WEBHOOK_SECRET_PREVIOUS)
+        )
+        if not token_ok:
             logger.warning(f"Unauthorized Jellyfin webhook attempt from {request.remote_addr}")
             return jsonify({"status": "error", "message": "Unauthorized"}), 401
 
