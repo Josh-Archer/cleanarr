@@ -525,7 +525,7 @@ def _compute_event_flags(ev: dict):
     # Only treat explicit watched events as finished.
     # Do not infer watched state from media.play/media.stop to avoid accidental promotion.
     # Also support Tautulli 'mark_watched' action.
-    if evt == 'media.scrobble' or act == 'mark_watched':
+    if evt == 'media.scrobble' or act == 'mark_watched' or evt in ('itemmarkplayed', 'playbackstopped', 'userdatasaved'):
         is_finished = True
     elif evt == 'library.remove':
         is_removed = True
