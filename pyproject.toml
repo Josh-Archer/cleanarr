@@ -1,10 +1,10 @@
-﻿[build-system]
+[build-system]
 requires = ["setuptools>=69", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "cleanarr"
-version = "0.2.31"
+version = "0.2.32"
 description = "Reusable Plex/Sonarr/Radarr cleanup runtime with cronjob and webhook harnesses."
 readme = "README.md"
 requires-python = ">=3.11"
