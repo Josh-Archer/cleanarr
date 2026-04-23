@@ -4,6 +4,7 @@ import hashlib
 import hmac
 import io
 import json
+import html
 import logging
 import os
 import threading
@@ -359,14 +360,14 @@ def _parse_jellyfin_webhook_event(body: bytes, remote_addr: str, method: str) ->
         "metadata": {
             "guid": guid,
             "ratingKey": None,
-            "title": title,
+            "title": html.unescape(payload.get("ItemName") or payload.get("Name") or ""),
             "type": "episode" if mtype in ("episode", "series") else "movie" if mtype == "movie" else mtype,
             "librarySectionTitle": None,
             "sectionTitle": None,
-            "parentTitle": payload.get("SeriesName"),
-            "index": payload.get("IndexNumber"),
-            "parentIndex": payload.get("ParentIndexNumber"),
-            "grandparentTitle": None,
+            "parentTitle": html.unescape(payload.get("SeriesName") or ""),
+            "index": payload.get("IndexNumber") or payload.get("EpisodeNumber"),
+            "parentIndex": payload.get("ParentIndexNumber") or payload.get("SeasonNumber"),
+            "grandparentTitle": html.unescape(payload.get("SeriesName") or ""),
         }
     }
 
