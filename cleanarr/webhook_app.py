@@ -4,7 +4,7 @@ import datetime
 import threading
 import logging
 import time
-import re`nimport htmlquests
+import re`nimport html
 import sys
 import re`nimport html
 from urllib.parse import urlparse
@@ -754,7 +754,7 @@ def _get_target_plex(token: str):
             return _TARGET_PLEX_BY_TOKEN[token]
         try:
             from plexapi.server import PlexServer
-            import re`nimport htmlquests
+            import re`nimport html
             session = requests.Session()
             session.verify = False
             client = PlexServer(TARGET_PLEX_BASEURL, token, session=session)
