@@ -2,6 +2,7 @@ import os
 import json
 import datetime
 import threading
+import logging
 from loguru import logger
 import time
 import re
@@ -19,7 +20,8 @@ APP = Flask(__name__)
 LOKI_URL = os.environ.get('LOKI_URL')
 if LOKI_URL:
     try:
-        from loguru import logger_loki
+        import logging
+from loguru import logger_loki
 
         cf_id = os.environ.get("CF_ACCESS_CLIENT_ID")
         cf_secret = os.environ.get("CF_ACCESS_CLIENT_SECRET")
@@ -55,7 +57,7 @@ if LOKI_URL:
         logger.addHandler(handler)
         logger.info(f"Loki logging enabled to {LOKI_URL}")
     except ImportError:
-        logging.warning("LOKI_URL set but python-logging-loki not installed; skipping Loki setup")
+        logger.warning("LOKI_URL set but python-logging-loki not installed; skipping Loki setup")
     except Exception:
         logging.exception("Failed to initialize Loki logging")
 
