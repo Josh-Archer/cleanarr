@@ -66,7 +66,7 @@ def _http_response_from_event(event):
 
 def lambda_handler(event, context):
     try:
-        logger.info("Starting Lambda execution for Cleanarr queued webhook processing")
+        logger.info("Starting Lambda execution for Cleanarr queued webhook processing"); logger.info(f"Event keys: {list(event.keys()) if isinstance(event, dict) else event}")
         records = event.get("Records") if isinstance(event, dict) else None
         if records:
             queue_summary = process_sqs_event_records(records, force_deletions=True)
