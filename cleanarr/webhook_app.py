@@ -2,7 +2,7 @@ import os
 import json
 import datetime
 import threading
-import logging
+from loguru import logger
 import time
 import re
 import html
@@ -11,15 +11,15 @@ import requests
 from flask import Flask, request, jsonify
 
 APP = Flask(__name__)
-logging.basicConfig(level=logging.INFO)
+
 # Avoid leaking webhook tokens in access logs (Werkzeug logs full request URLs).
-logging.getLogger("werkzeug").setLevel(logging.WARNING)
+
 
 # Setup Loki logging if configured
 LOKI_URL = os.environ.get('LOKI_URL')
 if LOKI_URL:
     try:
-        import logging_loki
+        from loguru import logger_loki
 
         cf_id = os.environ.get("CF_ACCESS_CLIENT_ID")
         cf_secret = os.environ.get("CF_ACCESS_CLIENT_SECRET")
@@ -65,7 +65,7 @@ EVENTS_FILE = os.environ.get("CLEANARR_EVENTS_FILE", os.path.join("/logs", "plex
 # Lazy MediaCleanup instance (created on first event processing)
 _MC = None
 _MC_LOCK = threading.Lock()
-logger = logging.getLogger(__name__)
+
 
 
 def _env_bool(name: str, default: bool = False) -> bool:
@@ -869,6 +869,7 @@ def jellyfin_webhook():
             pass
 
     # Map to internal format
+        logger.info(f"Jellyfin payload: {json.dumps(payload)}")
     mtype = (payload.get("ItemType") or "").lower()
     provider_ids = {str(k).lower(): v for k, v in (payload.get("ProviderIds") or {}).items() if v}
     guid = None
