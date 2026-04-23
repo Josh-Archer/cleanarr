@@ -4,8 +4,8 @@ import datetime
 import threading
 import logging
 import time
-import re
-import html
+            import re
+            import html
 import sys
 from urllib.parse import urlparse
 from flask import Flask, request, jsonify
@@ -755,7 +755,7 @@ def _get_target_plex(token: str):
         try:
             from plexapi.server import PlexServer
             import re
-import html
+            import html
             session = requests.Session()
             session.verify = False
             client = PlexServer(TARGET_PLEX_BASEURL, token, session=session)
