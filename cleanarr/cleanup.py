@@ -944,6 +944,12 @@ class MediaCleanup:
             "file_id": sonarr_episode.get("episodeFileId")
         }
 
+    def _years_match(self, y1, y2):
+        try:
+            return y1 is not None and y2 is not None and int(y1) == int(y2)
+        except (ValueError, TypeError):
+            return y1 == y2
+
     def match_movie_to_radarr(self, movie, *, log_unmatched=True):
         """Match a Plex movie to Radarr with fuzzy matching."""
         logger.info(f"Matching movie to Radarr: {movie['title']} ({movie['year']})")
@@ -971,7 +977,7 @@ class MediaCleanup:
 
         # Try exact match first (with year)
         for m in movie_list:
-            if m["title"].lower() == movie["title"].lower() and m["year"] == movie["year"]:
+            if m["title"].lower() == movie["title"].lower() and self._years_match(m["year"], movie["year"]):
                 return {
                     "movie": m,
                     "file_id": m.get("movieFile", {}).get("id")
@@ -980,7 +986,7 @@ class MediaCleanup:
         # Fallback: try normalized matching (with year)
         target_norm = normalize(movie["title"])
         for m in movie_list:
-            if m["year"] == movie["year"]:
+            if self._years_match(m["year"], movie["year"]):
                 # Exact normalized match
                 if normalize(m["title"]) == target_norm:
                     logger.info(f"Matched by normalized title: Radarr='{m['title']}' for Plex='{movie['title']}'")
@@ -994,7 +1000,7 @@ class MediaCleanup:
         plex_external_ids = self._extract_plex_movie_external_ids(movie)
         candidate_matches = []
         for m in movie_list:
-            if m["year"] == movie["year"]:
+            if self._years_match(m["year"], movie["year"]):
                 candidate_tokens = tokenize(m["title"])
                 if (
                     len(target_tokens) >= 2

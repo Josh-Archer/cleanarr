@@ -367,6 +367,7 @@ def _parse_jellyfin_webhook_event(body: bytes, remote_addr: str, method: str) ->
             "parentTitle": html.unescape(payload.get("SeriesName") or ""),
             "index": payload.get("IndexNumber") or payload.get("EpisodeNumber"),
             "parentIndex": payload.get("ParentIndexNumber") or payload.get("SeasonNumber"),
+            "year": payload.get("Year") or payload.get("ProductionYear"),
             "grandparentTitle": html.unescape(payload.get("SeriesName") or ""),
         }
     }
