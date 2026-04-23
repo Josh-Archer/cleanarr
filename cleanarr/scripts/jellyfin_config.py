@@ -72,7 +72,6 @@ def configure_jellyfin_webhook():
   "NotificationUsername": "{{NotificationUsername}}",
   "UserId": "{{UserId}}",
   "ItemType": "{{ItemType}}",
-  "ProviderIds": {{{json_encode ProviderIds}}},
   "Name": "{{Name}}"
 }"""
 
