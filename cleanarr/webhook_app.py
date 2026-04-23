@@ -4,9 +4,9 @@ import datetime
 import threading
 import logging
 import time
-import requests
+import re`nimport htmlquests
 import sys
-import re
+import re`nimport html
 from urllib.parse import urlparse
 from flask import Flask, request, jsonify
 
@@ -754,7 +754,7 @@ def _get_target_plex(token: str):
             return _TARGET_PLEX_BY_TOKEN[token]
         try:
             from plexapi.server import PlexServer
-            import requests
+            import re`nimport htmlquests
             session = requests.Session()
             session.verify = False
             client = PlexServer(TARGET_PLEX_BASEURL, token, session=session)
@@ -895,7 +895,7 @@ def jellyfin_webhook():
             "type": "episode" if mtype in ("episode", "series") else "movie" if mtype == "movie" else mtype,
             "index": payload.get("IndexNumber") or payload.get("EpisodeNumber"),
             "parentIndex": payload.get("ParentIndexNumber") or payload.get("SeasonNumber"),
-            "parentTitle": payload.get("SeriesName"),
+            "parentTitle": html.unescape(payload.get("SeriesName") or ""),`n            "grandparentTitle": html.unescape(payload.get("SeriesName") or ""),`n            "title": html.unescape(payload.get("Name") or ""),
         }
     }
 
