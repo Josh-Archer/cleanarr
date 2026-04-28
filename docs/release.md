@@ -25,6 +25,26 @@
    - the workflow uploads a `release-metadata` artifact containing `release-metadata.json`
 9. Only then update downstream Lambda consumers to the exact semver tag or digest. Do not rely on `latest` as the release source of truth.
 
+## Downstream Lambda + SQS deployment contract
+
+The `cleanarr-lambda` image is the shared runtime for Lambda webhook consumers that receive events through SQS.
+
+For SQS-driven Lambda consumers:
+
+- Consume `release-metadata/<entry>.json` from the workflow output and use:
+  - `ecr_repository`: must be `cleanarr-job` for Lambda queue consumers
+  - `ecr_release_tag_ref`: exact semver image reference for rollout
+  - `ecr_latest_ref`: optional mutable `latest` reference for compatibility only
+- Configure the Lambda function in SQS mode:
+  - `CLEANARR_WEBHOOK_QUEUE_MODE=sqs`
+  - `CLEANARR_WEBHOOK_QUEUE_POLLING=false` when using SQS event source mappings
+  - `CLEANARR_WEBHOOK_QUEUE_ENQUEUING=true` or `false` based on whether the same binary is also used as the ingress producer
+  - `CLEANARR_WEBHOOK_QUEUE_URL=<SQS queue URL>`
+- Configure the SQS event source mapping with partial failure reporting:
+  - `FunctionResponseTypes: [ReportBatchItemFailures]`
+  - `batch_size` in the same range as `CLEANARR_WEBHOOK_QUEUE_MAX_MESSAGES`
+- Keep webhook ingress consumers in `direct` mode if you are not using queue staging.
+
 Current image names:
 
 - `ghcr.io/<owner>/cleanarr-cronjob`
@@ -45,6 +65,10 @@ The release workflow now makes the semver tag authoritative for both registries.
 - GHCR remains the build source of truth
 - Lambda-consumer images are promoted from the exact GHCR release tag into ECR during the same release workflow
 - `release-metadata.json` records the release tag, GHCR refs, GHCR digests, ECR refs, and ECR digests
+
+Example downstream example:
+
+- `deploy/examples/lambda-sqs-consumer.yaml` for a minimal AWS SQS event-consumer wiring example
 
 That metadata is intended to feed downstream repos that deploy Lambda consumers.
 

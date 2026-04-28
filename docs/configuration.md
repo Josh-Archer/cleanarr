@@ -42,6 +42,21 @@ Issue #629 staged mode contract:
 - Fallback mode: set `CLEANARR_WEBHOOK_QUEUE_MODE=direct` to bypass queueing and process immediately
 - Proxy runtime: set `CLEANARR_WEBHOOK_QUEUE_URL` for direct SQS publishing; keep `CLEANARR_WEBHOOK_FORWARD_URL` only if you still need Lambda URL compatibility during rollout
 
+## AWS Lambda SQS consumer contract
+
+For Lambda consumers driven by SQS event source mappings:
+
+- Use image `ghcr.io/<owner>/cleanarr-lambda` in CI/packaging and deploy from the `ecr_release_tag_ref` field in `release-metadata.json`.
+- Set queue mode to `sqs`:
+  - `CLEANARR_WEBHOOK_QUEUE_MODE=sqs`
+  - `CLEANARR_WEBHOOK_QUEUE_POLLING=false`
+  - `CLEANARR_WEBHOOK_QUEUE_ENQUEUING=false`
+  - `CLEANARR_WEBHOOK_QUEUE_URL=<SQS queue URL>`
+- Keep deletion behavior explicit:
+  - `PLEX_WEBHOOK_ENABLE_DELETIONS=true` only when destructive actions are expected
+  - `CLEANARR_DRY_RUN=false` only when the target environment is approved for deletions
+- For staged/proxy ingress (not direct SQS mapping), keep a separate producer with `CLEANARR_WEBHOOK_QUEUE_ENQUEUING=true`.
+
 Repository boundary:
 
 - Keep webhook and proxy runtime code in `cleanarr`

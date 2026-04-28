@@ -58,6 +58,8 @@ jobs:
             file: apps/job/Dockerfile
           - image: cleanarr-webhook-app
             file: apps/webhook/Dockerfile
+          - image: cleanarr-lambda
+            file: apps/lambda/Dockerfile
     steps:
       - uses: actions/checkout@v6
       - uses: docker/setup-qemu-action@v4

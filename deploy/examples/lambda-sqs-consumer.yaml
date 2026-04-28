@@ -1,0 +1,57 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  Minimal AWS example for a Lambda consumer wired to an SQS queue.
+  Use release-metadata.json and the `ecr_release_tag_ref` for
+  `cleanarr-lambda` as the image source.
+
+Parameters:
+  FunctionName:
+    Type: String
+    Default: cleanarr-webhook-consumer
+  EcrReleaseTagRef:
+    Type: String
+    Default: <account>.dkr.ecr.<region>.amazonaws.com/cleanarr-job:vMAJOR.MINOR.PATCH
+  AwsRegion:
+    Type: String
+    Default: <region>
+  SqsQueueArn:
+    Type: String
+    Default: arn:aws:sqs:<region>:<account>:<queue-name>
+  SqsQueueUrl:
+    Type: String
+    Default: https://sqs.<region>.amazonaws.com/<account>/<queue-name>
+  LambdaRoleArn:
+    Type: String
+    Default: arn:aws:iam::<account>:role/<role-name>
+
+Resources:
+  CleanarrWebhookConsumer:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Ref FunctionName
+      PackageType: Image
+      Architectures:
+        - x86_64
+      Timeout: 30
+      MemorySize: 512
+      Role: !Ref LambdaRoleArn
+      Code:
+        ImageUri: !Ref EcrReleaseTagRef
+      Environment:
+        Variables:
+          CLEANARR_WEBHOOK_QUEUE_MODE: sqs
+          CLEANARR_WEBHOOK_QUEUE_POLLING: "false"
+          CLEANARR_WEBHOOK_QUEUE_ENQUEUING: "false"
+          CLEANARR_WEBHOOK_QUEUE_URL: !Ref SqsQueueUrl
+          CLEANARR_WEBHOOK_QUEUE_REGION: !Ref AwsRegion
+          PLEX_WEBHOOK_ENABLE_DELETIONS: "true"
+          CLEANARR_DRY_RUN: "true"
+
+  CleanarrWebhookQueueEventSource:
+    Type: AWS::Lambda::EventSourceMapping
+    Properties:
+      EventSourceArn: !Ref SqsQueueArn
+      FunctionName: !Ref CleanarrWebhookConsumer
+      BatchSize: 10
+      FunctionResponseTypes:
+        - ReportBatchItemFailures
