@@ -14,11 +14,12 @@ Design constraints:
 - Downstream private repos own Kubernetes overlays, secret material, Cloud Run or ingress setup, and image pinning.
 - Proxy and webhook runtime behavior stay in this repository; downstream repos own IAM roles, queue resources, manifests, and rollout policy.
 
-Queue decoupling (issue #629):
+Queue decoupling (issue #8):
 
 - In `direct` mode, webhook events are processed immediately by the webhook runtime.
 - In `sqs` mode, webhook runtime enqueues actionable events and returns quickly.
 - SQS webhook consumer runtime polls SQS and executes event actions (deletion + sync) out of band.
+- Scheduled runtimes (`apps/job/main.py` and `apps/job/lambda_handler.py`) intentionally do not read SQS or queue messages.
 - The in-cluster proxy publishes directly to SQS when a queue URL is configured; Lambda URL forwarding remains a compatibility sink only.
 - Downstream infrastructure can switch back to `direct` mode for automatic fallback when budget alarms trigger.
 - Direct Plex webhook handling remains a first-class runtime mode and is not replaced by the proxy path.
