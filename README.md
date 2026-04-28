@@ -1,15 +1,19 @@
+<p align="center">
+  <img src="assets/logo.png" alt="Cleanarr Logo" width="200">
+</p>
+
 # Cleanarr
 
-`cleanarr` is a reusable Plex cleanup runtime with two deployable harnesses:
+`cleanarr` is a reusable Plex and Jellyfin cleanup runtime with two deployable harnesses:
 
 - `job`: a scheduled cleanup worker for Plex, Sonarr, Radarr, and optional Transmission maintenance
-- `webhook`: a Plex webhook receiver that can sync watch state and optionally trigger deletion logic from Plex events
+- `webhook`: a Plex and Jellyfin webhook receiver that can sync watch state and optionally trigger deletion logic from events
 
 This repository is public-safe by design. It contains the runtime, images, tests, and generic examples. Private cluster overlays, secrets, and rollout orchestration belong in a downstream repo.
 
 ## What It Does
 
-Cleanarr is built for setups where Plex is the source of truth for watched state, while Sonarr and Radarr remain the source of truth for media lifecycle.
+Cleanarr is built for setups where Plex or Jellyfin is the source of truth for watched state, while Sonarr and Radarr remain the source of truth for media lifecycle.
 
 At a high level it can:
 
@@ -42,20 +46,21 @@ This is the safest default deployment mode and the one most operators should sta
 
 ### `webhook`
 
-The webhook app exposes a Plex webhook endpoint and health endpoint:
+The webhook app exposes Plex and Jellyfin webhook endpoints and a health endpoint:
 
 - `POST /plex/webhook`
+- `POST /jellyfin/webhook`
 - `GET /healthz`
 
 It can:
 
-- record incoming Plex events
-- process Plex webhook events directly when you run the webhook app as the ingress endpoint
+- record incoming Plex and Jellyfin events
+- process webhook events directly when you run the webhook app as the ingress endpoint
 - enqueue actionable webhook events to SQS when staged queue mode is enabled
 - process queued webhook events in the SQS consumer runtime, either by direct SQS event records from Lambda event source mappings or by explicit queue polling when polling is enabled
 - let the in-cluster proxy publish directly to SQS when `CLEANARR_WEBHOOK_QUEUE_URL` is configured
 - keep Lambda URL forwarding available as a compatibility fallback when `CLEANARR_WEBHOOK_FORWARD_URL` is set
-- optionally trigger deletion handling for `media.scrobble`, `media.stop`, and removal-style events
+- optionally trigger deletion handling for `media.scrobble`, `media.stop`, `PlaybackStopped`, and removal-style events
 - optionally sync watch state to another Plex server
 - expose dependency health for probes and monitoring
 
@@ -94,7 +99,7 @@ The proxy harness code stays in this repository because it is part of the reusab
 ### Flow
 
 ```text
-Plex watch state / webhook events
+Plex or Jellyfin watch state / webhook events
             |
             v
         cleanarr
@@ -108,8 +113,8 @@ Plex watch state / webhook events
 
 Webhook ingress can be wired in either of these supported shapes:
 
-- direct: Plex -> `apps/webhook` runtime -> cleanup logic
-- decoupled: Plex -> in-cluster proxy -> SQS -> webhook consumer runtime
+- direct: Plex or Jellyfin -> `apps/webhook` runtime -> cleanup logic
+- decoupled: Plex or Jellyfin -> in-cluster proxy -> SQS -> webhook consumer runtime
 
 In the decoupled shape, the proxy can publish directly to SQS. Lambda URL forwarding is retained only as a compatibility fallback during rollout or recovery.
 
@@ -203,8 +208,10 @@ Transmission is optional unless you want torrent maintenance or torrent removal 
 | --- | --- | --- |
 | `PLEX_WEBHOOK_PORT` | `8000` | Port used by the webhook app locally or in container runtime |
 | `PLEX_WEBHOOK_ENABLE_DELETIONS` | `false` | Allows webhook events to trigger deletion handling |
-| `WEBHOOK_SECRET` | unset | Shared secret accepted in `X-Cleanarr-Webhook-Token` or `X-Webhook-Token` |
-| `WEBHOOK_SECRET_PREVIOUS` | unset | Previous secret accepted during token rotation |
+| `WEBHOOK_SECRET` | unset | Shared secret for Plex accepted in `X-Cleanarr-Webhook-Token` or `X-Webhook-Token` |
+| `WEBHOOK_SECRET_PREVIOUS` | unset | Previous Plex secret accepted during token rotation |
+| `JELLYFIN_WEBHOOK_SECRET` | unset | Shared secret for Jellyfin |
+| `JELLYFIN_WEBHOOK_SECRET_PREVIOUS` | unset | Previous Jellyfin secret accepted during token rotation |
 | `CLEANARR_WEBHOOK_QUEUE_MODE` | `direct` | Event handling mode: `direct` (immediate) or `sqs` (staged enqueue + poll) |
 | `CLEANARR_WEBHOOK_QUEUE_URL` | unset | SQS queue URL used in staged mode |
 | `CLEANARR_WEBHOOK_QUEUE_REGION` | unset | AWS region for SQS client initialization |
