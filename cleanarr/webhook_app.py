@@ -9,6 +9,7 @@ import re
 import html
 import sys
 import requests
+from urllib.parse import urlparse
 from flask import Flask, request, jsonify
 
 APP = Flask(__name__)
@@ -21,6 +22,7 @@ LOKI_URL = os.environ.get('LOKI_URL')
 if LOKI_URL:
     try:
         import logging
+        import logging_loki
 
         cf_id = os.environ.get("CF_ACCESS_CLIENT_ID")
         cf_secret = os.environ.get("CF_ACCESS_CLIENT_SECRET")
