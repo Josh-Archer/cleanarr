@@ -9,6 +9,7 @@ import re
 import html
 import sys
 import requests
+from urllib.parse import urlparse
 from flask import Flask, request, jsonify
 from cleanarr.reporting import DecisionReporter, redact_sensitive_data
 
@@ -22,6 +23,7 @@ LOKI_URL = os.environ.get('LOKI_URL')
 if LOKI_URL:
     try:
         import logging
+        import logging_loki
 
         cf_id = os.environ.get("CF_ACCESS_CLIENT_ID")
         cf_secret = os.environ.get("CF_ACCESS_CLIENT_SECRET")
@@ -1783,17 +1785,18 @@ def _background_process_finished(ev: dict):
             logger.info(f"Unhandled media type for deletion: {mtype}")
             _record_webhook_decision(
                 reason_code="unmatched",
-                media_type=media_type,
-                media_title=metadata.get('title') or "webhook-event",
+                media_type=mtype or "unknown",
+                media_title=meta.get('title') or "webhook-event",
                 reason="unsupported_media_type",
                 details={"media_type": mtype, "event": ev.get('event')},
             )
     except Exception:
         logger.exception("Error processing finished webhook event for deletion")
+        meta = ev.get('metadata') or {}
         _record_webhook_decision(
             reason_code="error",
             media_type="unknown",
-            media_title=metadata.get('title') or metadata.get('parentTitle') or "webhook-event",
+            media_title=meta.get('title') or meta.get('parentTitle') or "webhook-event",
             reason="processing_failed",
             details={"event": ev.get('event'), "error": "exception"},
         )

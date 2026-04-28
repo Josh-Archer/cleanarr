@@ -2,6 +2,7 @@
 
 import json
 import os
+import sys
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -147,6 +148,12 @@ class DecisionReporter:
 
     def _persist(self, record: Dict[str, Any]):
         path = Path(self.report_file)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        with open(path, "a", encoding="utf-8") as handle:
-            handle.write(json.dumps(record, ensure_ascii=False) + "\n")
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with open(path, "a", encoding="utf-8") as handle:
+                handle.write(json.dumps(record, ensure_ascii=False) + "\n")
+        except OSError as exc:
+            print(
+                f"cleanarr decision report write skipped for {path}: {exc}",
+                file=sys.stderr,
+            )
