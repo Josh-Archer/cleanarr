@@ -20,9 +20,10 @@ Optional variables:
 - `CLEANARR_WEBHOOK_QUEUE_MODE` (`direct` or `sqs`) for staged webhook buffering
 - `CLEANARR_WEBHOOK_QUEUE_URL` and `CLEANARR_WEBHOOK_QUEUE_REGION` for SQS wiring
 - `CLEANARR_WEBHOOK_QUEUE_ENQUEUING` to enable producer behavior in webhook runtime
-- `CLEANARR_WEBHOOK_QUEUE_POLLING` to enable consumer behavior in the SQS consumer runtime
+- `CLEANARR_WEBHOOK_QUEUE_POLLING` to enable consumer behavior only in the SQS consumer runtime (`apps/lambda/main.py`)
 - `CLEANARR_WEBHOOK_QUEUE_MAX_MESSAGES`, `CLEANARR_WEBHOOK_QUEUE_WAIT_SECONDS`, and `CLEANARR_WEBHOOK_QUEUE_VISIBILITY_TIMEOUT` for poll tuning
 - `CLEANARR_WEBHOOK_FORWARD_URL` to keep the proxy harness compatible with the Lambda URL sink during rollout or fallback
+- `CLEANARR_DECISION_REPORT_FILE` to persist machine-readable webhook and cleanup decisions as JSONL
 - `TARGET_PLEX_*` for cross-instance Plex sync
 - `CLEANARR_USER_ALIASES_JSON` for multi-platform username canonicalization. Supports legacy flat mapping or multi-platform objects:
   ```json
@@ -38,7 +39,8 @@ Issue #629 staged mode contract:
 
 - Direct webhook mode: leave `CLEANARR_WEBHOOK_QUEUE_MODE=direct` and run the webhook app as the ingress endpoint
 - Webhook runtime: `CLEANARR_WEBHOOK_QUEUE_MODE=sqs` with `CLEANARR_WEBHOOK_QUEUE_ENQUEUING=true`
-- SQS consumer runtime: `CLEANARR_WEBHOOK_QUEUE_MODE=sqs` with `CLEANARR_WEBHOOK_QUEUE_POLLING=true`
+- SQS consumer runtime: `CLEANARR_WEBHOOK_QUEUE_MODE=sqs` with `CLEANARR_WEBHOOK_QUEUE_POLLING=true` (consumer runtime only)
+- Scheduled/job runtimes (`apps/job/main.py`, `apps/job/lambda_handler.py`) do not consume queue messages and should not set `CLEANARR_WEBHOOK_QUEUE_POLLING`
 - Fallback mode: set `CLEANARR_WEBHOOK_QUEUE_MODE=direct` to bypass queueing and process immediately
 - Proxy runtime: set `CLEANARR_WEBHOOK_QUEUE_URL` for direct SQS publishing; keep `CLEANARR_WEBHOOK_FORWARD_URL` only if you still need Lambda URL compatibility during rollout
 

@@ -3,17 +3,7 @@ import json
 import base64
 from urllib.parse import urlencode
 from loguru import logger
-from cleanarr.webhook_app import APP, process_sqs_event_records, process_sqs_queue_messages
-
-
-def _queue_max_messages_from_env():
-    raw = os.environ.get('CLEANARR_WEBHOOK_QUEUE_MAX_MESSAGES')
-    if not raw:
-        return None
-    try:
-        return max(1, int(raw))
-    except ValueError:
-        return None
+from cleanarr.webhook_app import APP, process_sqs_event_records
 
 
 def _is_http_event(event):
@@ -88,28 +78,10 @@ def lambda_handler(event, context):
             logger.info("Received direct webhook invocation; dispatching through webhook app")
             return _http_response_from_event(event)
 
-        queue_summary = process_sqs_queue_messages(
-            max_messages=_queue_max_messages_from_env(),
-            force_deletions=True,
-        )
-        if queue_summary.get('enabled'):
-            if queue_summary.get('failed'):
-                logger.warning(f"Queued webhook polling reported failures: {queue_summary}")
-                return {
-                    "statusCode": 500,
-                    "body": json.dumps({
-                        "message": "Queued webhook processing failed",
-                        "queue": queue_summary,
-                    }),
-                }
-            logger.info(f"Processed queued webhook events: {queue_summary}")
-        else:
-            logger.info(f"No queued webhook events processed: {queue_summary}")
         return {
             "statusCode": 200,
             "body": json.dumps({
-                "message": "Queued webhook processing complete",
-                "queue": queue_summary,
+                "message": "No webhook queue event payload",
             }),
         }
     except SystemExit as e:

@@ -1,5 +1,6 @@
 import json
 import os
+import tempfile
 import sys
 import unittest
 from unittest.mock import patch
@@ -254,6 +255,60 @@ class TestWebhookQueueMode(unittest.TestCase):
             webhook_app._background_process_finished(event)
 
         send_ntfy.assert_not_called()
+
+    def test_process_webhook_event_actions_records_skip_for_non_actionable_event(self):
+        event = {
+            'event': 'library.updated',
+            'action': 'some_action',
+            'metadata': {
+                'type': 'movie',
+                'title': 'Archived Movie',
+                'ratingKey': '123',
+            },
+            'account': {'title': 'alice'},
+        }
+
+        with patch.object(webhook_app, '_append_event') as append_event, \
+             patch.object(webhook_app, '_record_webhook_decision') as record_decision:
+            result = webhook_app._process_webhook_event_actions(event, async_mode=False, force_deletions=False)
+
+        self.assertFalse(result['actionable'])
+        append_event.assert_not_called()
+        record_decision.assert_called_once_with(
+            reason_code='skip',
+            media_type='movie',
+            media_title='Archived Movie',
+            reason='event_not_actionable',
+            details={'event': 'library.updated', 'action': 'some_action'},
+        )
+
+    def test_append_event_redacts_sensitive_payload(self):
+        os.environ['CLEANARR_PLEX_TOKEN'] = 'unit-secret'
+
+        with tempfile.NamedTemporaryFile(delete=False) as fp:
+            report_path = fp.name
+
+        try:
+            event = {
+                'api_key': 'unit-secret',
+                'token': 'another-secret',
+                'metadata': {'secret': 'x', 'value': 'y'},
+                'nested': [{'auth': 'unit-secret'}],
+            }
+
+            with patch.object(webhook_app, 'EVENTS_FILE', report_path):
+                webhook_app._append_event(event)
+
+            with open(report_path, 'r', encoding='utf-8') as handle:
+                payload = json.loads(handle.read().strip())
+
+            self.assertEqual(payload['api_key'], '[REDACTED]')
+            self.assertEqual(payload['token'], '[REDACTED]')
+            self.assertEqual(payload['metadata']['secret'], '[REDACTED]')
+            self.assertEqual(payload['nested'][0]['auth'], '[REDACTED]')
+        finally:
+            os.remove(report_path)
+            os.environ.pop('CLEANARR_PLEX_TOKEN', None)
 
 
 if __name__ == '__main__':

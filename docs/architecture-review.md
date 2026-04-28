@@ -10,3 +10,4 @@ Review before first public release:
 - Staged queue-mode interfaces are documented (`CLEANARR_WEBHOOK_QUEUE_*`) with clear producer/consumer behavior.
 - Downstream integration uses images, not source-copy or ConfigMap overrides.
 - Versioning is single-sourced from `pyproject.toml` and enforced by release automation.
+- Queue-mode runtime boundaries are explicit: webhook queue consumers remain in `apps/lambda`, while `apps/job` remains scheduled-cleanup-only.
