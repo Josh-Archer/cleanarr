@@ -110,6 +110,41 @@ class TestMediaCleanup(unittest.TestCase):
 
         self.assertTrue(self.cleanup.should_delete_media(media, user_tags, watched_by))
 
+    def test_should_delete_media_accepts_iswatched_fallback_untagged(self):
+        """isWatched_fallback is valid exact-item evidence when history is empty."""
+        media = {
+            'title': 'Crime 101',
+            'watched_by': {'josharcher354': True},
+            'watch_evidence': {'josharcher354': 'isWatched_fallback'},
+        }
+        self.assertTrue(self.cleanup.should_delete_media(media, [], media['watched_by']))
+
+    def test_should_delete_media_accepts_iswatched_fallback_tagged(self):
+        """Dutton Ranch S1E9 regression: tagged user + isWatched_fallback deletes."""
+        media = {
+            'show_title': 'Dutton Ranch',
+            'season': 1,
+            'episode': 9,
+            'title': 'El Padrino',
+            'watched_by': {'josharcher354': True, 'Erin': False, 'Kids': False},
+            'watch_evidence': {
+                'josharcher354': 'isWatched_fallback',
+                'Erin': 'not_watched',
+                'Kids': 'not_watched',
+            },
+        }
+        self.assertTrue(
+            self.cleanup.should_delete_media(media, ['josharcher354'], media['watched_by'])
+        )
+
+    def test_should_delete_media_no_watched_users(self):
+        media = {
+            'title': 'Unwatched',
+            'watched_by': {'josharcher354': False},
+            'watch_evidence': {'josharcher354': 'not_watched'},
+        }
+        self.assertFalse(self.cleanup.should_delete_media(media, [], media['watched_by']))
+
     def test_sonarr_request_success(self):
         """Test successful Sonarr API call."""
         mock_response = MagicMock()

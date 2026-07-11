@@ -5,6 +5,8 @@ The public runtime repository is intentionally split into three layers:
 - `cleanarr/`: shared library code used by both runtime harnesses
 - `apps/job/`: thin cron/job entrypoint around `MediaCleanup`
 - `apps/webhook/`: thin Flask entrypoint around the shared webhook app
+- `apps/lambda/`: AWS Lambda container for SQS webhook consumption and
+  EventBridge/manual full-library cleanup (dual-mode single function)
 
 Design constraints:
 
@@ -20,6 +22,9 @@ Queue decoupling (issue #8):
 - In `sqs` mode, webhook runtime enqueues actionable events and returns quickly.
 - SQS webhook consumer runtime polls SQS and executes event actions (deletion + sync) out of band.
 - Scheduled runtimes (`apps/job/main.py` and `apps/job/lambda_handler.py`) intentionally do not read SQS or queue messages.
+- The Lambda container image (`apps/lambda`) is dual-mode for downstream single-function deploys:
+  SQS event records process the queue; non-HTTP, non-SQS invokes run full-library
+  cleanup (EventBridge/manual). Dedicated scheduled job images remain available.
 - The in-cluster proxy publishes directly to SQS when a queue URL is configured; Lambda URL forwarding remains a compatibility sink only.
 - Downstream infrastructure can switch back to `direct` mode for automatic fallback when budget alarms trigger.
 - Direct Plex webhook handling remains a first-class runtime mode and is not replaced by the proxy path.

@@ -1077,25 +1077,46 @@ class MediaCleanup:
         return user_tags
 
     def should_delete_media(self, media_item, user_tags, watched_by):
-        """Determine if media should be deleted based on watch status and user tags."""
+        """Determine if media should be deleted based on watch status and user tags.
+
+        Exact-episode / movie deletion accepts both Plex history and
+        ``isWatched_fallback`` evidence. History is frequently empty for
+        legitimate watches (local account mapping, clients that never
+        scrobble), while ``isWatched`` / viewCount still reflect a real
+        completion. Watched-ahead inference remains history-only and is
+        handled separately in ``process_watched_episodes``.
+        """
         logger.info("should_delete_media called")
         # Determine the media name for logging
         media_name = media_item.get('title', 'Unknown Media')
         if 'season' in media_item and 'episode' in media_item:
             media_name = f"{media_item['show_title']} S{media_item['season']}E{media_item['episode']}"
-        
-        if not user_tags:
-            logger.info(f"No user tags found for {media_name}, proceeding with deletion")
-            return True
-        
+
         # Log users who have watched the media
         logger.info(f"Watched by items: {watched_by.items()}")
         watched_users = [user.lower() for user, watched in watched_by.items() if watched]
+        watch_evidence = {
+            str(user).lower(): evidence
+            for user, evidence in (media_item.get("watch_evidence") or {}).items()
+        }
+        fallback_users = [
+            user for user in watched_users if watch_evidence.get(user) == "isWatched_fallback"
+        ]
         if watched_users:
             logger.info(f"Users who have watched {media_name}: {', '.join(watched_users)}")
+            if fallback_users:
+                logger.info(
+                    f"Accepting isWatched_fallback evidence for exact-item delete on {media_name}: "
+                    f"{fallback_users}"
+                )
         else:
             logger.info(f"No users have watched {media_name} yet")
-        
+            return False
+
+        if not user_tags:
+            logger.info(f"No user tags found for {media_name}, proceeding with deletion")
+            return True
+
         # Check and log users who have not watched the media
         for user_tag in user_tags:
             found = False
@@ -1107,7 +1128,7 @@ class MediaCleanup:
             if not found:
                 logger.info(f"User {user_tag} has not watched {media_name} yet")
                 return False
-        
+
         logger.info(f"All tagged users have watched {media_name}: {user_tags}")
         return True
 
@@ -1698,13 +1719,31 @@ class MediaCleanup:
                     f"{episode_label} includes isWatched fallback evidence for exact-episode evaluation: {watch_evidence}"
                 )
             if not self.should_delete_media(episode, user_tags, episode["watched_by"]):
-                logger.info(f"Skipping deletion for {episode_label} because tagged users have not all watched it.")
+                watched_users = [
+                    user for user, watched in episode["watched_by"].items() if watched
+                ]
+                if not watched_users:
+                    logger.info(
+                        f"Skipping deletion for {episode_label} because no users have watched it."
+                    )
+                    skip_reason = "not_watched"
+                else:
+                    logger.info(
+                        f"Skipping deletion for {episode_label} because tagged users have not "
+                        f"all watched it (user_tags={user_tags}, watched_by={episode['watched_by']}, "
+                        f"evidence={watch_evidence})."
+                    )
+                    skip_reason = "tagged_users_not_all_watched"
                 self._record_decision(
                     reason_code="skip",
                     media_type="episode",
                     media_title=episode_label,
-                    reason="tagged_users_not_all_watched",
-                    details={"user_tags": user_tags},
+                    reason=skip_reason,
+                    details={
+                        "user_tags": user_tags,
+                        "watched_by": episode["watched_by"],
+                        "watch_evidence": watch_evidence,
+                    },
                 )
                 continue
 

@@ -41,6 +41,10 @@ Issue #629 staged mode contract:
 - Webhook runtime: `CLEANARR_WEBHOOK_QUEUE_MODE=sqs` with `CLEANARR_WEBHOOK_QUEUE_ENQUEUING=true`
 - SQS consumer runtime: `CLEANARR_WEBHOOK_QUEUE_MODE=sqs` with `CLEANARR_WEBHOOK_QUEUE_POLLING=true` (consumer runtime only)
 - Scheduled/job runtimes (`apps/job/main.py`, `apps/job/lambda_handler.py`) do not consume queue messages and should not set `CLEANARR_WEBHOOK_QUEUE_POLLING`
+- The dual-mode Lambda image (`apps/lambda`) processes SQS records when present;
+  otherwise non-HTTP invokes run full-library cleanup (EventBridge/manual). Use
+  `CLEANARR_WEBHOOK_QUEUE_POLLING=false` when SQS is delivered only via event
+  source mappings.
 - Fallback mode: set `CLEANARR_WEBHOOK_QUEUE_MODE=direct` to bypass queueing and process immediately
 - Proxy runtime: set `CLEANARR_WEBHOOK_QUEUE_URL` for direct SQS publishing; keep `CLEANARR_WEBHOOK_FORWARD_URL` only if you still need Lambda URL compatibility during rollout
 

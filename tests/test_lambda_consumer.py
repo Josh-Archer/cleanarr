@@ -70,18 +70,33 @@ class TestLambdaConsumer(unittest.TestCase):
             {"batchItemFailures": [{"itemIdentifier": "msg-2"}]},
         )
 
-    def test_lambda_handler_does_not_poll_queue_without_records(self):
+    def test_lambda_handler_runs_scheduled_cleanup_without_records(self):
+        """EventBridge/manual invokes with no SQS payload run full library cleanup."""
+        cleaner = MagicMock()
+        cleaner.run = MagicMock()
         with patch.object(webhook_app, "process_sqs_queue_messages") as process_queue, \
-             patch.object(webhook_app, "process_sqs_event_records") as process_records:
+             patch.object(webhook_app, "process_sqs_event_records") as process_records, \
+             patch.object(lambda_main, "MediaCleanup", return_value=cleaner) as cleanup_cls:
             response = lambda_main.lambda_handler({}, None)
 
         process_queue.assert_not_called()
         process_records.assert_not_called()
+        cleanup_cls.assert_called_once()
+        cleaner.run.assert_called_once()
         self.assertEqual(response["statusCode"], 200)
-        self.assertEqual(
-            json.loads(response["body"]).get("message"),
-            "No webhook queue event payload",
-        )
+        self.assertEqual(json.loads(response["body"]), "Cleanup successful")
+
+    def test_lambda_handler_runs_scheduled_cleanup_for_eventbridge_source(self):
+        cleaner = MagicMock()
+        cleaner.run = MagicMock()
+        with patch.object(lambda_main, "MediaCleanup", return_value=cleaner):
+            response = lambda_main.lambda_handler(
+                {"source": "aws.scheduler", "detail-type": "Scheduled Event"},
+                None,
+            )
+
+        cleaner.run.assert_called_once()
+        self.assertEqual(response["statusCode"], 200)
 
 
 class TestScheduledRuntimeBoundary(unittest.TestCase):
