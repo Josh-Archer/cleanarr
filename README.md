@@ -181,6 +181,7 @@ The full configuration contract is documented in [docs/configuration.md](./docs/
 | Variable | Default | What It Does |
 | --- | --- | --- |
 | `CLEANARR_DRY_RUN` | `false` | Disables destructive delete operations. Start here first. |
+| `CLEANARR_DRY_RUN_REPORT_DIR` | `/logs/dry-run-reports` | When dry-run is enabled, the job writes per-user JSON and Markdown report artifacts here (`cleanarr-dry-run-report.json` / `.md`). Webhook mode does not emit these aggregate artifacts (see [docs/configuration.md](./docs/configuration.md)). |
 | `CLEANARR_DISABLE_TORRENT_CLEANUP` | `false` | Disables stale torrent and failed download cleanup. |
 | `CLEANARR_REMOVE_FAILED_DOWNLOADS` | `false` | Removes failed Transmission downloads when enabled. |
 | `CLEANARR_REMOVE_ORPHAN_INCOMPLETE_DOWNLOADS` | mirrors `CLEANARR_REMOVE_FAILED_DOWNLOADS` | Deletes orphaned entries from Transmission's incomplete directory when no active torrent still owns them. |
@@ -266,7 +267,7 @@ For a new deployment:
 
 1. Set `CLEANARR_DRY_RUN=true`
 2. Set `CLEANARR_DISABLE_TORRENT_CLEANUP=true` unless you explicitly want Transmission maintenance on day one
-3. Run the `job` image first and inspect the summary logs
+3. Run the `job` image first and inspect the summary logs **and** dry-run report artifacts under `CLEANARR_DRY_RUN_REPORT_DIR` (JSON + Markdown, grouped per user/profile with `safe` / `kids` / `policy` skip reasons)
 4. Verify protected items are being skipped as expected
 5. Only then disable dry-run
 6. Enable `PLEX_WEBHOOK_ENABLE_DELETIONS=true` only if you want event-driven cleanup in addition to the scheduled job
