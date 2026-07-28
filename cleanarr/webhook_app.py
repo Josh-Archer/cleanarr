@@ -210,6 +210,8 @@ WEBHOOK_SECRET = os.environ.get('WEBHOOK_SECRET')
 WEBHOOK_SECRET_PREVIOUS = os.environ.get('WEBHOOK_SECRET_PREVIOUS')
 JELLYFIN_WEBHOOK_SECRET = os.environ.get('JELLYFIN_WEBHOOK_SECRET')
 JELLYFIN_WEBHOOK_SECRET_PREVIOUS = os.environ.get('JELLYFIN_WEBHOOK_SECRET_PREVIOUS')
+EMBY_WEBHOOK_SECRET = os.environ.get('EMBY_WEBHOOK_SECRET')
+EMBY_WEBHOOK_SECRET_PREVIOUS = os.environ.get('EMBY_WEBHOOK_SECRET_PREVIOUS')
 _TARGET_PLEX = None
 _TARGET_PLEX_BY_TOKEN = {}
 _TARGET_PLEX_OWNER_KEYS_BY_TOKEN = {}
@@ -775,6 +777,105 @@ def process_sqs_event_records(records, force_deletions: bool = True):
 
 
 # Start background threads (health monitor) after all definitions to avoid NameError race
+def _resolve_platform_user(platform: str, user_name: str) -> str:
+    """Map a platform username to a canonical Cleanarr user via CLEANARR_USER_ALIASES_JSON."""
+    if not user_name:
+        return user_name
+    aliases_raw = os.environ.get("CLEANARR_USER_ALIASES_JSON", "")
+    if not aliases_raw:
+        return user_name
+    try:
+        aliases = json.loads(aliases_raw)
+        search_val = str(user_name).strip().lower()
+        for ck, platforms in aliases.items():
+            if isinstance(platforms, dict) and str(platforms.get(platform) or "").strip().lower() == search_val:
+                return ck
+            if not isinstance(platforms, dict) and str(platforms).strip().lower() == search_val:
+                return ck
+    except Exception:
+        pass
+    return user_name
+
+
+@APP.route("/emby/webhook", methods=["POST"])
+
+@APP.route("/emby/webhook", methods=["POST"])
+def emby_webhook():
+    """Receive Emby native or plugin-style notification webhooks.
+
+    Event mapping (see cleanarr.emby_client.compute_emby_event_flags):
+    - finished: item.markplayed / item.markwatched, plugin ItemMarkPlayed,
+      UserDataSaved, and playback.stop when PlayedToCompletion is true
+    - stopped: playback.stop / PlaybackStopped
+    - paused: playback.pause / PlaybackPaused
+    """
+    if EMBY_WEBHOOK_SECRET or EMBY_WEBHOOK_SECRET_PREVIOUS:
+        token_val = (
+            request.headers.get("X-Cleanarr-Webhook-Token")
+            or request.headers.get("X-Webhook-Token")
+            or request.headers.get("X-Emby-Token")
+            or request.args.get("token")
+        )
+        token_ok = (
+            token_val == EMBY_WEBHOOK_SECRET
+            or (
+                EMBY_WEBHOOK_SECRET_PREVIOUS
+                and token_val == EMBY_WEBHOOK_SECRET_PREVIOUS
+            )
+        )
+        if not token_ok:
+            logger.warning(
+                f"Unauthorized Emby webhook attempt from {request.remote_addr}"
+            )
+            return jsonify({"status": "error", "message": "Unauthorized"}), 401
+
+    logger.info(
+        "Received Emby request: %s %s from %s content_type=%s",
+        request.method,
+        request.path,
+        request.remote_addr,
+        request.content_type,
+    )
+
+    _start_background_threads()
+    payload = request.get_json(silent=True)
+    if not isinstance(payload, dict):
+        return jsonify({"status": "error", "message": "Invalid JSON"}), 400
+
+    from cleanarr.emby_client import map_emby_webhook_payload
+
+    raw_user = ""
+    user_obj = payload.get("User")
+    if isinstance(user_obj, dict):
+        raw_user = user_obj.get("Name") or ""
+    if not raw_user:
+        raw_user = (
+            payload.get("NotificationUsername")
+            or payload.get("UserName")
+            or payload.get("UserId")
+            or ""
+        )
+    canonical_user = _resolve_platform_user("emby", raw_user)
+
+    logger.info(f"Emby payload: {json.dumps(payload)}")
+    ev = map_emby_webhook_payload(
+        payload,
+        remote_addr=request.remote_addr or "",
+        method=request.method,
+        canonical_user=canonical_user,
+    )
+    ev["received_at"] = datetime.datetime.utcnow().isoformat() + "Z"
+
+    actionable = bool(ev.get("actionable"))
+    recorded = bool(ev.get("recorded") or ev.get("finished"))
+
+    if actionable and _queue_enqueuing_enabled():
+        if _enqueue_webhook_event(ev):
+            return jsonify({"status": "ok", "queued": True})
+
+    _process_webhook_event_actions(ev, async_mode=True, force_deletions=False)
+    return jsonify({"status": "ok", "recorded": recorded})
+
 def _start_background_threads():
     try:
         global _THREADS_STARTED

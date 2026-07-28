@@ -42,6 +42,8 @@ _CREDENTIAL_LOCK = threading.Lock()
 
 JELLYFIN_WEBHOOK_SECRET = os.environ.get("JELLYFIN_WEBHOOK_SECRET", "")
 JELLYFIN_WEBHOOK_SECRET_PREVIOUS = os.environ.get("JELLYFIN_WEBHOOK_SECRET_PREVIOUS", "")
+EMBY_WEBHOOK_SECRET = os.environ.get("EMBY_WEBHOOK_SECRET", "")
+EMBY_WEBHOOK_SECRET_PREVIOUS = os.environ.get("EMBY_WEBHOOK_SECRET_PREVIOUS", "")
 
 
 def _queue_url() -> str:
@@ -544,6 +546,46 @@ def _forward_webhook_request(body: bytes, content_type: str, token: str):
             "payload": b'{"error":"upstream_unreachable"}\n',
         }
 
+def _parse_emby_webhook_event(body: bytes, remote_addr: str, method: str) -> dict:
+    payload = None
+    try:
+        payload = json.loads(body.decode("utf-8")) if body else None
+    except Exception:
+        LOG.exception("Failed to parse Emby webhook JSON")
+
+    if not isinstance(payload, dict):
+        return {
+            "received_at": datetime.datetime.utcnow().isoformat() + "Z",
+            "remote_addr": remote_addr,
+            "method": method,
+            "platform": "emby",
+            "error": "invalid_payload",
+        }
+
+    from cleanarr.emby_client import map_emby_webhook_payload
+
+    raw_user = ""
+    user_obj = payload.get("User")
+    if isinstance(user_obj, dict):
+        raw_user = user_obj.get("Name") or ""
+    if not raw_user:
+        raw_user = (
+            payload.get("NotificationUsername")
+            or payload.get("UserName")
+            or payload.get("UserId")
+            or ""
+        )
+    canonical_user = _resolve_user_key("emby", raw_user)
+    event = map_emby_webhook_payload(
+        payload,
+        remote_addr=remote_addr,
+        method=method,
+        canonical_user=canonical_user,
+    )
+    event["received_at"] = datetime.datetime.utcnow().isoformat() + "Z"
+    return event
+
+
 class ProxyHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         if self.path != "/healthz":
@@ -559,7 +601,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
     def do_POST(self):
         parsed_url = urlsplit(self.path)
         is_plex = parsed_url.path == "/plex/webhook"
-        is_jellyfin = parsed_url.path == "/jellyfin/webhook"
+        is_jellyfin = parsed_url.path in ("/jellyfin/webhook", "/emby/webhook")
         
         if not is_plex and not is_jellyfin:
             self.send_response(404)
