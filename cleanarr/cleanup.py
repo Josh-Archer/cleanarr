@@ -1,3 +1,4 @@
+from . import emby_client
 #!/usr/bin/env python3
 """Core Cleanarr cleanup logic shared by the job and webhook harnesses."""
 
@@ -257,6 +258,9 @@ def household_policy_allows_delete(
 
 
 CONFIG = {
+    "media_source": (
+        _get_env("CLEANARR_MEDIA_SOURCE", default="plex") or "plex"
+    ).strip().lower(),
     "plex": {
         "baseurl": _get_env(
             "CLEANARR_PLEX_BASEURL",
@@ -278,6 +282,21 @@ CONFIG = {
             default="http://radarr:7878/api/v3/",
         ),
         "apikey": _get_env("CLEANARR_RADARR_APIKEY"),
+    },
+    "emby": {
+        "baseurl": _get_env(
+            "CLEANARR_EMBY_BASEURL",
+            "EMBY_URL",
+            default="http://emby:8096",
+        ),
+        "apikey": _get_env(
+            "CLEANARR_EMBY_APIKEY",
+            "CLEANARR_EMBY_TOKEN",
+            "EMBY_APIKEY",
+            "EMBY_TOKEN",
+        ),
+        # Optional comma-separated usernames; empty means all non-disabled users.
+        "users": _env_csv_set("CLEANARR_EMBY_USERS", default=""),
     },
     # Optional Lidarr music cleanup (default OFF). When disabled, no Lidarr API
     # calls are made and music libraries are left untouched.
@@ -433,6 +452,12 @@ class MediaCleanup:
     def __init__(self):
         """Initialize API connections."""
         logger.info("Initializing Plex Media Cleanup script")
+        self.media_source = (CONFIG.get("media_source") or "plex").strip().lower()
+        if self.media_source not in ("plex", "emby"):
+            raise ValueError(
+                f"Unsupported CLEANARR_MEDIA_SOURCE={self.media_source!r}; "
+                "expected 'plex' or 'emby'"
+            )
         self.watch_evidence_by_rating_key = {}
         self.run_summary = {
             "tv_deletions": [],
@@ -457,10 +482,6 @@ class MediaCleanup:
             "sonarr_episodes_by_series_id": {},
             "radarr_managed_movie_roots": None,
         }
-        if not CONFIG["plex"]["token"]:
-            logger.error("Missing Plex token. Set CLEANARR_PLEX_TOKEN or PLEX_TOKEN.")
-            sys.exit(1)
-
         # Prepare headers for Cloudflare Access if present
         self.cf_headers = {}
         cf_id = os.environ.get("CF_ACCESS_CLIENT_ID")
@@ -472,17 +493,42 @@ class MediaCleanup:
             }
             logger.debug("Cloudflare Access headers configured")
 
-        try:
-            # Create session and inject headers *before* PlexServer connects
-            session = requests.Session()
+        self._emby_watched_cache = None
+        self.plex = None
+        self.emby_session = None
+        if self.media_source == "emby":
+            if not CONFIG.get("emby", {}).get("apikey"):
+                logger.error(
+                    "Missing Emby API key. Set CLEANARR_EMBY_APIKEY "
+                    "(or CLEANARR_EMBY_TOKEN / EMBY_APIKEY)."
+                )
+                sys.exit(1)
+            self.emby_session = requests.Session()
             if self.cf_headers:
-                session.headers.update(self.cf_headers)
-                logger.debug("Injected Cloudflare Access headers into Plex session")
+                self.emby_session.headers.update(self.cf_headers)
+        else:
+            if not CONFIG["plex"]["token"]:
+                logger.error("Missing Plex token. Set CLEANARR_PLEX_TOKEN or PLEX_TOKEN.")
+                sys.exit(1)
 
-            self.plex = PlexServer(CONFIG["plex"]["baseurl"], CONFIG["plex"]["token"], session=session)
-            logger.info(f"Connected to Plex server: {self.plex.friendlyName}")
-        except Exception as e:
-            logger.error(f"Failed to connect to Plex: {str(e)}")
+        if self.media_source != "emby":
+            try:
+                # Create session and inject headers *before* PlexServer connects
+                session = requests.Session()
+                if self.cf_headers:
+                    session.headers.update(self.cf_headers)
+                    logger.debug("Injected Cloudflare Access headers into Plex session")
+
+                self.plex = PlexServer(
+                    CONFIG["plex"]["baseurl"],
+                    CONFIG["plex"]["token"],
+                    session=session,
+                )
+                logger.info(f"Connected to Plex server: {self.plex.friendlyName}")
+            except Exception as e:
+                logger.error(f"Failed to connect to Plex: {str(e)}")
+        else:
+            logger.info("Media source is Emby; skipping Plex client connection")
 
         # Initialize Sonarr Session
         self.sonarr_session = requests.Session()
@@ -943,7 +989,13 @@ class MediaCleanup:
         return None
 
     def get_watched_movies(self):
-        """Get all watched movies from Plex."""
+        """Get all watched movies from the configured media source."""
+        if self.media_source == "emby":
+            logger.info("Checking for watched movies in Emby")
+            movies, _ = self._load_emby_watched_state()
+            logger.info(f"Found {len(movies)} watched movies")
+            return movies
+
         logger.info("Checking for watched movies in Plex")
         watched_movies = []
         try:
@@ -972,8 +1024,43 @@ class MediaCleanup:
             logger.error(f"Error getting watched movies: {str(e)}")
             return []
 
+    def _load_emby_watched_state(self):
+        """Load and cache Emby watched movies/episodes for this run."""
+        if self._emby_watched_cache is not None:
+            return self._emby_watched_cache
+        if self.emby_session is None:
+            logger.error("Emby session is not initialized")
+            self._emby_watched_cache = ([], [])
+            return self._emby_watched_cache
+        allowed = CONFIG.get("emby", {}).get("users") or set()
+        try:
+            movies, episodes = emby_client.load_watched_state(
+                self.emby_session,
+                CONFIG["emby"]["baseurl"],
+                CONFIG["emby"]["apikey"],
+                allowed_usernames=allowed or None,
+            )
+            logger.info(
+                "Loaded Emby watched state: %s movies, %s episodes",
+                len(movies),
+                len(episodes),
+            )
+            self._emby_watched_cache = (movies, episodes)
+        except Exception as e:
+            logger.error(f"Error loading Emby watched state: {str(e)}")
+            import traceback
+            logger.error(traceback.format_exc())
+            self._emby_watched_cache = ([], [])
+        return self._emby_watched_cache
+
     def get_watched_episodes(self):
-        """Get all watched episodes from Plex."""
+        """Get all watched episodes from the configured media source."""
+        if self.media_source == "emby":
+            logger.info("Checking for watched episodes in Emby")
+            _, episodes = self._load_emby_watched_state()
+            logger.info(f"Found {len(episodes)} watched episodes")
+            return episodes
+
         logger.info("Checking for watched episodes in Plex")
         watched_episodes = []
         try:

@@ -222,3 +222,60 @@ Sonarr/Radarr (user tags, `safe`/`kids` protected tags, and `CLEANARR_DRY_RUN`).
 
 
 Unmatched or unowned tracks are skipped (never force-deleted from disk outside Lidarr).
+
+| --- | --- | --- |
+| `CLEANARR_MEDIA_SOURCE` | `plex` | `plex` or `emby`. Selects which library provides watched state for the scheduled job. |
+
+
+### Emby
+
+
+Required when `CLEANARR_MEDIA_SOURCE=emby`:
+
+| --- | --- | --- |
+| `CLEANARR_EMBY_BASEURL` | `EMBY_URL` | Emby Server base URL (default `http://emby:8096`) |
+| `CLEANARR_EMBY_APIKEY` | `CLEANARR_EMBY_TOKEN`, `EMBY_APIKEY`, `EMBY_TOKEN` | Emby API key (`X-Emby-Token`) |
+| `CLEANARR_EMBY_USERS` | — | Optional comma-separated usernames. Empty = all non-disabled users. |
+
+
+Job mode calls Emby REST:
+
+
+Per-user played flags are merged into the same `watched_by` / `watch_evidence` shape used for Plex (`watch_evidence` value `emby_isplayed`). Matching and delete policy then use Sonarr/Radarr tags as usual.
+
+- `JELLYFIN_WEBHOOK_SECRET` to protect the Jellyfin webhook endpoint (`/jellyfin/webhook`)
+- `EMBY_WEBHOOK_SECRET` / `EMBY_WEBHOOK_SECRET_PREVIOUS` to protect the Emby webhook endpoint (`/emby/webhook`); accepted headers: `X-Cleanarr-Webhook-Token`, `X-Webhook-Token`, or `X-Emby-Token`
+- `PLEX_WEBHOOK_ENABLE_DELETIONS` to let the webhook perform deletions
+- `CLEANARR_WEBHOOK_QUEUE_MODE` (`direct` or `sqs`) for staged webhook buffering
+- `CLEANARR_WEBHOOK_QUEUE_URL` and `CLEANARR_WEBHOOK_QUEUE_REGION` for SQS wiring
+- `CLEANARR_WEBHOOK_QUEUE_ENQUEUING` to enable producer behavior in webhook runtime
+- `CLEANARR_WEBHOOK_QUEUE_POLLING` to enable consumer behavior only in the SQS consumer runtime (`apps/lambda/main.py`)
+- `CLEANARR_WEBHOOK_QUEUE_MAX_MESSAGES`, `CLEANARR_WEBHOOK_QUEUE_WAIT_SECONDS`, and `CLEANARR_WEBHOOK_QUEUE_VISIBILITY_TIMEOUT` for poll tuning
+- `CLEANARR_WEBHOOK_FORWARD_URL` to keep the proxy harness compatible with the Lambda URL sink during rollout or fallback
+- `CLEANARR_DECISION_REPORT_FILE` to persist machine-readable webhook and cleanup decisions as JSONL
+- `TARGET_PLEX_*` for cross-instance Plex sync
+- `CLEANARR_USER_ALIASES_JSON` for multi-platform username canonicalization. Supports legacy flat mapping or multi-platform objects:
+  ```json
+  {
+    "josh": {"plex": "josharcher354", "jellyfin": "gawly", "emby": "josh"},
+    "erin": {"plex": "erinarcher", "jellyfin": "erin", "emby": "erin"}
+  }
+  ```
+
+
+## Emby webhook event mapping
+
+
+Point Emby Notifications (or a webhook plugin) at `POST /emby/webhook` (or the proxy path of the same name).
+
+
+| Emby event / plugin type | Cleanarr flags | Notes |
+| --- | --- | --- |
+| `item.markplayed`, `item.markwatched` | `finished` + `recorded` | Native mark-as-played |
+| `ItemMarkPlayed`, `UserDataSaved` | `finished` + `recorded` | Plugin / Jellyfin-compatible templates |
+| `playback.stop` / `playback.stopped` | `stopped`; `finished` only if `PlaybackInfo.PlayedToCompletion` (or top-level `PlayedToCompletion`) is true | Avoids deleting on mid-play stops |
+| `PlaybackStopped` | `finished` + `stopped` | Plugin convention (treated as completion) |
+| `playback.pause` / `PlaybackPaused` | `paused` | Non-destructive |
+
+
+Native Emby payloads use nested `Event`, `User`, and `Item` objects. Plugin-style flat `NotificationType` / `ItemType` / `NotificationUsername` bodies are also accepted. The proxy sink path (`/emby/webhook`) uses the same mapping when publishing to SQS.

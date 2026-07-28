@@ -359,3 +359,95 @@ Cleanarr is built for setups where Plex or Jellyfin is the source of truth for w
 | `CLEANARR_TRANSMISSION_IO_ERROR_CLEANUP_ENABLED` | `false` | Enables repeated Transmission I/O error cleanup logic. |
 | `CLEANARR_TRANSMISSION_IO_ERROR_THRESHOLD` | `3` | Number of repeated I/O errors before action is taken. |
 | `CLEANARR_TRANSMISSION_IO_ERROR_STATE_FILE` | `/logs/transmission-io-error-state.json` | Persistent state used by I/O error cleanup tracking. |
+
+
+`cleanarr` is a reusable Plex, Emby, and Jellyfin cleanup runtime with two deployable harnesses:
+
+
+- `job`: a scheduled cleanup worker for Plex or Emby watched state, Sonarr, Radarr, and optional Transmission maintenance
+- `webhook`: a Plex, Emby, and Jellyfin webhook receiver that can sync watch state and optionally trigger deletion logic from events
+
+
+Cleanarr is built for setups where Plex, Emby, or Jellyfin is the source of truth for watched state, while Sonarr and Radarr remain the source of truth for media lifecycle.
+
+
+- inspect Plex watch history (or Emby played state) for episodes and movies
+- map library items back to Sonarr and Radarr records
+- delete or unmonitor matching files when policy allows it
+- skip protected content with `safe` and `kids` tags
+- perform watched-ahead logic for TV episodes using real user history (Plex history path)
+- remove items from a Plex watchlist after cleanup (Plex source)
+- perform optional Transmission maintenance for stale torrents, failed downloads, and repeated I/O errors
+- receive Plex, Emby, and Jellyfin webhook events and optionally act on them in near real time
+- send run summaries and health notifications to `ntfy`
+
+
+- connect to Plex or Emby (`CLEANARR_MEDIA_SOURCE`)
+- load watched episodes and movies
+- match content in Sonarr and Radarr
+- apply deletion policy
+- optionally do Transmission maintenance
+- emit a summary line and optional `ntfy` notification
+
+
+The webhook app exposes Plex, Emby, and Jellyfin webhook endpoints and a health endpoint:
+
+- `POST /plex/webhook`
+- `POST /emby/webhook`
+- `POST /jellyfin/webhook`
+- `GET /healthz`
+
+
+- record incoming Plex, Emby, and Jellyfin events
+- process webhook events directly when you run the webhook app as the ingress endpoint
+- enqueue actionable webhook events to SQS when staged queue mode is enabled
+- process queued webhook events in the SQS consumer runtime, either by direct SQS event records from Lambda event source mappings or by explicit queue polling when polling is enabled
+- let the in-cluster proxy publish directly to SQS when `CLEANARR_WEBHOOK_QUEUE_URL` is configured
+- keep Lambda URL forwarding available as a compatibility fallback when `CLEANARR_WEBHOOK_FORWARD_URL` is set
+- optionally trigger deletion handling for `media.scrobble`, `media.stop`, Emby `item.markplayed` / completed `playback.stop`, Jellyfin `PlaybackStopped`, and removal-style events
+- optionally sync watch state to another Plex server
+- expose dependency health for probes and monitoring
+
+```text
+Plex / Emby / Jellyfin watch state / webhook events
+            |
+            v
+        cleanarr
+            |
+            +--> Sonarr episode matching and file removal
+            +--> Radarr movie matching and file removal
+            +--> Transmission maintenance
+            +--> Plex watchlist cleanup
+            +--> ntfy summaries / health notifications
+```
+
+
+- direct: Plex / Emby / Jellyfin -> `apps/webhook` runtime -> cleanup logic
+- decoupled: Plex / Emby / Jellyfin -> in-cluster proxy -> SQS -> webhook consumer runtime
+
+| --- | --- | --- |
+| `CLEANARR_MEDIA_SOURCE` | No | Job watched-state source: `plex` (default) or `emby` |
+| `CLEANARR_PLEX_BASEURL` | When source is plex | Plex base URL used for watch state, item lookups, and watchlist cleanup |
+| `CLEANARR_PLEX_TOKEN` | When source is plex | Plex auth token |
+| `CLEANARR_EMBY_BASEURL` | When source is emby | Emby Server base URL |
+| `CLEANARR_EMBY_APIKEY` | When source is emby | Emby API key (`X-Emby-Token`) |
+| `CLEANARR_EMBY_USERS` | No | Optional comma-separated Emby usernames for job watched state |
+| `CLEANARR_SONARR_BASEURL` | Yes | Sonarr API base URL |
+| `CLEANARR_SONARR_APIKEY` | Yes | Sonarr API key |
+| `CLEANARR_RADARR_BASEURL` | Yes | Radarr API base URL |
+| `CLEANARR_RADARR_APIKEY` | Yes | Radarr API key |
+| `CLEANARR_LOG_FILE` | No | Log file path for the runtime |
+| `CLEANARR_DEBUG` | No | Enables verbose logging |
+
+| `JELLYFIN_WEBHOOK_SECRET_PREVIOUS` | unset | Previous Jellyfin secret accepted during token rotation |
+| `EMBY_WEBHOOK_SECRET` | unset | Shared secret for Emby (`/emby/webhook`) |
+| `EMBY_WEBHOOK_SECRET_PREVIOUS` | unset | Previous Emby secret accepted during token rotation |
+| `CLEANARR_WEBHOOK_QUEUE_MODE` | `direct` | Event handling mode: `direct` (immediate) or `sqs` (staged enqueue + poll) |
+| `CLEANARR_WEBHOOK_QUEUE_URL` | unset | SQS queue URL used in staged mode |
+| `CLEANARR_WEBHOOK_QUEUE_REGION` | unset | AWS region for SQS client initialization |
+| `CLEANARR_WEBHOOK_QUEUE_ENQUEUING` | `false` unless queue mode is `sqs` | Enables webhook-side enqueue behavior |
+| `CLEANARR_WEBHOOK_QUEUE_POLLING` | `false` | Enables consumer-side queue polling for manual or scheduled runs; Lambda SQS event source mappings can deliver records directly without polling |
+| `CLEANARR_WEBHOOK_QUEUE_MAX_MESSAGES` | `50` | Maximum SQS messages consumed in one poll cycle |
+| `CLEANARR_WEBHOOK_QUEUE_WAIT_SECONDS` | `1` | Long-poll wait time for SQS receives |
+| `CLEANARR_WEBHOOK_QUEUE_VISIBILITY_TIMEOUT` | `0` | Optional visibility timeout override for consumed messages |
+| `CLEANARR_WEBHOOK_FORWARD_URL` | unset | Optional Lambda URL fallback for the proxy harness when direct SQS publishing is unavailable |
