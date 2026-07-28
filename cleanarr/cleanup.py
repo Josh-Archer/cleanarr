@@ -21,7 +21,7 @@ import requests
 from urllib.parse import urljoin
 from plexapi.server import PlexServer
 from transmission_rpc import Client as TransmissionClient
-from cleanarr.reporting import DecisionReporter
+from cleanarr.reporting import DecisionReporter, DryRunReportCollector
 from loguru import logger
 
 # Run outcome taxonomy: full success vs partial failure vs aborted.
@@ -292,6 +292,10 @@ CONFIG = {
     "debug": _env_flag("CLEANARR_DEBUG", default="true"),
     "stale_torrent_hours": int(_get_env("CLEANARR_STALE_TORRENT_HOURS", default="8")),
     "dry_run": _env_flag("CLEANARR_DRY_RUN", default="false"),
+    "dry_run_report_dir": _get_env(
+        "CLEANARR_DRY_RUN_REPORT_DIR",
+        default="/logs/dry-run-reports",
+    ),
     "disable_torrent_cleanup": _env_flag("CLEANARR_DISABLE_TORRENT_CLEANUP", default="false"),
     "remove_failed_downloads": _env_flag("CLEANARR_REMOVE_FAILED_DOWNLOADS", default="false"),
     "remove_orphan_incomplete_downloads": _env_flag(
@@ -429,6 +433,10 @@ class MediaCleanup:
         self.run_outcome = OUTCOME_SUCCESS
         self.run_abort_reason = None
         self.decision_reporter = DecisionReporter(component="cleanup")
+        self.dry_run_report = DryRunReportCollector(
+            component="cleanup",
+            mode="dry-run" if CONFIG.get("dry_run") else "live",
+        )
         self._arr_cache = {
             "sonarr_tags": None,
             "radarr_tags": None,
@@ -526,13 +534,25 @@ class MediaCleanup:
         reason,
         details=None,
     ):
-        return self.decision_reporter.emit(
+        payload = self.decision_reporter.emit(
             reason_code=reason_code,
             media_type=media_type,
             media_title=media_title,
             reason=reason,
             details=details or {},
         )
+        # Always collect for optional artifact emission; written only for dry-run jobs.
+        self.dry_run_report.add_decision(payload)
+        return payload
+
+    def _protected_labels_for_ids(self, tags, tag_ids):
+        """Return protected tag labels (safe/kids) present in the given id set."""
+        labels = []
+        id_set = set(tag_ids or [])
+        for tag in tags or []:
+            if tag.get("id") in id_set and _is_protected_tag_label(tag.get("label")):
+                labels.append(_normalize_tag_label(tag.get("label")))
+        return labels
 
     def _summarize_entries(self, category, label):
         entries = self.run_summary.get(category, [])
@@ -588,6 +608,21 @@ class MediaCleanup:
             self.run_summary.setdefault("errors", []).append(f"ntfy failed: {exc}")
             self._mark_partial_failure()
 
+    def _write_dry_run_report_artifacts(self):
+        """Emit per-user JSON/Markdown dry-run report artifacts (job mode)."""
+        if not CONFIG.get("dry_run"):
+            return None
+        report_dir = CONFIG.get("dry_run_report_dir") or "/logs/dry-run-reports"
+        paths = self.dry_run_report.write_artifacts(report_dir=report_dir)
+        if not paths:
+            logger.warning("Dry-run report artifacts were not written")
+            return None
+        logger.info(
+            "Wrote dry-run report artifacts: "
+            f"json={paths.get('json')} markdown={paths.get('markdown')}"
+        )
+        return paths
+
     def _flush_run_summary(self):
         lines = [
             self._outcome_status_line(),
@@ -597,6 +632,11 @@ class MediaCleanup:
             self._summarize_entries("errors", "Errors"),
         ]
         logger.info("Cleanup summary | " + " | ".join(lines))
+
+        dry_run_paths = self._write_dry_run_report_artifacts()
+        if dry_run_paths:
+            lines.append(f"Dry-run report JSON: {dry_run_paths.get('json')}")
+            lines.append(f"Dry-run report Markdown: {dry_run_paths.get('markdown')}")
 
         deletion_count = (
             len(self.run_summary.get("tv_deletions", []))
@@ -1418,8 +1458,23 @@ class MediaCleanup:
     def _describe_episode(self, episode):
         return f"{episode['show_title']} S{episode['season']}E{episode['episode']}"
 
-    def _delete_episode_and_cleanup(self, episode_label, reason, file_id, episode_id, file_path=None, rating_key=None):
+    def _delete_episode_and_cleanup(
+        self,
+        episode_label,
+        reason,
+        file_id,
+        episode_id,
+        file_path=None,
+        rating_key=None,
+        related_users=None,
+        watched_by=None,
+    ):
         logger.info(f"Deleting {episode_label} via {reason}")
+        decision_details = {"episode_id": episode_id, "file_id": file_id}
+        if related_users:
+            decision_details["related_users"] = list(related_users)
+        if watched_by is not None:
+            decision_details["watched_by"] = watched_by
         if self.delete_sonarr_episode_file(file_id):
             delete_reason = "dry-run" if CONFIG["dry_run"] else "delete"
             self._record_decision(
@@ -1427,7 +1482,7 @@ class MediaCleanup:
                 media_type="episode",
                 media_title=episode_label,
                 reason=reason,
-                details={"episode_id": episode_id, "file_id": file_id},
+                details=decision_details,
             )
             self._record_summary("tv_deletions", f"{episode_label} [{reason}]")
             self.unmonitor_sonarr_episode(episode_id)
@@ -1441,7 +1496,7 @@ class MediaCleanup:
             media_type="episode",
             media_title=episode_label,
             reason="delete_failed",
-            details={"episode_id": episode_id, "file_id": file_id, "delete_reason": reason},
+            details={**decision_details, "delete_reason": reason},
         )
         self._record_summary("errors", f"{episode_label} delete failed [{reason}]")
         return False
@@ -1954,6 +2009,10 @@ class MediaCleanup:
                 file_path = plex_ep["file"] if plex_ep else None
                 episode_tag_ids = set(ep_obj.get("tags") or [])
                 if protected_tag_ids & (series_tag_ids | episode_tag_ids):
+                    protected_labels = self._protected_labels_for_ids(
+                        sonarr_tags,
+                        series_tag_ids | episode_tag_ids,
+                    )
                     logger.info(
                         f"[Watched Ahead] Skipping deletion for {episode_label} "
                         f"due to 'safe' or 'kids' tag (users ahead={users_ahead})"
@@ -1971,6 +2030,7 @@ class MediaCleanup:
                             "series": show_title,
                             "users_ahead": users_ahead,
                             "later_by_user": later_by_user,
+                            "protected_labels": protected_labels,
                         },
                     )
                     continue
@@ -2006,6 +2066,7 @@ class MediaCleanup:
                             "household": episode_household,
                             "users_ahead": users_ahead,
                             "later_by_user": later_by_user,
+                            "skip_category": "policy",
                         },
                     )
                     continue
@@ -2022,7 +2083,9 @@ class MediaCleanup:
                     ep_obj["id"],
                     file_path=file_path,
                     rating_key=plex_ep.get("rating_key") if plex_ep else None,
+                    related_users=users_ahead,
                 )
+
 
         # --- Standard logic for watched episodes ---
         for episode in watched_episodes:
@@ -2053,6 +2116,10 @@ class MediaCleanup:
             series_tag_ids = set(series_tags or [])
             episode_tag_ids = set(episode_tags)
             if protected_tag_ids & (series_tag_ids | episode_tag_ids):
+                protected_labels = self._protected_labels_for_ids(
+                    sonarr_tags,
+                    series_tag_ids | episode_tag_ids,
+                )
                 logger.info(
                     f"Skipping deletion for {episode_label} "
                     "due to 'safe' or 'kids' tag"
@@ -2063,7 +2130,12 @@ class MediaCleanup:
                     media_type="episode",
                     media_title=episode_label,
                     reason="protected_series_or_episode_tags",
-                    details={"series_tags": series_tag_ids, "episode_tags": episode_tag_ids},
+                    details={
+                        "series_tags": list(series_tag_ids),
+                        "episode_tags": list(episode_tag_ids),
+                        "protected_labels": protected_labels,
+                        "watched_by": episode.get("watched_by"),
+                    },
                 )
                 continue
             # Check if episode has been watched by any user, or if it's marked as watched at the episode level
@@ -2077,7 +2149,10 @@ class MediaCleanup:
                     media_type="episode",
                     media_title=episode_label,
                     reason="not_watched",
-                    details={"watched_by": episode["watched_by"]},
+                    details={
+                        "watched_by": episode["watched_by"],
+                        "skip_category": "policy",
+                    },
                 )
                 continue
 
@@ -2113,6 +2188,7 @@ class MediaCleanup:
                         "user_tags": user_tags,
                         "watched_by": episode["watched_by"],
                         "watch_evidence": watch_evidence,
+                        "skip_category": "policy",
                     },
                 )
                 continue
@@ -2124,6 +2200,8 @@ class MediaCleanup:
                 sonarr_match["episode"]["id"],
                 file_path=episode["file"],
                 rating_key=episode.get("rating_key"),
+                watched_by=episode.get("watched_by"),
+                related_users=user_tags or None,
             )
 
     def process_watched_movies(self):
@@ -2184,6 +2262,7 @@ class MediaCleanup:
             safe_tag = next((tag for tag in radarr_tags if _normalize_tag_label(tag.get("label")) == "safe"), None)
             if ((safe_tag and safe_tag["id"] in movie_tags) or
                     (kids_tag and kids_tag["id"] in movie_tags)):
+                protected_labels = self._protected_labels_for_ids(radarr_tags, movie_tags)
                 logger.info(
                     f"Skipping deletion for {movie['title']} ({movie['year']}) due to 'safe' or 'kids' tag"
                 )
@@ -2192,7 +2271,11 @@ class MediaCleanup:
                     media_type="movie",
                     media_title=f"{movie['title']} ({movie['year']})",
                     reason="protected_series_or_movie_tags",
-                    details={"movie_tags": movie_tags},
+                    details={
+                        "movie_tags": movie_tags,
+                        "protected_labels": protected_labels,
+                        "watched_by": movie.get("watched_by"),
+                    },
                 )
                 continue
             user_tags = self.get_user_tags(radarr_tags, movie_tags)
@@ -2208,7 +2291,11 @@ class MediaCleanup:
                         media_type="movie",
                         media_title=f"{movie['title']} ({movie['year']})",
                         reason="no_movie_file_id",
-                        details={"radarr_id": radarr_match["movie"].get("id")},
+                        details={
+                            "radarr_id": radarr_match["movie"].get("id"),
+                            "skip_category": "policy",
+                            "watched_by": movie.get("watched_by"),
+                        },
                     )
                     continue
                 if self.delete_radarr_movie_file(radarr_match["file_id"]):
@@ -2218,7 +2305,12 @@ class MediaCleanup:
                         media_type="movie",
                         media_title=f"{movie['title']} ({movie['year']})",
                         reason="standard watched",
-                        details={"radarr_id": radarr_match["movie"]["id"], "file_id": radarr_match["file_id"]},
+                        details={
+                            "radarr_id": radarr_match["movie"]["id"],
+                            "file_id": radarr_match["file_id"],
+                            "watched_by": movie.get("watched_by"),
+                            "user_tags": user_tags,
+                        },
                     )
                     self._record_summary("movie_deletions", f"{movie['title']} ({movie['year']}) [standard watched]")
                     self.unmonitor_radarr_movie(radarr_match["movie"]["id"])
@@ -2243,6 +2335,7 @@ class MediaCleanup:
                         "user_tags": user_tags,
                         "policy": CONFIG.get("multi_user_delete_policy", "require_all_users"),
                         "watched_by": movie.get("watched_by"),
+                        "skip_category": "policy",
                     },
                 )
 

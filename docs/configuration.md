@@ -13,6 +13,7 @@ Optional variables:
 
 - `CLEANARR_TRANSMISSION_*` for torrent cleanup
 - `CLEANARR_DRY_RUN` to disable destructive actions
+- `CLEANARR_DRY_RUN_REPORT_DIR` directory for per-user dry-run report artifacts (`cleanarr-dry-run-report.json` and `.md`). Default: `/logs/dry-run-reports`. Written at end of a **job-mode** dry-run only.
 - `CLEANARR_NTFY_*` for run summaries
 - `WEBHOOK_SECRET` / `WEBHOOK_SECRET_PREVIOUS` to protect the Plex webhook endpoint (`/plex/webhook`) and the proxy ingress for Plex events
 - `JELLYFIN_WEBHOOK_SECRET` / `JELLYFIN_WEBHOOK_SECRET_PREVIOUS` to protect the Jellyfin webhook endpoint (`/jellyfin/webhook`) and the proxy ingress for Jellyfin events
@@ -142,4 +143,29 @@ Repository boundary:
 
 - Keep webhook and proxy runtime code in `cleanarr`
 - Keep cluster manifests, Terraform IAM, queue provisioning, and release promotion in the downstream environment repo
+
+## Dry-run report artifacts (job mode)
+
+When `CLEANARR_DRY_RUN=true`, a completed **scheduled job** run writes structured report artifacts under `CLEANARR_DRY_RUN_REPORT_DIR`:
+
+| File | Purpose |
+| --- | --- |
+| `cleanarr-dry-run-report.json` | Machine-readable per-user report (`schema_version: 1`) |
+| `cleanarr-dry-run-report.md` | Human-readable Markdown summary of the same data |
+
+Report contents:
+
+- `summary.would_delete` / `summary.skipped` / `summary.skip_breakdown`
+- `users.<profile>.would_delete[]` and `users.<profile>.skipped[]`
+- Each skip includes `skip_category`: `safe`, `kids`, `policy`, `protected`, `unmatched`, or `error`
+- Decisions without a known profile appear under `_unattributed`
+- Sensitive values are redacted (same rules as decision JSONL)
+
+### Webhook limitations
+
+Dry-run **aggregate** report artifacts are a **job-mode** feature (full-library pass). Webhook and SQS consumer runtimes remain event-driven and do **not** write the per-user JSON/Markdown dry-run report files:
+
+- They still append individual decisions to `CLEANARR_DECISION_REPORT_FILE` (JSONL) when configured.
+- A single webhook event only evaluates one (or a small set of) titles, so a complete per-user library report is not produced.
+- Operators who need a full “what would be deleted for each profile” artifact should run the job image with `CLEANARR_DRY_RUN=true` and collect files from `CLEANARR_DRY_RUN_REPORT_DIR` (for example via a mounted logs volume or `kubectl cp`).
 

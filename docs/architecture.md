@@ -17,6 +17,11 @@ Design constraints:
 - Proxy and webhook runtime behavior stay in this repository; downstream repos own IAM roles, queue resources, manifests, and rollout policy.
 - Multi-user delete policy defaults to `require_all_users` so shared-library watch state cannot delete media while another household member is still mid-season (exact-item and watched-ahead paths share the same policy). See `docs/configuration.md`.
 
+Dry-run reporting:
+
+- Job mode (`MediaCleanup.run`) can emit per-user dry-run JSON/Markdown artifacts when `CLEANARR_DRY_RUN=true`.
+- Webhook / SQS consumer paths remain event-scoped and only use decision JSONL; they do not produce the aggregate library dry-run report.
+
 Queue decoupling (issue #8):
 
 - In `direct` mode, webhook events are processed immediately by the webhook runtime.
