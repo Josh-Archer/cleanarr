@@ -1,9 +1,12 @@
+import sys
+
 from cleanarr.cleanup import MediaCleanup
 
 
-def main() -> None:
-    MediaCleanup().run()
+def main() -> int:
+    result = MediaCleanup().run()
+    return result.exit_code()
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

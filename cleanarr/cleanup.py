@@ -15,6 +15,7 @@ import sys
 import json
 import time
 import re
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 import requests
 from urllib.parse import urljoin
@@ -22,6 +23,32 @@ from plexapi.server import PlexServer
 from transmission_rpc import Client as TransmissionClient
 from cleanarr.reporting import DecisionReporter
 from loguru import logger
+
+# Run outcome taxonomy: full success vs partial failure vs aborted.
+OUTCOME_SUCCESS = "success"
+OUTCOME_PARTIAL_FAILURE = "partial_failure"
+OUTCOME_ABORTED = "aborted"
+
+
+@dataclass
+class CleanupResult:
+    """Structured result of a cleanup run for callers and exit codes."""
+
+    outcome: str = OUTCOME_SUCCESS
+    errors: list = field(default_factory=list)
+    tv_deletions: list = field(default_factory=list)
+    movie_deletions: list = field(default_factory=list)
+    protected_skips: list = field(default_factory=list)
+    message: str = ""
+
+    @property
+    def failed(self) -> bool:
+        """True when the run was not a full success."""
+        return self.outcome != OUTCOME_SUCCESS
+
+    def exit_code(self) -> int:
+        """Non-zero when partial failures or aborts occurred."""
+        return 0 if self.outcome == OUTCOME_SUCCESS else 1
 
 def _get_env(*keys, default=None):
     for key in keys:
@@ -216,6 +243,8 @@ class MediaCleanup:
             "protected_skips": [],
             "errors": [],
         }
+        self.run_outcome = OUTCOME_SUCCESS
+        self.run_abort_reason = None
         self.decision_reporter = DecisionReporter(component="cleanup")
         self._arr_cache = {
             "sonarr_tags": None,
@@ -289,8 +318,22 @@ class MediaCleanup:
                 logger.error(f"Failed to connect to Transmission: {str(e)}")
                 sys.exit(1)
 
+    def _mark_partial_failure(self):
+        """Mark the run as a partial failure unless already aborted."""
+        if self.run_outcome != OUTCOME_ABORTED:
+            self.run_outcome = OUTCOME_PARTIAL_FAILURE
+
+    def _mark_aborted(self, reason):
+        """Mark the run as aborted and record the reason."""
+        self.run_outcome = OUTCOME_ABORTED
+        self.run_abort_reason = reason
+        self.run_summary.setdefault("errors", []).append(f"aborted: {reason}")
+
     def _record_summary(self, category, message):
         self.run_summary.setdefault(category, []).append(message)
+        # Errors indicate at least a partial failure for exit/reporting.
+        if category == "errors":
+            self._mark_partial_failure()
 
     def _record_decision(
         self,
@@ -313,6 +356,25 @@ class MediaCleanup:
         if not entries:
             return f"{label}: none"
         return f"{label} ({len(entries)}): " + "; ".join(entries[:10])
+
+    def _outcome_status_line(self):
+        error_count = len(self.run_summary.get("errors", []))
+        if self.run_outcome == OUTCOME_ABORTED:
+            reason = self.run_abort_reason or "error"
+            return f"Outcome: {OUTCOME_ABORTED} ({reason})"
+        if self.run_outcome == OUTCOME_PARTIAL_FAILURE:
+            return f"Outcome: {OUTCOME_PARTIAL_FAILURE} ({error_count} error(s))"
+        return f"Outcome: {OUTCOME_SUCCESS}"
+
+    def _build_result(self) -> CleanupResult:
+        return CleanupResult(
+            outcome=self.run_outcome,
+            errors=list(self.run_summary.get("errors", [])),
+            tv_deletions=list(self.run_summary.get("tv_deletions", [])),
+            movie_deletions=list(self.run_summary.get("movie_deletions", [])),
+            protected_skips=list(self.run_summary.get("protected_skips", [])),
+            message=self.run_abort_reason or "",
+        )
 
     def _send_ntfy_summary(self, title, lines, priority="default", tags=None):
         topic = CONFIG.get("ntfy", {}).get("topic")
@@ -338,10 +400,14 @@ class MediaCleanup:
             logger.info("Sent Cleanarr summary notification to ntfy")
         except Exception as exc:
             logger.error(f"Failed to send ntfy notification: {exc}")
-            self._record_summary("errors", f"ntfy failed: {exc}")
+            # Do not use _record_summary here: ntfy is secondary reporting and
+            # should not rewrite the cleanup outcome after the fact.
+            self.run_summary.setdefault("errors", []).append(f"ntfy failed: {exc}")
+            self._mark_partial_failure()
 
     def _flush_run_summary(self):
         lines = [
+            self._outcome_status_line(),
             self._summarize_entries("tv_deletions", "TV deletions"),
             self._summarize_entries("movie_deletions", "Movie deletions"),
             self._summarize_entries("protected_skips", "Protected skips"),
@@ -349,16 +415,30 @@ class MediaCleanup:
         ]
         logger.info("Cleanup summary | " + " | ".join(lines))
 
-        deletion_count = len(self.run_summary.get("tv_deletions", [])) + len(self.run_summary.get("movie_deletions", []))
-        if deletion_count == 0 and not CONFIG.get("dry_run"):
+        deletion_count = (
+            len(self.run_summary.get("tv_deletions", []))
+            + len(self.run_summary.get("movie_deletions", []))
+        )
+        error_count = len(self.run_summary.get("errors", []))
+        # Always report when there are failures, even if no deletions succeeded.
+        if deletion_count == 0 and error_count == 0 and not CONFIG.get("dry_run"):
             return
 
         title_prefix = "[DRY RUN] " if CONFIG.get("dry_run") else ""
-        self._send_ntfy_summary(
-            f"{title_prefix}Cleanarr summary",
-            lines,
-            priority="high" if deletion_count else "default",
-        )
+        if self.run_outcome == OUTCOME_ABORTED:
+            title = f"{title_prefix}Cleanarr FAILED (aborted)"
+            priority = "urgent"
+            tags = "x,warning"
+        elif self.run_outcome == OUTCOME_PARTIAL_FAILURE:
+            title = f"{title_prefix}Cleanarr FAILED (partial)"
+            priority = "high"
+            tags = "warning,x"
+        else:
+            title = f"{title_prefix}Cleanarr summary"
+            priority = "high" if deletion_count else "default"
+            tags = None
+
+        self._send_ntfy_summary(title, lines, priority=priority, tags=tags)
 
     def _torrent_cleanup_allowed(self, torrent, reason):
         torrent_name = getattr(torrent, "name", "unknown torrent")
@@ -468,6 +548,7 @@ class MediaCleanup:
             torrents = self.transmission.get_torrents()
         except Exception as exc:
             logger.error(f"Failed to list Transmission torrents for I/O error cleanup: {exc}")
+            self._record_summary("errors", f"I/O error cleanup list failed: {exc}")
             return
 
         for torrent in torrents:
@@ -524,12 +605,17 @@ class MediaCleanup:
                 self.transmission.remove_torrent(torrent.id, delete_data=False)
             except Exception as exc:
                 logger.error(f"Failed to remove torrent {torrent.name} after repeated I/O errors: {exc}")
+                self._record_summary(
+                    "errors",
+                    f"I/O error torrent remove failed: {torrent.name}: {exc}",
+                )
                 next_state[torrent_key] = entry
 
         try:
             self._save_io_error_state(next_state)
         except OSError as exc:
             logger.error(f"Failed to persist Transmission I/O error cleanup state: {exc}")
+            self._record_summary("errors", f"I/O error state persist failed: {exc}")
 
     def _sonarr_request(self, endpoint, method="GET", data=None):
         """Make a request to the Sonarr API."""
@@ -1292,6 +1378,7 @@ class MediaCleanup:
             return False
         except Exception as e:
             logger.error(f"Error removing torrent by file path {file_path}: {str(e)}")
+            self._record_summary("errors", f"torrent remove by path failed: {file_path}: {e}")
             return False
 
     def clean_failed_downloads(self):
@@ -1327,6 +1414,10 @@ class MediaCleanup:
                                 removed_torrent_ids.add(torrent.id)
                             except Exception as e:
                                 logger.error(f"Failed to remove errored torrent {torrent.name}: {e}")
+                                self._record_summary(
+                                    "errors",
+                                    f"errored torrent remove failed: {torrent.name}: {e}",
+                                )
             else:
                 logger.info("Failed download cleanup is disabled")
 
@@ -1362,6 +1453,7 @@ class MediaCleanup:
                 actual_files = os.listdir(incomplete_dir)
             except OSError as e:
                 logger.error(f"Failed to list incomplete directory {incomplete_dir}: {e}")
+                self._record_summary("errors", f"incomplete dir list failed: {incomplete_dir}: {e}")
                 return
 
             for filename in actual_files:
@@ -1391,11 +1483,13 @@ class MediaCleanup:
                             logger.info(f"Successfully deleted orphan: {filename}")
                         except Exception as e:
                             logger.error(f"Failed to delete orphan {filename}: {e}")
+                            self._record_summary("errors", f"orphan delete failed: {filename}: {e}")
                 else:
                     logger.debug(f"Keeping file {filename} (belongs to active torrent)")
 
         except Exception as e:
             logger.error(f"Error cleaning failed downloads: {e}")
+            self._record_summary("errors", f"failed download cleanup error: {e}")
 
     def remove_stale_torrents(self):
         """Remove stale torrents from Transmission."""
@@ -1487,9 +1581,14 @@ class MediaCleanup:
                         logger.debug(f"Torrent {torrent.name} not stale (Age: {age}, Complete: {is_complete} | {torrent.percent_done}, Peers: {torrent.peers_connected}, Status: {torrent.status})")
                 except Exception as e:
                     logger.error(f"Error processing torrent {torrent.name}: {str(e)}")
+                    self._record_summary(
+                        "errors",
+                        f"stale torrent processing failed: {getattr(torrent, 'name', 'unknown')}: {e}",
+                    )
                     continue
         except Exception as e:
             logger.error(f"Error in stale torrent check: {str(e)}")
+            self._record_summary("errors", f"stale torrent check error: {e}")
 
     def remove_from_plex_watchlist(self, rating_key):
         """Remove an item from the Plex Watchlist for the owner and managed users."""
@@ -1551,6 +1650,10 @@ class MediaCleanup:
         sonarr_tags = self.get_sonarr_tags()
         if sonarr_tags is None:
             logger.error("Failed to fetch Sonarr tags; aborting watched episode processing to prevent accidental deletions.")
+            self._record_summary(
+                "errors",
+                "Failed to fetch Sonarr tags; aborted watched episode processing",
+            )
             return
 
         # --- Watched ahead logic ---
@@ -1763,6 +1866,10 @@ class MediaCleanup:
         radarr_tags = self.get_radarr_tags()
         if radarr_tags is None:
             logger.error("Failed to fetch Radarr tags; aborting watched movie processing to prevent accidental deletions.")
+            self._record_summary(
+                "errors",
+                "Failed to fetch Radarr tags; aborted watched movie processing",
+            )
             return
         radarr_managed_roots = self._radarr_managed_movie_roots()
         
@@ -1868,8 +1975,14 @@ class MediaCleanup:
                     details={"user_tags": user_tags},
                 )
 
-    def run(self):
-        """Run the main cleanup process."""
+    def run(self) -> CleanupResult:
+        """Run the main cleanup process.
+
+        Returns a CleanupResult with outcome taxonomy:
+        - success: no errors recorded
+        - partial_failure: some deletes/operations failed, run finished
+        - aborted: unhandled exception stopped the run early
+        """
         start_time = time.time()
         logger.info("Starting Plex media cleanup process")
         try:
@@ -1878,14 +1991,33 @@ class MediaCleanup:
             self.clean_repeated_io_error_torrents()
             self.clean_failed_downloads()
             self.remove_stale_torrents()
-            self._flush_run_summary()
-            elapsed_time = time.time() - start_time
-            logger.info(f"Cleanup process completed in {elapsed_time:.2f} seconds")
         except Exception as e:
             logger.error(f"Error during cleanup process: {str(e)}")
+            self._mark_aborted(str(e))
+        finally:
+            try:
+                self._flush_run_summary()
+            except Exception as flush_exc:
+                logger.error(f"Failed to flush cleanup summary: {flush_exc}")
+                self._mark_partial_failure()
+                self.run_summary.setdefault("errors", []).append(
+                    f"summary flush failed: {flush_exc}"
+                )
+
+        elapsed_time = time.time() - start_time
+        result = self._build_result()
+        if result.failed:
+            logger.error(
+                f"Cleanup process finished with outcome={result.outcome} "
+                f"in {elapsed_time:.2f} seconds ({len(result.errors)} error(s))"
+            )
+        else:
+            logger.info(f"Cleanup process completed in {elapsed_time:.2f} seconds")
+        return result
 
 
 if __name__ == "__main__":
     cleaner = MediaCleanup()
-    cleaner.run()
+    result = cleaner.run()
+    sys.exit(result.exit_code())
 

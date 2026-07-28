@@ -71,7 +71,23 @@ def _run_scheduled_cleanup():
     """Full-library cleanup for EventBridge/manual invokes without SQS records."""
     logger.info("No SQS records found; performing full library cleanup")
     cleaner = MediaCleanup()
-    cleaner.run()
+    result = cleaner.run()
+    if result.failed:
+        logger.error(
+            f"Scheduled cleanup finished with outcome={result.outcome}: {result.errors}"
+        )
+        return {
+            "statusCode": 500,
+            "body": json.dumps(
+                {
+                    "outcome": result.outcome,
+                    "failed": True,
+                    "errors": result.errors,
+                    "message": result.message
+                    or f"Cleanup finished with outcome={result.outcome}",
+                }
+            ),
+        }
     return {
         "statusCode": 200,
         "body": json.dumps("Cleanup successful"),
