@@ -279,6 +279,16 @@ CONFIG = {
         ),
         "apikey": _get_env("CLEANARR_RADARR_APIKEY"),
     },
+    # Optional Lidarr music cleanup (default OFF). When disabled, no Lidarr API
+    # calls are made and music libraries are left untouched.
+    "lidarr": {
+        "enabled": _env_flag("CLEANARR_LIDARR_ENABLE", default="false"),
+        "baseurl": _get_env(
+            "CLEANARR_LIDARR_BASEURL",
+            default="http://lidarr:8686/api/v1/",
+        ),
+        "apikey": _get_env("CLEANARR_LIDARR_APIKEY"),
+    },
     "transmission": {
         "host": _get_env("CLEANARR_TRANSMISSION_HOST", default="transmission"),
         "port": int(_get_env("CLEANARR_TRANSMISSION_PORT", default="9091")),
@@ -427,6 +437,7 @@ class MediaCleanup:
         self.run_summary = {
             "tv_deletions": [],
             "movie_deletions": [],
+            "music_deletions": [],
             "protected_skips": [],
             "errors": [],
         }
@@ -439,6 +450,7 @@ class MediaCleanup:
         )
         self._arr_cache = {
             "sonarr_tags": None,
+            "lidarr_tags": None,
             "radarr_tags": None,
             "sonarr_series": None,
             "radarr_movies": None,
@@ -2339,6 +2351,572 @@ class MediaCleanup:
                     },
                 )
 
+    def _lidarr_enabled(self):
+        """Return True when optional Lidarr music cleanup is enabled."""
+        return bool(CONFIG.get("lidarr", {}).get("enabled"))
+
+    def _lidarr_request(self, endpoint, method="GET", data=None):
+        """Make a request to the Lidarr API."""
+        if not self._lidarr_enabled():
+            logger.debug("Lidarr cleanup disabled; skipping Lidarr API call")
+            return None
+        if not CONFIG["lidarr"]["apikey"]:
+            logger.error("Missing Lidarr API key. Set CLEANARR_LIDARR_APIKEY.")
+            return None
+        url = urljoin(CONFIG["lidarr"]["baseurl"], endpoint)
+        self.lidarr_session.headers.update({"X-Api-Key": CONFIG["lidarr"]["apikey"]})
+        return self._arr_request("Lidarr", self.lidarr_session, url, endpoint, method, data)
+
+    def get_lidarr_tags(self):
+        """Get all tags from Lidarr. Returns None on error."""
+        logger.debug("Getting Lidarr tags")
+        if self._arr_cache["lidarr_tags"] is not None:
+            return self._arr_cache["lidarr_tags"]
+        tags = self._lidarr_request("tag")
+        if tags is not None:
+            self._arr_cache["lidarr_tags"] = tags
+        return tags
+
+    def get_lidarr_artists(self):
+        """Get all artists from Lidarr."""
+        logger.debug("Getting Lidarr artists")
+        if self._arr_cache["lidarr_artists"] is not None:
+            return self._arr_cache["lidarr_artists"]
+        artists = self._lidarr_request("artist")
+        if artists is not None:
+            self._arr_cache["lidarr_artists"] = artists or []
+            return self._arr_cache["lidarr_artists"]
+        return []
+
+    def get_lidarr_albums_for_artist(self, artist_id):
+        """Get Lidarr albums for an artist, cached per artist ID."""
+        cache = self._arr_cache["lidarr_albums_by_artist_id"]
+        if artist_id in cache:
+            return cache[artist_id]
+        albums = self._lidarr_request(f"album?artistId={artist_id}") or []
+        cache[artist_id] = albums
+        return albums
+
+    def get_lidarr_tracks_for_album(self, album_id):
+        """Get Lidarr tracks for an album, cached per album ID."""
+        cache = self._arr_cache["lidarr_tracks_by_album_id"]
+        if album_id in cache:
+            return cache[album_id]
+        tracks = self._lidarr_request(f"track?albumId={album_id}") or []
+        cache[album_id] = tracks
+        return tracks
+
+    def get_lidarr_tracks_for_artist(self, artist_id):
+        """Get Lidarr tracks for an artist, cached per artist ID."""
+        cache = self._arr_cache["lidarr_tracks_by_artist_id"]
+        if artist_id in cache:
+            return cache[artist_id]
+        tracks = self._lidarr_request(f"track?artistId={artist_id}") or []
+        cache[artist_id] = tracks
+        return tracks
+
+    @staticmethod
+    def _normalize_music_title(title):
+        """Normalize music titles for artist/album/track matching."""
+        t = (title or "").lower()
+        t = re.sub(r"\(.*?\)", "", t)
+        t = re.sub(r"\[.*?\]", "", t)
+        t = re.sub(r"^the\s+", "", t)
+        t = re.sub(r"'s\b", "", t)
+        t = re.sub(r"[^a-z0-9]", "", t)
+        return t.strip()
+
+    def _extract_music_mbids(self, media_item):
+        """Extract MusicBrainz IDs from Plex track guid fields."""
+        ids = {"track": set(), "album": set(), "artist": set()}
+        if not isinstance(media_item, dict):
+            return ids
+
+        def consider(raw_value):
+            text = str(raw_value or "")
+            for match in re.finditer(
+                r"(mbid|musicbrainz(?:track|album|artist)?)://([^/?]+)",
+                text,
+                re.IGNORECASE,
+            ):
+                scheme = match.group(1).lower()
+                value = match.group(2).strip().lower()
+                if not value:
+                    continue
+                if "track" in scheme:
+                    ids["track"].add(value)
+                elif "album" in scheme:
+                    ids["album"].add(value)
+                elif "artist" in scheme:
+                    ids["artist"].add(value)
+                else:
+                    # Bare mbid://uuid — role unknown; keep on all for intersection checks.
+                    ids["track"].add(value)
+                    ids["album"].add(value)
+                    ids["artist"].add(value)
+            # plexapi sometimes uses com.plexapp.agents.musicbrainz://uuid?lang=en
+            for match in re.finditer(
+                r"musicbrainz://([^/?]+)",
+                text,
+                re.IGNORECASE,
+            ):
+                value = match.group(1).strip().lower()
+                if value:
+                    ids["track"].add(value)
+                    ids["album"].add(value)
+                    ids["artist"].add(value)
+
+        consider(media_item.get("guid"))
+        for guid in media_item.get("guids") or []:
+            consider(guid)
+        return ids
+
+    def _lidarr_foreign_id(self, record, *keys):
+        """Return a normalized foreign/MusicBrainz id from a Lidarr record."""
+        if not isinstance(record, dict):
+            return None
+        for key in keys:
+            value = record.get(key)
+            if value:
+                return str(value).strip().lower()
+        foreign = record.get("foreignArtistId") or record.get("foreignAlbumId") or record.get(
+            "foreignTrackId"
+        )
+        if foreign:
+            return str(foreign).strip().lower()
+        return None
+
+    def get_played_tracks(self):
+        """Get played (listened) music tracks from Plex artist libraries.
+
+        Source of truth for play/listened state is Plex history / isWatched /
+        viewCount — the same family of signals used for TV and movies. Lidarr
+        remains the source of truth for whether a track file is managed and
+        may be deleted (lifecycle, tags, monitoring).
+        """
+        logger.info("Checking for played music tracks in Plex")
+        played_tracks = []
+        try:
+            all_sections = self.plex.library.sections()
+            music_sections = [
+                section for section in all_sections if section.type == "artist"
+            ]
+            logger.info(
+                f"Found {len(music_sections)} music sections: "
+                f"{[s.title for s in music_sections]}"
+            )
+            for section in music_sections:
+                try:
+                    tracks = section.search(libtype="track")
+                except Exception as search_err:
+                    logger.warning(
+                        f"Failed to search tracks in music section '{section.title}': {search_err}"
+                    )
+                    continue
+                for track in tracks:
+                    is_played = bool(getattr(track, "isWatched", False)) or int(
+                        getattr(track, "viewCount", 0) or 0
+                    ) > 0
+                    if not is_played:
+                        continue
+                    watch_status = self._get_watch_status(track)
+                    guid_values = []
+                    for guid in getattr(track, "guids", None) or []:
+                        value = getattr(guid, "id", guid)
+                        if value:
+                            guid_values.append(str(value))
+                    track_data = {
+                        "title": track.title,
+                        "artist": getattr(track, "grandparentTitle", None)
+                        or getattr(track, "originalTitle", None),
+                        "album": getattr(track, "parentTitle", None),
+                        "track_number": getattr(track, "index", None)
+                        or getattr(track, "trackNumber", None),
+                        "year": getattr(track, "year", None)
+                        or getattr(track, "parentYear", None),
+                        "file": track.locations[0] if getattr(track, "locations", None) else None,
+                        "watched_by": watch_status,
+                        "watch_evidence": self.watch_evidence_by_rating_key.get(
+                            track.ratingKey, {}
+                        ).copy(),
+                        "guid": getattr(track, "guid", None),
+                        "guids": guid_values,
+                        "rating_key": track.ratingKey,
+                    }
+                    if not any(watch_status.values()) and is_played:
+                        track_data["is_watched_override"] = True
+                    played_tracks.append(track_data)
+            logger.info(f"Found {len(played_tracks)} played music tracks")
+            return played_tracks
+        except Exception as e:
+            logger.error(f"Error getting played music tracks: {str(e)}")
+            return []
+
+    def match_track_to_lidarr(self, track, *, log_unmatched=True):
+        """Match a Plex music track to a Lidarr-managed track.
+
+        Matching order (first hit wins):
+        1. MusicBrainz track id (foreignTrackId)
+        2. Artist name + album title + track title (normalized)
+        3. Artist name + track title when the track title is unique for the artist
+        """
+        logger.info(
+            f"Matching track to Lidarr: {track.get('artist')} - "
+            f"{track.get('album')} - {track.get('title')}"
+        )
+        artists = self.get_lidarr_artists()
+        if not artists:
+            if log_unmatched:
+                logger.warning("No Lidarr artists available for music matching")
+            return None
+
+        mbids = self._extract_music_mbids(track)
+        track_mbids = mbids["track"]
+        album_mbids = mbids["album"]
+        artist_mbids = mbids["artist"]
+
+        # --- MusicBrainz track id match across managed artists ---
+        if track_mbids:
+            for artist in artists:
+                for lidarr_track in self.get_lidarr_tracks_for_artist(artist["id"]):
+                    foreign = self._lidarr_foreign_id(lidarr_track, "foreignTrackId")
+                    if foreign and foreign in track_mbids:
+                        logger.info(
+                            f"Matched Lidarr track by MusicBrainz id: "
+                            f"{lidarr_track.get('title')} (artist={artist.get('artistName')})"
+                        )
+                        return {
+                            "artist": artist,
+                            "album": lidarr_track.get("album") or {},
+                            "track": lidarr_track,
+                            "file_id": lidarr_track.get("trackFileId")
+                            or (lidarr_track.get("trackFile") or {}).get("id"),
+                        }
+
+        target_artist = self._normalize_music_title(track.get("artist"))
+        target_album = self._normalize_music_title(track.get("album"))
+        target_title = self._normalize_music_title(track.get("title"))
+        if not target_artist or not target_title:
+            if log_unmatched:
+                logger.warning(
+                    f"Insufficient music metadata to match Lidarr track: "
+                    f"artist={track.get('artist')!r} title={track.get('title')!r}"
+                )
+            return None
+
+        # Prefer MBID artist, then normalized artist name.
+        artist_candidates = []
+        for artist in artists:
+            foreign = self._lidarr_foreign_id(artist, "foreignArtistId")
+            if foreign and foreign in artist_mbids:
+                artist_candidates.append(artist)
+                continue
+            name = self._normalize_music_title(
+                artist.get("artistName") or artist.get("sortName") or artist.get("name")
+            )
+            if name and name == target_artist:
+                artist_candidates.append(artist)
+
+        if not artist_candidates:
+            if log_unmatched:
+                logger.warning(f"Artist not found in Lidarr: {track.get('artist')}")
+            return None
+
+        for artist in artist_candidates:
+            albums = self.get_lidarr_albums_for_artist(artist["id"])
+            album_candidates = []
+            for album in albums:
+                foreign = self._lidarr_foreign_id(album, "foreignAlbumId")
+                if foreign and foreign in album_mbids:
+                    album_candidates.append(album)
+                    continue
+                if target_album and self._normalize_music_title(album.get("title")) == target_album:
+                    album_candidates.append(album)
+
+            search_albums = album_candidates or albums
+            title_matches = []
+            for album in search_albums:
+                for lidarr_track in self.get_lidarr_tracks_for_album(album["id"]):
+                    if self._normalize_music_title(lidarr_track.get("title")) == target_title:
+                        title_matches.append((artist, album, lidarr_track))
+
+            if len(title_matches) == 1:
+                artist_match, album_match, track_match = title_matches[0]
+                logger.info(
+                    f"Matched Lidarr track by artist/album/title: "
+                    f"{artist_match.get('artistName')} / {album_match.get('title')} / "
+                    f"{track_match.get('title')}"
+                )
+                return {
+                    "artist": artist_match,
+                    "album": album_match,
+                    "track": track_match,
+                    "file_id": track_match.get("trackFileId")
+                    or (track_match.get("trackFile") or {}).get("id"),
+                }
+
+            if album_candidates and title_matches:
+                # Prefer matches restricted to the matched album set.
+                album_ids = {a["id"] for a in album_candidates}
+                album_restricted = [m for m in title_matches if m[1].get("id") in album_ids]
+                if len(album_restricted) == 1:
+                    artist_match, album_match, track_match = album_restricted[0]
+                    logger.info(
+                        f"Matched Lidarr track by album-restricted title: "
+                        f"{track_match.get('title')}"
+                    )
+                    return {
+                        "artist": artist_match,
+                        "album": album_match,
+                        "track": track_match,
+                        "file_id": track_match.get("trackFileId")
+                        or (track_match.get("trackFile") or {}).get("id"),
+                    }
+
+            # Track-number disambiguation when titles collide.
+            track_number = track.get("track_number")
+            if track_number is not None and title_matches:
+                numbered = []
+                for artist_match, album_match, track_match in title_matches:
+                    lidarr_num = track_match.get("trackNumber") or track_match.get(
+                        "absoluteTrackNumber"
+                    )
+                    try:
+                        if int(lidarr_num) == int(track_number):
+                            numbered.append((artist_match, album_match, track_match))
+                    except (TypeError, ValueError):
+                        if str(lidarr_num) == str(track_number):
+                            numbered.append((artist_match, album_match, track_match))
+                if len(numbered) == 1:
+                    artist_match, album_match, track_match = numbered[0]
+                    logger.info(
+                        f"Matched Lidarr track by title+track number: "
+                        f"{track_match.get('title')} #{track_number}"
+                    )
+                    return {
+                        "artist": artist_match,
+                        "album": album_match,
+                        "track": track_match,
+                        "file_id": track_match.get("trackFileId")
+                        or (track_match.get("trackFile") or {}).get("id"),
+                    }
+
+        if log_unmatched:
+            logger.warning(
+                f"Track not found in Lidarr: {track.get('artist')} - "
+                f"{track.get('album')} - {track.get('title')}"
+            )
+        return None
+
+    def delete_lidarr_track_file(self, file_id):
+        """Delete a track file from Lidarr."""
+        if not file_id:
+            logger.warning("No file ID provided for Lidarr track deletion")
+            return False
+        if CONFIG["dry_run"]:
+            logger.info(f"[DRY RUN] Would delete track file from Lidarr: {file_id}")
+            return True
+        logger.info(f"Deleting track file from Lidarr: {file_id}")
+        result = self._lidarr_request(f"trackfile/{file_id}", method="DELETE")
+        if result is None:
+            return False
+        logger.info(f"Successfully deleted track file: {file_id}")
+        return True
+
+    def unmonitor_lidarr_track(self, track_id):
+        """Unmonitor a track in Lidarr."""
+        if CONFIG["dry_run"]:
+            logger.info(f"[DRY RUN] Would unmonitor track {track_id} in Lidarr")
+            return True
+        logger.info(f"Attempting to unmonitor track {track_id} in Lidarr")
+        track = self._lidarr_request(f"track/{track_id}")
+        if track:
+            track["monitored"] = False
+            result = self._lidarr_request(f"track/{track_id}", method="PUT", data=track)
+            if result is not None:
+                logger.info(f"Unmonitored track {track_id}")
+                return True
+            logger.error(f"Failed to unmonitor track {track_id}")
+            return False
+        logger.error(f"Failed to retrieve track {track_id} for unmonitoring")
+        return False
+
+    def _describe_track(self, track):
+        artist = track.get("artist") or "Unknown Artist"
+        album = track.get("album") or "Unknown Album"
+        title = track.get("title") or "Unknown Track"
+        return f"{artist} - {album} - {title}"
+
+    def _delete_track_and_cleanup(self, track_label, reason, file_id, track_id, file_path=None):
+        logger.info(f"Deleting {track_label} via {reason}")
+        if self.delete_lidarr_track_file(file_id):
+            delete_reason = "dry-run" if CONFIG["dry_run"] else "delete"
+            self._record_decision(
+                reason_code=delete_reason,
+                media_type="track",
+                media_title=track_label,
+                reason=reason,
+                details={"track_id": track_id, "file_id": file_id},
+            )
+            self._record_summary("music_deletions", f"{track_label} [{reason}]")
+            self.unmonitor_lidarr_track(track_id)
+            if file_path:
+                self.remove_torrent_by_file_path(file_path)
+            return True
+        self._record_decision(
+            reason_code="error",
+            media_type="track",
+            media_title=track_label,
+            reason="delete_failed",
+            details={"track_id": track_id, "file_id": file_id, "delete_reason": reason},
+        )
+        self._record_summary("errors", f"{track_label} delete failed [{reason}]")
+        return False
+
+    def process_played_tracks(self):
+        """Process played music tracks against Lidarr (optional; default OFF).
+
+        Source of truth:
+        - Plex play/listened signals decide *whether* a track is eligible.
+        - Lidarr records, tags, and owned track files decide *what* can be deleted.
+        """
+        if not self._lidarr_enabled():
+            logger.info(
+                "Lidarr music cleanup disabled "
+                "(set CLEANARR_LIDARR_ENABLE=true to opt in)"
+            )
+            return
+
+        logger.info("Processing played music tracks via Lidarr")
+        if not CONFIG["lidarr"].get("apikey"):
+            logger.error(
+                "CLEANARR_LIDARR_ENABLE is true but CLEANARR_LIDARR_APIKEY is missing; "
+                "aborting music cleanup"
+            )
+            self._record_summary("errors", "lidarr enabled without api key")
+            return
+
+        lidarr_tags = self.get_lidarr_tags()
+        if lidarr_tags is None:
+            logger.error(
+                "Failed to fetch Lidarr tags; aborting music cleanup to prevent "
+                "accidental deletions."
+            )
+            return
+
+        protected_tag_ids = {
+            tag["id"]
+            for tag in lidarr_tags
+            if _is_protected_tag_label(tag.get("label"))
+        }
+
+        played_tracks = self.get_played_tracks()
+        for track in played_tracks:
+            track_label = self._describe_track(track)
+            if not track.get("file"):
+                logger.warning(f"No file path for track: {track_label}")
+                self._record_decision(
+                    reason_code="skip",
+                    media_type="track",
+                    media_title=track_label,
+                    reason="missing_file_path",
+                    details={"rating_key": track.get("rating_key")},
+                )
+                continue
+
+            lidarr_match = self.match_track_to_lidarr(track)
+            if not lidarr_match:
+                self._record_decision(
+                    reason_code="unmatched",
+                    media_type="track",
+                    media_title=track_label,
+                    reason="no_lidarr_match",
+                    details={"rating_key": track.get("rating_key")},
+                )
+                continue
+
+            artist_tag_ids = set((lidarr_match["artist"] or {}).get("tags") or [])
+            album_tag_ids = set((lidarr_match["album"] or {}).get("tags") or [])
+            track_tag_ids = set((lidarr_match["track"] or {}).get("tags") or [])
+            combined_tag_ids = artist_tag_ids | album_tag_ids | track_tag_ids
+
+            if protected_tag_ids & combined_tag_ids:
+                logger.info(
+                    f"Skipping deletion for {track_label} due to 'safe' or 'kids' tag"
+                )
+                self._record_summary("protected_skips", f"{track_label} [protected tag]")
+                self._record_decision(
+                    reason_code="protected",
+                    media_type="track",
+                    media_title=track_label,
+                    reason="protected_artist_album_or_track_tags",
+                    details={
+                        "artist_tags": list(artist_tag_ids),
+                        "album_tags": list(album_tag_ids),
+                        "track_tags": list(track_tag_ids),
+                    },
+                )
+                continue
+
+            has_been_played = any(track["watched_by"].values()) or track.get(
+                "is_watched_override", False
+            )
+            if not has_been_played:
+                self._record_decision(
+                    reason_code="skip",
+                    media_type="track",
+                    media_title=track_label,
+                    reason="not_played",
+                    details={"watched_by": track["watched_by"]},
+                )
+                continue
+
+            user_tags = self.get_user_tags(lidarr_tags, combined_tag_ids)
+            if not self.should_delete_media(track, user_tags, track["watched_by"]):
+                watched_users = [
+                    user for user, watched in track["watched_by"].items() if watched
+                ]
+                skip_reason = (
+                    "not_played" if not watched_users else "tagged_users_not_all_watched"
+                )
+                self._record_decision(
+                    reason_code="skip",
+                    media_type="track",
+                    media_title=track_label,
+                    reason=skip_reason,
+                    details={
+                        "user_tags": user_tags,
+                        "watched_by": track["watched_by"],
+                        "watch_evidence": track.get("watch_evidence"),
+                    },
+                )
+                continue
+
+            file_id = lidarr_match.get("file_id")
+            if not file_id:
+                logger.info(
+                    f"Skipping deletion for {track_label}: matched Lidarr track "
+                    f"'{lidarr_match['track'].get('title')}' has no track file id "
+                    "(not owned / not imported)"
+                )
+                self._record_decision(
+                    reason_code="skip",
+                    media_type="track",
+                    media_title=track_label,
+                    reason="no_track_file_id",
+                    details={"lidarr_track_id": lidarr_match["track"].get("id")},
+                )
+                continue
+
+            self._delete_track_and_cleanup(
+                track_label,
+                "standard played",
+                file_id,
+                lidarr_match["track"]["id"],
+                file_path=track.get("file"),
+            )
+
+
     def run(self) -> CleanupResult:
         """Run the main cleanup process.
 
@@ -2352,6 +2930,7 @@ class MediaCleanup:
         try:
             self.process_watched_episodes()
             self.process_watched_movies()
+            self.process_played_tracks()
             self.clean_repeated_io_error_torrents()
             self.clean_failed_downloads()
             self.remove_stale_torrents()
