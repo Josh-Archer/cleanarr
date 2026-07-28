@@ -81,6 +81,181 @@ def _env_csv_set(*keys, default=""):
     }
 
 
+# Multi-user / household delete policies (issue #20).
+# Default is intentionally the safest option for shared libraries.
+MULTI_USER_DELETE_POLICIES = frozenset({
+    "require_all_users",
+    "majority",
+    "primary_user_only",
+})
+
+_MULTI_USER_DELETE_POLICY_ALIASES = {
+    "require_all": "require_all_users",
+    "require-all-users": "require_all_users",
+    "all": "require_all_users",
+    "all_users": "require_all_users",
+    "majority_users": "majority",
+    "primary": "primary_user_only",
+    "primary-user-only": "primary_user_only",
+    "primary_only": "primary_user_only",
+    "primary-only": "primary_user_only",
+}
+
+
+def _normalize_multi_user_delete_policy(value, *, default="require_all_users"):
+    """Normalize policy name; unknown values fall back to the safe default."""
+    raw = (value or default or "require_all_users").strip().lower().replace("-", "_")
+    # Re-apply alias lookup for hyphen forms that became underscores, and raw.
+    candidates = [
+        (value or "").strip().lower(),
+        raw,
+        raw.replace("_", "-"),
+    ]
+    for candidate in candidates:
+        if not candidate:
+            continue
+        if candidate in MULTI_USER_DELETE_POLICIES:
+            return candidate
+        aliased = _MULTI_USER_DELETE_POLICY_ALIASES.get(candidate)
+        if aliased:
+            return aliased
+        underscored = candidate.replace("-", "_")
+        if underscored in MULTI_USER_DELETE_POLICIES:
+            return underscored
+        aliased = _MULTI_USER_DELETE_POLICY_ALIASES.get(underscored)
+        if aliased:
+            return aliased
+    logger.warning(
+        f"Unknown CLEANARR_MULTI_USER_DELETE_POLICY '{value}'; "
+        f"using safe default '{default}'"
+    )
+    return default if default in MULTI_USER_DELETE_POLICIES else "require_all_users"
+
+
+def _user_names_match(left: str, right: str) -> bool:
+    """Flexible username match used for tags vs Plex account names."""
+    left = (left or "").strip().lower()
+    right = (right or "").strip().lower()
+    if not left or not right:
+        return False
+    if left == right:
+        return True
+    # Keep legacy flexible matching (e.g. tag 'user' matches 'user123').
+    try:
+        return bool(re.search(left, right) or re.search(right, left))
+    except re.error:
+        return False
+
+
+def _user_in_collection(username: str, collection) -> bool:
+    username = (username or "").strip().lower()
+    if not username:
+        return False
+    for entry in collection or []:
+        if _user_names_match(username, entry):
+            return True
+    return False
+
+
+def _resolve_household_members(user_tags, watched_by, household_users=None):
+    """Resolve the household constituency for multi-user delete decisions.
+
+    Priority:
+    1. Explicit CLEANARR_HOUSEHOLD_USERS (or provided set)
+    2. Sonarr/Radarr user tags on the item (shared library ownership tags)
+    3. All accounts present in watched_by (Plex owner + managed users)
+    """
+    if household_users is None:
+        household_users = CONFIG.get("household_users") or set()
+    if household_users:
+        return sorted({str(u).strip().lower() for u in household_users if str(u).strip()})
+    if user_tags:
+        return sorted({str(u).strip().lower() for u in user_tags if str(u).strip()})
+    return sorted({str(u).strip().lower() for u in (watched_by or {}).keys() if str(u).strip()})
+
+
+def _satisfied_household_members(household_members, satisfied_users):
+    """Return household members whose watch state is considered satisfied."""
+    satisfied = []
+    for member in household_members:
+        if _user_in_collection(member, satisfied_users):
+            satisfied.append(member)
+    return satisfied
+
+
+def household_policy_allows_delete(
+    household_members,
+    satisfied_users,
+    *,
+    policy=None,
+    primary_user=None,
+):
+    """Apply multi-user delete policy for a household.
+
+    ``satisfied_users`` is the set of usernames that already meet the deletion
+    precondition (exact-item watched, or watched-ahead for earlier episodes).
+
+    Returns (allowed: bool, detail: str).
+    """
+    policy = _normalize_multi_user_delete_policy(
+        policy if policy is not None else CONFIG.get("multi_user_delete_policy"),
+    )
+    if primary_user is None:
+        primary_user = CONFIG.get("primary_user") or ""
+    primary_user = (primary_user or "").strip().lower()
+
+    members = [m for m in (household_members or []) if m]
+    # No constituency: only allow when at least one satisfied watcher exists.
+    # Callers that already require a watcher keep this as a final guard.
+    if not members:
+        if satisfied_users:
+            return True, "no_household_members_any_watcher"
+        return False, "no_household_members_no_watchers"
+
+    satisfied = _satisfied_household_members(members, satisfied_users)
+    satisfied_count = len(satisfied)
+    member_count = len(members)
+
+    if policy == "primary_user_only":
+        if not primary_user:
+            logger.warning(
+                "CLEANARR_MULTI_USER_DELETE_POLICY=primary_user_only but "
+                "CLEANARR_PRIMARY_USER is unset; falling back to require_all_users"
+            )
+            policy = "require_all_users"
+        else:
+            if _user_in_collection(primary_user, satisfied):
+                return True, f"primary_user_only primary={primary_user}"
+            # Primary may not be listed in household_members (misconfig); still check raw.
+            if _user_in_collection(primary_user, satisfied_users):
+                return True, f"primary_user_only primary={primary_user}"
+            return False, (
+                f"primary_user_only primary={primary_user} not satisfied "
+                f"(satisfied={satisfied}, household={members})"
+            )
+
+    if policy == "majority":
+        # Strict majority: more than half of the household must be satisfied.
+        needed = (member_count // 2) + 1
+        if satisfied_count >= needed:
+            return True, (
+                f"majority {satisfied_count}/{member_count} (needed {needed}) "
+                f"satisfied={satisfied}"
+            )
+        return False, (
+            f"majority {satisfied_count}/{member_count} (needed {needed}) "
+            f"satisfied={satisfied} household={members}"
+        )
+
+    # require_all_users (safe default)
+    if satisfied_count >= member_count:
+        return True, f"require_all_users all {member_count} satisfied={satisfied}"
+    return False, (
+        f"require_all_users {satisfied_count}/{member_count} "
+        f"satisfied={satisfied} household={members}"
+    )
+
+
 CONFIG = {
     "plex": {
         "baseurl": _get_env(
@@ -158,6 +333,14 @@ CONFIG = {
         "tags": _get_env("CLEANARR_NTFY_TAGS", default="warning,clapper"),
         "priority": _get_env("CLEANARR_NTFY_PRIORITY", default="default"),
     },
+    # Household multi-user delete policy (issue #20).
+    # require_all_users is the safe default so one watcher's progress cannot
+    # delete media another household member still needs.
+    "multi_user_delete_policy": _normalize_multi_user_delete_policy(
+        _get_env("CLEANARR_MULTI_USER_DELETE_POLICY", default="require_all_users")
+    ),
+    "primary_user": (_get_env("CLEANARR_PRIMARY_USER", default="") or "").strip().lower(),
+    "household_users": _env_csv_set("CLEANARR_HOUSEHOLD_USERS", default=""),
 }
 
 IO_ERROR_PATTERNS = (
@@ -1163,7 +1346,7 @@ class MediaCleanup:
         return user_tags
 
     def should_delete_media(self, media_item, user_tags, watched_by):
-        """Determine if media should be deleted based on watch status and user tags.
+        """Determine if media should be deleted based on watch status and household policy.
 
         Exact-episode / movie deletion accepts both Plex history and
         ``isWatched_fallback`` evidence. History is frequently empty for
@@ -1171,6 +1354,16 @@ class MediaCleanup:
         scrobble), while ``isWatched`` / viewCount still reflect a real
         completion. Watched-ahead inference remains history-only and is
         handled separately in ``process_watched_episodes``.
+
+        Multi-user / household policy (issue #20):
+        - ``require_all_users`` (default): every household member must have watched
+        - ``majority``: strict majority of household members must have watched
+        - ``primary_user_only``: only ``CLEANARR_PRIMARY_USER`` must have watched
+
+        Household members are resolved from ``CLEANARR_HOUSEHOLD_USERS``, then
+        Sonarr/Radarr user tags, then every account present in ``watched_by``.
+        One user's watched state must not delete content another household
+        member still needs (e.g. mid-season progress).
         """
         logger.info("should_delete_media called")
         # Determine the media name for logging
@@ -1180,7 +1373,9 @@ class MediaCleanup:
 
         # Log users who have watched the media
         logger.info(f"Watched by items: {watched_by.items()}")
-        watched_users = [user.lower() for user, watched in watched_by.items() if watched]
+        watched_users = [
+            str(user).lower() for user, watched in (watched_by or {}).items() if watched
+        ]
         watch_evidence = {
             str(user).lower(): evidence
             for user, evidence in (media_item.get("watch_evidence") or {}).items()
@@ -1199,24 +1394,26 @@ class MediaCleanup:
             logger.info(f"No users have watched {media_name} yet")
             return False
 
-        if not user_tags:
-            logger.info(f"No user tags found for {media_name}, proceeding with deletion")
+        household = _resolve_household_members(user_tags, watched_by)
+        policy = CONFIG.get("multi_user_delete_policy", "require_all_users")
+        allowed, detail = household_policy_allows_delete(
+            household,
+            watched_users,
+            policy=policy,
+            primary_user=CONFIG.get("primary_user"),
+        )
+        if allowed:
+            logger.info(
+                f"Household policy allows delete for {media_name}: "
+                f"policy={policy} {detail} household={household}"
+            )
             return True
 
-        # Check and log users who have not watched the media
-        for user_tag in user_tags:
-            found = False
-            for watched_user in watched_users:
-                # Use regex for flexible matching (e.g., 'user' matches 'user123')
-                if re.search(user_tag, watched_user) or re.search(watched_user, user_tag):
-                    found = True
-                    break
-            if not found:
-                logger.info(f"User {user_tag} has not watched {media_name} yet")
-                return False
-
-        logger.info(f"All tagged users have watched {media_name}: {user_tags}")
-        return True
+        logger.info(
+            f"Household policy blocks delete for {media_name}: "
+            f"policy={policy} {detail} watched={watched_users} user_tags={user_tags}"
+        )
+        return False
 
     def _describe_episode(self, episode):
         return f"{episode['show_title']} S{episode['season']}E{episode['episode']}"
@@ -1685,78 +1882,147 @@ class MediaCleanup:
             episodes = self.get_sonarr_episodes_for_series(series["id"]) or []
             # Build a mapping: (season, episode) -> episode dict
             all_eps = {(ep["seasonNumber"], ep["episodeNumber"]): ep for ep in episodes}
-            # For each user, check for watched ahead
+            series_tag_ids = set(series.get("tags") or [])
+            series_user_tags = self.get_user_tags(sonarr_tags, series_tag_ids)
+
+            # Aggregate watched-ahead candidates per episode so one household
+            # member finishing a season cannot delete while another is mid-season.
+            # key -> {users_ahead, later_by_user, ep_obj}
+            ahead_candidates = {}
+            ep_numbers_by_season = defaultdict(list)
+            for (season, epnum) in all_eps:
+                ep_numbers_by_season[season].append(epnum)
+
             for user in show_user_watched[show_title]:
                 watched_set = show_user_watched[show_title][user]
-                # For each episode, if user has watched N+2 or greater, but not N, mark N for deletion
-                ep_numbers_by_season = defaultdict(list)
-                for (season, epnum) in all_eps:
-                    ep_numbers_by_season[season].append(epnum)
                 for season, epnums in ep_numbers_by_season.items():
-                    epnums_sorted = sorted(epnums)
-                    for epnum in epnums_sorted:
+                    for epnum in sorted(epnums):
                         ahead_eps = sorted(
                             watched_epnum
                             for watched_season, watched_epnum in watched_set
                             if watched_season == season and watched_epnum >= epnum + 2
                         )
-                        if ahead_eps and (season, epnum) not in watched_set:
-                            # Only delete if file exists and not already deleted
-                            ep_obj = all_eps[(season, epnum)]
-                            file_id = ep_obj.get("episodeFileId")
-                            if not file_id:
-                                self._record_decision(
-                                    reason_code="unmatched",
-                                    media_type="episode",
-                                    media_title=f"{show_title} S{season}E{epnum}",
-                                    reason="watch_ahead_no_sonarr_file",
-                                    details={
-                                        "series": show_title,
-                                        "season": season,
-                                        "episode": epnum,
-                                        "watcher": user,
-                                    },
-                                )
-                                continue
+                        if not ahead_eps or (season, epnum) in watched_set:
+                            continue
+                        key = (season, epnum)
+                        candidate = ahead_candidates.setdefault(
+                            key,
+                            {
+                                "users_ahead": set(),
+                                "later_by_user": {},
+                                "ep_obj": all_eps[(season, epnum)],
+                            },
+                        )
+                        candidate["users_ahead"].add(str(user).lower())
+                        candidate["later_by_user"][str(user).lower()] = ahead_eps
 
-                            # Find matching Plex episode for file path
-                            plex_ep = show_season_ep_map[show_title][season].get(epnum)
-                            file_path = plex_ep["file"] if plex_ep else None
-                            
-                            # Check if series has kids or safe tags before deleting
-                            series_tag_ids = set(series.get("tags") or [])
-                            episode_tag_ids = set(ep_obj.get("tags") or [])
-                            if protected_tag_ids & (series_tag_ids | episode_tag_ids):
-                                logger.info(
-                                    f"[Watched Ahead] Skipping deletion for {show_title} S{season}E{epnum} "
-                                    f"due to 'safe' or 'kids' tag (user '{user}' watched later episodes {ahead_eps})"
-                                )
-                                self._record_summary(
-                                    "protected_skips",
-                                    f"{show_title} S{season}E{epnum} [watched-ahead by {user}: {ahead_eps}]",
-                                )
-                                self._record_decision(
-                                    reason_code="protected",
-                                    media_type="episode",
-                                    media_title=f"{show_title} S{season}E{epnum}",
-                                    reason="protected_series_or_episode_tags",
-                                    details={"series": show_title, "user": user, "later_episodes": ahead_eps},
-                                )
-                                continue
+            # Household for this show: configured users, series tags, else all
+            # accounts with any real history on the show (plus any Plex accounts
+            # observed on watched episodes of the show).
+            show_watchers = {}
+            for ep in watched_episodes:
+                if ep.get("show_title") != show_title:
+                    continue
+                for user_name, watched in (ep.get("watched_by") or {}).items():
+                    show_watchers[str(user_name).lower()] = True
+            for user_name in show_user_watched[show_title]:
+                show_watchers[str(user_name).lower()] = True
+            household = _resolve_household_members(series_user_tags, show_watchers)
 
-                            episode_label = f"{show_title} S{season}E{epnum}"
-                            logger.info(
-                                f"[Watched Ahead] User '{user}' has real later watched episodes {ahead_eps} "
-                                f"for {episode_label}. Deleting episode file. File: {file_path}"
-                            )
-                            self._delete_episode_and_cleanup(
-                                episode_label,
-                                f"watched-ahead user={user} later={ahead_eps}",
-                                file_id,
-                                ep_obj["id"],
-                                file_path=file_path,
-                                rating_key=plex_ep.get("rating_key") if plex_ep else None,
-                            )
+            for (season, epnum), candidate in sorted(ahead_candidates.items()):
+                ep_obj = candidate["ep_obj"]
+                users_ahead = sorted(candidate["users_ahead"])
+                later_by_user = candidate["later_by_user"]
+                episode_label = f"{show_title} S{season}E{epnum}"
+                file_id = ep_obj.get("episodeFileId")
+                if not file_id:
+                    self._record_decision(
+                        reason_code="unmatched",
+                        media_type="episode",
+                        media_title=episode_label,
+                        reason="watch_ahead_no_sonarr_file",
+                        details={
+                            "series": show_title,
+                            "season": season,
+                            "episode": epnum,
+                            "users_ahead": users_ahead,
+                        },
+                    )
+                    continue
+
+                plex_ep = show_season_ep_map[show_title][season].get(epnum)
+                file_path = plex_ep["file"] if plex_ep else None
+                episode_tag_ids = set(ep_obj.get("tags") or [])
+                if protected_tag_ids & (series_tag_ids | episode_tag_ids):
+                    logger.info(
+                        f"[Watched Ahead] Skipping deletion for {episode_label} "
+                        f"due to 'safe' or 'kids' tag (users ahead={users_ahead})"
+                    )
+                    self._record_summary(
+                        "protected_skips",
+                        f"{episode_label} [watched-ahead by {users_ahead}]",
+                    )
+                    self._record_decision(
+                        reason_code="protected",
+                        media_type="episode",
+                        media_title=episode_label,
+                        reason="protected_series_or_episode_tags",
+                        details={
+                            "series": show_title,
+                            "users_ahead": users_ahead,
+                            "later_by_user": later_by_user,
+                        },
+                    )
+                    continue
+
+                # Per-episode tags can further restrict the household.
+                episode_user_tags = self.get_user_tags(
+                    sonarr_tags, series_tag_ids | episode_tag_ids
+                )
+                episode_household = _resolve_household_members(
+                    episode_user_tags or series_user_tags, show_watchers
+                ) or household
+
+                policy = CONFIG.get("multi_user_delete_policy", "require_all_users")
+                allowed, detail = household_policy_allows_delete(
+                    episode_household,
+                    users_ahead,
+                    policy=policy,
+                    primary_user=CONFIG.get("primary_user"),
+                )
+                if not allowed:
+                    logger.info(
+                        f"[Watched Ahead] Household policy blocks delete for {episode_label}: "
+                        f"policy={policy} {detail} users_ahead={users_ahead}"
+                    )
+                    self._record_decision(
+                        reason_code="skip",
+                        media_type="episode",
+                        media_title=episode_label,
+                        reason="household_policy_blocks_watch_ahead",
+                        details={
+                            "policy": policy,
+                            "detail": detail,
+                            "household": episode_household,
+                            "users_ahead": users_ahead,
+                            "later_by_user": later_by_user,
+                        },
+                    )
+                    continue
+
+                logger.info(
+                    f"[Watched Ahead] Household policy allows delete for {episode_label}: "
+                    f"policy={policy} {detail} users_ahead={users_ahead} later={later_by_user}. "
+                    f"File: {file_path}"
+                )
+                self._delete_episode_and_cleanup(
+                    episode_label,
+                    f"watched-ahead users={users_ahead} later={later_by_user} policy={policy}",
+                    file_id,
+                    ep_obj["id"],
+                    file_path=file_path,
+                    rating_key=plex_ep.get("rating_key") if plex_ep else None,
+                )
 
         # --- Standard logic for watched episodes ---
         for episode in watched_episodes:
@@ -1831,12 +2097,13 @@ class MediaCleanup:
                     )
                     skip_reason = "not_watched"
                 else:
+                    policy = CONFIG.get("multi_user_delete_policy", "require_all_users")
                     logger.info(
-                        f"Skipping deletion for {episode_label} because tagged users have not "
-                        f"all watched it (user_tags={user_tags}, watched_by={episode['watched_by']}, "
-                        f"evidence={watch_evidence})."
+                        f"Skipping deletion for {episode_label} because household policy "
+                        f"'{policy}' is not satisfied (user_tags={user_tags}, "
+                        f"watched_by={episode['watched_by']}, evidence={watch_evidence})."
                     )
-                    skip_reason = "tagged_users_not_all_watched"
+                    skip_reason = "household_policy_not_satisfied"
                 self._record_decision(
                     reason_code="skip",
                     media_type="episode",
@@ -1971,8 +2238,12 @@ class MediaCleanup:
                     reason_code="skip",
                     media_type="movie",
                     media_title=f"{movie['title']} ({movie['year']})",
-                    reason="tagged_users_not_all_watched",
-                    details={"user_tags": user_tags},
+                    reason="household_policy_not_satisfied",
+                    details={
+                        "user_tags": user_tags,
+                        "policy": CONFIG.get("multi_user_delete_policy", "require_all_users"),
+                        "watched_by": movie.get("watched_by"),
+                    },
                 )
 
     def run(self) -> CleanupResult:

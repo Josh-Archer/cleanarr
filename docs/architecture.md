@@ -15,6 +15,7 @@ Design constraints:
 - Runtime defaults are generic and env-driven so downstream repos can supply their own wiring.
 - Downstream private repos own Kubernetes overlays, secret material, Cloud Run or ingress setup, and image pinning.
 - Proxy and webhook runtime behavior stay in this repository; downstream repos own IAM roles, queue resources, manifests, and rollout policy.
+- Multi-user delete policy defaults to `require_all_users` so shared-library watch state cannot delete media while another household member is still mid-season (exact-item and watched-ahead paths share the same policy). See `docs/configuration.md`.
 
 Queue decoupling (issue #8):
 

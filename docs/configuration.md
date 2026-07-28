@@ -32,6 +32,40 @@ Optional variables:
     "erin": {"plex": "erinarcher", "jellyfin": "erin"}
   }
   ```
+- `CLEANARR_MULTI_USER_DELETE_POLICY` for household-safe deletion (see below)
+- `CLEANARR_HOUSEHOLD_USERS` optional comma-separated Plex/Jellyfin usernames that form the household
+- `CLEANARR_PRIMARY_USER` username used when policy is `primary_user_only`
+
+## Household multi-user delete policy (issue #20)
+
+Shared libraries must not delete an episode or movie just because **one** household member finished it while another is still mid-season.
+
+### Policy values
+
+| Value | Behavior | Safety |
+| --- | --- | --- |
+| `require_all_users` | **Default.** Every household member must satisfy the delete precondition (exact-item watched, or watched-ahead past the episode). | Safest for multi-user homes |
+| `majority` | Strict majority (`floor(n/2)+1`) of household members must be satisfied. | Balanced |
+| `primary_user_only` | Only `CLEANARR_PRIMARY_USER` must be satisfied; other members are ignored. | Least safe for shared libraries; use only when one account is the intentional owner |
+
+Aliases such as `require-all-users`, `all`, `primary-only` are accepted. Unknown values fall back to `require_all_users`. If `primary_user_only` is selected without `CLEANARR_PRIMARY_USER`, Cleanarr logs a warning and falls back to `require_all_users`.
+
+### How household members are resolved
+
+For each media item, the household constituency is chosen in this order:
+
+1. **`CLEANARR_HOUSEHOLD_USERS`** when set (explicit shared-library roster)
+2. Else **Sonarr/Radarr user tags** on the series/episode/movie (ownership tags; `safe` / `kids` remain protected and never count as users)
+3. Else **every account present in Plex/Jellyfin watch status** for that item (owner + managed users)
+
+Example: Alice watched S1E3, Bob has not. With the default policy and no user tags, Cleanarr **keeps** the file. Watched-ahead inference uses the same policy so Alice finishing S1E10 cannot delete S1E1–S1E8 while Bob is still catching up.
+
+### Operator guidance
+
+- Leave the default (`require_all_users`) for household libraries.
+- Set `CLEANARR_HOUSEHOLD_USERS=alice,bob` when guest or unused Plex accounts would otherwise block cleanup forever.
+- Use Sonarr/Radarr per-user tags when only a subset of the household "owns" a title.
+- Prefer `primary_user_only` only for single-decision-maker setups, and always set `CLEANARR_PRIMARY_USER`.
 
 The webhook, scheduled job runtime, and SQS webhook consumer runtime use the same cleanup configuration surface so downstream operators only need one secret/config contract.
 
