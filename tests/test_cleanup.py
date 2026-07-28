@@ -145,6 +145,249 @@ class TestMediaCleanup(unittest.TestCase):
         }
         self.assertFalse(self.cleanup.should_delete_media(media, [], media['watched_by']))
 
+    def test_multi_user_require_all_blocks_when_second_user_mid_season(self):
+        """Issue #20: one user's watched state must not delete for another mid-season."""
+        media = {
+            'show_title': 'Shared Show',
+            'season': 1,
+            'episode': 3,
+            'title': 'Episode 3',
+            'watched_by': {'alice': True, 'bob': False},
+            'watch_evidence': {'alice': 'history', 'bob': 'not_watched'},
+        }
+        # Default policy is require_all_users; no tags => household is all watched_by keys.
+        self.assertFalse(self.cleanup.should_delete_media(media, [], media['watched_by']))
+
+    def test_multi_user_require_all_allows_when_all_household_watched(self):
+        media = {
+            'show_title': 'Shared Show',
+            'season': 1,
+            'episode': 3,
+            'title': 'Episode 3',
+            'watched_by': {'alice': True, 'bob': True},
+            'watch_evidence': {'alice': 'history', 'bob': 'history'},
+        }
+        self.assertTrue(self.cleanup.should_delete_media(media, [], media['watched_by']))
+
+    def test_multi_user_majority_allows_when_more_than_half_watched(self):
+        media = {
+            'title': 'Shared Movie',
+            'watched_by': {'alice': True, 'bob': True, 'carol': False},
+            'watch_evidence': {
+                'alice': 'history',
+                'bob': 'history',
+                'carol': 'not_watched',
+            },
+        }
+        with patch.dict(cleanarr.CONFIG, {
+            "multi_user_delete_policy": "majority",
+            "household_users": set(),
+            "primary_user": "",
+        }):
+            self.assertTrue(
+                self.cleanup.should_delete_media(media, [], media['watched_by'])
+            )
+
+    def test_multi_user_majority_blocks_when_half_or_fewer_watched(self):
+        media = {
+            'title': 'Shared Movie',
+            'watched_by': {'alice': True, 'bob': False},
+            'watch_evidence': {'alice': 'history', 'bob': 'not_watched'},
+        }
+        with patch.dict(cleanarr.CONFIG, {
+            "multi_user_delete_policy": "majority",
+            "household_users": set(),
+            "primary_user": "",
+        }):
+            self.assertFalse(
+                self.cleanup.should_delete_media(media, [], media['watched_by'])
+            )
+
+    def test_multi_user_primary_user_only_ignores_other_household_members(self):
+        media = {
+            'show_title': 'Shared Show',
+            'season': 2,
+            'episode': 1,
+            'title': 'Episode 1',
+            'watched_by': {'alice': True, 'bob': False},
+            'watch_evidence': {'alice': 'history', 'bob': 'not_watched'},
+        }
+        with patch.dict(cleanarr.CONFIG, {
+            "multi_user_delete_policy": "primary_user_only",
+            "primary_user": "alice",
+            "household_users": set(),
+        }):
+            self.assertTrue(
+                self.cleanup.should_delete_media(media, [], media['watched_by'])
+            )
+
+    def test_multi_user_primary_user_only_blocks_when_primary_has_not_watched(self):
+        media = {
+            'title': 'Shared Movie',
+            'watched_by': {'alice': False, 'bob': True},
+            'watch_evidence': {'alice': 'not_watched', 'bob': 'history'},
+        }
+        with patch.dict(cleanarr.CONFIG, {
+            "multi_user_delete_policy": "primary_user_only",
+            "primary_user": "alice",
+            "household_users": set(),
+        }):
+            self.assertFalse(
+                self.cleanup.should_delete_media(media, [], media['watched_by'])
+            )
+
+    def test_multi_user_explicit_household_users_override_watched_by_keys(self):
+        """CLEANARR_HOUSEHOLD_USERS defines the constituency when set."""
+        media = {
+            'title': 'Shared Movie',
+            # guest is present in Plex status but not part of the household config
+            'watched_by': {'alice': True, 'bob': True, 'guest': False},
+            'watch_evidence': {
+                'alice': 'history',
+                'bob': 'history',
+                'guest': 'not_watched',
+            },
+        }
+        with patch.dict(cleanarr.CONFIG, {
+            "multi_user_delete_policy": "require_all_users",
+            "household_users": {"alice", "bob"},
+            "primary_user": "",
+        }):
+            self.assertTrue(
+                self.cleanup.should_delete_media(media, [], media['watched_by'])
+            )
+
+    def test_multi_user_user_tags_define_household_over_other_watchers(self):
+        """Tagged ownership still scopes the household when household_users is unset."""
+        media = {
+            'title': 'Tagged Movie',
+            'watched_by': {'alice': True, 'bob': False, 'carol': False},
+            'watch_evidence': {
+                'alice': 'history',
+                'bob': 'not_watched',
+                'carol': 'not_watched',
+            },
+        }
+        # Only alice is tagged: bob/carol mid-season must not block alice-tagged titles.
+        self.assertTrue(
+            self.cleanup.should_delete_media(media, ['alice'], media['watched_by'])
+        )
+
+    def test_household_policy_allows_delete_helpers(self):
+        """Direct unit coverage for policy edge cases."""
+        allowed, _ = cleanarr.household_policy_allows_delete(
+            ["alice", "bob"], ["alice"], policy="require_all_users"
+        )
+        self.assertFalse(allowed)
+
+        allowed, _ = cleanarr.household_policy_allows_delete(
+            ["alice", "bob", "carol"], ["alice", "bob"], policy="majority"
+        )
+        self.assertTrue(allowed)
+
+        allowed, detail = cleanarr.household_policy_allows_delete(
+            ["alice", "bob"], ["bob"], policy="primary_user_only", primary_user="alice"
+        )
+        self.assertFalse(allowed)
+        self.assertIn("primary_user_only", detail)
+
+        # Missing primary falls back to require_all_users (safe).
+        allowed, _ = cleanarr.household_policy_allows_delete(
+            ["alice", "bob"], ["alice"], policy="primary_user_only", primary_user=""
+        )
+        self.assertFalse(allowed)
+
+    def test_normalize_multi_user_delete_policy_aliases(self):
+        self.assertEqual(
+            cleanarr._normalize_multi_user_delete_policy("require-all-users"),
+            "require_all_users",
+        )
+        self.assertEqual(
+            cleanarr._normalize_multi_user_delete_policy("majority"),
+            "majority",
+        )
+        self.assertEqual(
+            cleanarr._normalize_multi_user_delete_policy("primary-user-only"),
+            "primary_user_only",
+        )
+        self.assertEqual(
+            cleanarr._normalize_multi_user_delete_policy("not-a-real-policy"),
+            "require_all_users",
+        )
+
+    def test_process_watched_episodes_watch_ahead_respects_multi_user_conflict(self):
+        """Watched-ahead must not delete while another household user is mid-season."""
+        # Alice finished far ahead via real history; Bob has no history on the show.
+        watched_episode = {
+            "show_title": "Shared Show",
+            "season": 1,
+            "episode": 5,
+            "title": "Five",
+            "file": "/tv/Shared Show/S01E05.mkv",
+            "rating_key": "rk-5",
+            "watched_by": {"alice": True, "bob": False},
+            "watch_evidence": {"alice": "history", "bob": "not_watched"},
+        }
+        sonarr_series = [{"id": 10, "title": "Shared Show", "tags": []}]
+        sonarr_episodes = [
+            {"id": 101, "seasonNumber": 1, "episodeNumber": 1, "episodeFileId": 1001, "tags": []},
+            {"id": 102, "seasonNumber": 1, "episodeNumber": 2, "episodeFileId": 1002, "tags": []},
+            {"id": 105, "seasonNumber": 1, "episodeNumber": 5, "episodeFileId": 1005, "tags": []},
+        ]
+
+        with patch.object(self.cleanup, "get_watched_episodes", return_value=[watched_episode]), \
+             patch.object(self.cleanup, "get_sonarr_tags", return_value=[]), \
+             patch.object(self.cleanup, "get_sonarr_series", return_value=sonarr_series), \
+             patch.object(self.cleanup, "get_sonarr_episodes_for_series", return_value=sonarr_episodes), \
+             patch.object(self.cleanup, "match_episode_to_sonarr", return_value=None), \
+             patch.object(self.cleanup, "delete_sonarr_episode_file") as mock_delete, \
+             patch.dict(cleanarr.CONFIG, {
+                 "multi_user_delete_policy": "require_all_users",
+                 "household_users": set(),
+                 "primary_user": "",
+             }):
+            self.cleanup.process_watched_episodes()
+
+        mock_delete.assert_not_called()
+
+    def test_process_watched_episodes_watch_ahead_allows_when_all_users_ahead(self):
+        """Watched-ahead may delete once every household member has progressed past it."""
+        watched_episodes = [
+            {
+                "show_title": "Shared Show",
+                "season": 1,
+                "episode": 5,
+                "title": "Five",
+                "file": "/tv/Shared Show/S01E05.mkv",
+                "rating_key": "rk-5",
+                "watched_by": {"alice": True, "bob": True},
+                "watch_evidence": {"alice": "history", "bob": "history"},
+            },
+        ]
+        sonarr_series = [{"id": 10, "title": "Shared Show", "tags": []}]
+        sonarr_episodes = [
+            {"id": 101, "seasonNumber": 1, "episodeNumber": 1, "episodeFileId": 1001, "tags": []},
+            {"id": 105, "seasonNumber": 1, "episodeNumber": 5, "episodeFileId": 1005, "tags": []},
+        ]
+
+        with patch.object(self.cleanup, "get_watched_episodes", return_value=watched_episodes), \
+             patch.object(self.cleanup, "get_sonarr_tags", return_value=[]), \
+             patch.object(self.cleanup, "get_sonarr_series", return_value=sonarr_series), \
+             patch.object(self.cleanup, "get_sonarr_episodes_for_series", return_value=sonarr_episodes), \
+             patch.object(self.cleanup, "match_episode_to_sonarr", return_value=None), \
+             patch.object(self.cleanup, "delete_sonarr_episode_file", return_value=True) as mock_delete, \
+             patch.object(self.cleanup, "unmonitor_sonarr_episode"), \
+             patch.object(self.cleanup, "remove_torrent_by_file_path"), \
+             patch.object(self.cleanup, "remove_from_plex_watchlist"), \
+             patch.dict(cleanarr.CONFIG, {
+                 "multi_user_delete_policy": "require_all_users",
+                 "household_users": set(),
+                 "primary_user": "",
+             }):
+            self.cleanup.process_watched_episodes()
+
+        mock_delete.assert_called_once_with(1001)
+
     def test_sonarr_request_success(self):
         """Test successful Sonarr API call."""
         mock_response = MagicMock()

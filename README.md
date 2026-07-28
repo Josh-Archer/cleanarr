@@ -20,8 +20,9 @@ At a high level it can:
 - inspect Plex watch history for episodes and movies
 - map Plex items back to Sonarr and Radarr records
 - delete or unmonitor matching files when policy allows it
+- apply a household multi-user delete policy so one user's watched state cannot remove content another household member still needs
 - skip protected content with `safe` and `kids` tags
-- perform watched-ahead logic for TV episodes using real user history
+- perform watched-ahead logic for TV episodes using real user history (same multi-user policy)
 - remove items from a Plex watchlist after cleanup
 - perform optional Transmission maintenance for stale torrents, failed downloads, and repeated I/O errors
 - receive Plex and Jellyfin webhook events and optionally act on them in near real time
@@ -189,6 +190,9 @@ The full configuration contract is documented in [docs/configuration.md](./docs/
 | `CLEANARR_TRANSMISSION_IO_ERROR_CLEANUP_ENABLED` | `false` | Enables repeated Transmission I/O error cleanup logic. |
 | `CLEANARR_TRANSMISSION_IO_ERROR_THRESHOLD` | `3` | Number of repeated I/O errors before action is taken. |
 | `CLEANARR_TRANSMISSION_IO_ERROR_STATE_FILE` | `/logs/transmission-io-error-state.json` | Persistent state used by I/O error cleanup tracking. |
+| `CLEANARR_MULTI_USER_DELETE_POLICY` | `require_all_users` | Household delete policy: `require_all_users` (safe default), `majority`, or `primary_user_only`. Prevents one watcher's progress from deleting media another household member still needs. |
+| `CLEANARR_HOUSEHOLD_USERS` | unset | Optional comma-separated usernames that form the household constituency for multi-user decisions. |
+| `CLEANARR_PRIMARY_USER` | unset | Required for `primary_user_only`; the single account whose watch state may authorize deletes. |
 
 ### Transmission Flags
 
