@@ -310,3 +310,52 @@ cleanarr/
 - [Release Process](./docs/release.md)
 - [Architecture Review Gate](./docs/architecture-review.md)
 - [Security Review Gate](./docs/security-review.md)
+
+
+- `job`: a scheduled cleanup worker for Plex, Sonarr, Radarr, optional Lidarr music cleanup, and optional Transmission maintenance
+- `webhook`: a Plex and Jellyfin webhook receiver that can sync watch state and optionally trigger deletion logic from events
+
+
+Cleanarr is built for setups where Plex or Jellyfin is the source of truth for watched (or played) state, while Sonarr, Radarr, and optionally Lidarr remain the source of truth for media lifecycle.
+
+- map Plex items back to Sonarr and Radarr records
+- optionally map played Plex music tracks to Lidarr-managed track files (default off)
+- delete or unmonitor matching files when policy allows it
+- skip protected content with `safe` and `kids` tags
+- perform watched-ahead logic for TV episodes using real user history
+- remove items from a Plex watchlist after cleanup
+- perform optional Transmission maintenance for stale torrents, failed downloads, and repeated I/O errors
+- receive Plex and Jellyfin webhook events and optionally act on them in near real time
+- send run summaries and health notifications to `ntfy`
+
+- match content in Sonarr and Radarr
+- when `CLEANARR_LIDARR_ENABLE=true`, load played music tracks and match them in Lidarr
+- apply deletion policy
+- optionally do Transmission maintenance
+- emit a summary line and optional `ntfy` notification
+
+            +--> Radarr movie matching and file removal
+            +--> Lidarr track matching and file removal (optional, default off)
+            +--> Transmission maintenance
+            +--> Plex watchlist cleanup
+            +--> ntfy summaries / health notifications
+```
+
+| `CLEANARR_RADARR_APIKEY` | Yes | Radarr API key |
+| `CLEANARR_LIDARR_ENABLE` | No (`false`) | Opt-in Lidarr music cleanup path |
+| `CLEANARR_LIDARR_BASEURL` | No | Lidarr API base URL (used when music cleanup is enabled) |
+| `CLEANARR_LIDARR_APIKEY` | No | Lidarr API key (required when music cleanup is enabled) |
+| `CLEANARR_LOG_FILE` | No | Log file path for the runtime |
+| `CLEANARR_DEBUG` | No | Enables verbose logging |
+
+| `CLEANARR_DRY_RUN` | `false` | Disables destructive delete operations. Start here first. |
+| `CLEANARR_LIDARR_ENABLE` | `false` | Enables optional Lidarr music cleanup. Leave off unless you intentionally want played tracks deleted via Lidarr. |
+| `CLEANARR_DISABLE_TORRENT_CLEANUP` | `false` | Disables stale torrent and failed download cleanup. |
+| `CLEANARR_REMOVE_FAILED_DOWNLOADS` | `false` | Removes failed Transmission downloads when enabled. |
+| `CLEANARR_REMOVE_ORPHAN_INCOMPLETE_DOWNLOADS` | mirrors `CLEANARR_REMOVE_FAILED_DOWNLOADS` | Deletes orphaned entries from Transmission's incomplete directory when no active torrent still owns them. |
+| `CLEANARR_REMOVE_STALE_TORRENTS` | `true` | Removes stale torrents based on age and activity checks. |
+| `CLEANARR_STALE_TORRENT_HOURS` | `8` | Age threshold for stale torrent cleanup. |
+| `CLEANARR_TORRENT_CLEANUP_ALLOWED_CATEGORIES` | unset | Comma-separated Transmission download-dir category names allowed for torrent removal, such as `sonarr,radarr,readarr,lidarr`. When unset, Cleanarr keeps current behavior and may clean any category. |
+| `CLEANARR_TRANSMISSION_IO_ERROR_CLEANUP_ENABLED` | `false` | Enables repeated Transmission I/O error cleanup logic. |
+| `CLEANARR_TRANSMISSION_IO_ERROR_THRESHOLD` | `3` | Number of repeated I/O errors before action is taken. |
+| `CLEANARR_TRANSMISSION_IO_ERROR_STATE_FILE` | `/logs/transmission-io-error-state.json` | Persistent state used by I/O error cleanup tracking. |

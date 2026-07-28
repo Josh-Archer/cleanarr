@@ -169,3 +169,56 @@ Dry-run **aggregate** report artifacts are a **job-mode** feature (full-library 
 - A single webhook event only evaluates one (or a small set of) titles, so a complete per-user library report is not produced.
 - Operators who need a full “what would be deleted for each profile” artifact should run the job image with `CLEANARR_DRY_RUN=true` and collect files from `CLEANARR_DRY_RUN_REPORT_DIR` (for example via a mounted logs volume or `kubectl cp`).
 
+
+- `CLEANARR_LIDARR_ENABLE` to opt into Lidarr-managed music cleanup (**default `false` / off**)
+- `CLEANARR_LIDARR_BASEURL` and `CLEANARR_LIDARR_APIKEY` when Lidarr music cleanup is enabled
+- `CLEANARR_TRANSMISSION_*` for torrent cleanup
+- `CLEANARR_DRY_RUN` to disable destructive actions
+- `CLEANARR_NTFY_*` for run summaries
+- `WEBHOOK_SECRET` to protect the Plex webhook endpoint; send it via `X-Cleanarr-Webhook-Token` or `X-Webhook-Token`
+- `JELLYFIN_WEBHOOK_SECRET` to protect the Jellyfin webhook endpoint (/jellyfin/webhook)
+- `PLEX_WEBHOOK_ENABLE_DELETIONS` to let the webhook perform deletions
+- `CLEANARR_WEBHOOK_QUEUE_MODE` (`direct` or `sqs`) for staged webhook buffering
+- `CLEANARR_WEBHOOK_QUEUE_URL` and `CLEANARR_WEBHOOK_QUEUE_REGION` for SQS wiring
+- `CLEANARR_WEBHOOK_QUEUE_ENQUEUING` to enable producer behavior in webhook runtime
+- `CLEANARR_WEBHOOK_QUEUE_POLLING` to enable consumer behavior only in the SQS consumer runtime (`apps/lambda/main.py`)
+- `CLEANARR_WEBHOOK_QUEUE_MAX_MESSAGES`, `CLEANARR_WEBHOOK_QUEUE_WAIT_SECONDS`, and `CLEANARR_WEBHOOK_QUEUE_VISIBILITY_TIMEOUT` for poll tuning
+- `CLEANARR_WEBHOOK_FORWARD_URL` to keep the proxy harness compatible with the Lambda URL sink during rollout or fallback
+- `CLEANARR_DECISION_REPORT_FILE` to persist machine-readable webhook and cleanup decisions as JSONL
+- `TARGET_PLEX_*` for cross-instance Plex sync
+- `CLEANARR_USER_ALIASES_JSON` for multi-platform username canonicalization. Supports legacy flat mapping or multi-platform objects:
+  ```json
+  {
+    "josh": {"plex": "josharcher354", "jellyfin": "gawly"},
+    "erin": {"plex": "erinarcher", "jellyfin": "erin"}
+  }
+  ```
+
+
+## Optional Lidarr music cleanup (issue #17)
+
+
+Lidarr music cleanup is **off by default**. When enabled, the scheduled job path can delete
+Lidarr track files for music that Plex reports as played, using the same safety model as
+Sonarr/Radarr (user tags, `safe`/`kids` protected tags, and `CLEANARR_DRY_RUN`).
+
+| --- | --- | --- |
+| `CLEANARR_LIDARR_ENABLE` | `false` | Master switch for the music cleanup path |
+| `CLEANARR_LIDARR_BASEURL` | `http://lidarr:8686/api/v1/` | Lidarr API base URL |
+| `CLEANARR_LIDARR_APIKEY` | unset | Lidarr API key (required when enabled) |
+| `CLEANARR_DRY_RUN` | `false` | When `true`, log intended Lidarr deletes without calling DELETE |
+
+  `viewCount > 0` on music tracks).
+- **Lidarr** is the source of truth for *owned / managed* music lifecycle: whether a track has
+  an imported file (`trackFileId`), artist/album/track tags, and monitoring state.
+
+
+1. Lidarr cleanup is enabled and credentials are present
+2. Plex reports the track as played (or tagged users have all played it)
+3. The track matches a Lidarr record (MusicBrainz id preferred, else artist + album + title)
+4. Lidarr owns a track file for that record
+5. No `safe` / `kids` tags protect the artist, album, or track
+6. Shared user-tag policy passes (`should_delete_media`)
+
+
+Unmatched or unowned tracks are skipped (never force-deleted from disk outside Lidarr).

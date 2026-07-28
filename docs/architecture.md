@@ -34,3 +34,6 @@ Queue decoupling (issue #8):
 - The in-cluster proxy publishes directly to SQS when a queue URL is configured; Lambda URL forwarding remains a compatibility sink only.
 - Downstream infrastructure can switch back to `direct` mode for automatic fallback when budget alarms trigger.
 - Direct Plex webhook handling remains a first-class runtime mode and is not replaced by the proxy path.
+
+- Proxy and webhook runtime behavior stay in this repository; downstream repos own IAM roles, queue resources, manifests, and rollout policy.
+- Optional Lidarr music cleanup is feature-flagged (`CLEANARR_LIDARR_ENABLE`, default off). Plex owns play/listened signals; Lidarr owns managed track files, tags, and deletes.
