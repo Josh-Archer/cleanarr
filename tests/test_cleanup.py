@@ -833,5 +833,146 @@ class TestMediaCleanup(unittest.TestCase):
 
         mock_delete.assert_not_called()
 
+    def test_run_success_outcome_when_no_errors(self):
+        """Full success when all cleanup stages complete without errors."""
+        with patch.object(self.cleanup, "process_watched_episodes"), \
+             patch.object(self.cleanup, "process_watched_movies"), \
+             patch.object(self.cleanup, "clean_repeated_io_error_torrents"), \
+             patch.object(self.cleanup, "clean_failed_downloads"), \
+             patch.object(self.cleanup, "remove_stale_torrents"), \
+             patch.object(self.cleanup, "_flush_run_summary") as mock_flush:
+            result = self.cleanup.run()
+
+        mock_flush.assert_called_once()
+        self.assertEqual(result.outcome, cleanarr.OUTCOME_SUCCESS)
+        self.assertFalse(result.failed)
+        self.assertEqual(result.exit_code(), 0)
+        self.assertEqual(result.errors, [])
+
+    def test_run_partial_failure_when_delete_errors_recorded(self):
+        """Partial deletes that fail must mark the run failed (not success)."""
+        def fail_one_episode():
+            self.cleanup._record_summary(
+                "errors",
+                "Memory of a Killer S1E9 delete failed [standard watched]",
+            )
+            self.cleanup._record_summary(
+                "tv_deletions",
+                "Other Show S1E1 [standard watched]",
+            )
+
+        with patch.object(self.cleanup, "process_watched_episodes", side_effect=fail_one_episode), \
+             patch.object(self.cleanup, "process_watched_movies"), \
+             patch.object(self.cleanup, "clean_repeated_io_error_torrents"), \
+             patch.object(self.cleanup, "clean_failed_downloads"), \
+             patch.object(self.cleanup, "remove_stale_torrents"), \
+             patch.object(self.cleanup, "_flush_run_summary") as mock_flush:
+            result = self.cleanup.run()
+
+        mock_flush.assert_called_once()
+        self.assertEqual(result.outcome, cleanarr.OUTCOME_PARTIAL_FAILURE)
+        self.assertTrue(result.failed)
+        self.assertEqual(result.exit_code(), 1)
+        self.assertEqual(len(result.errors), 1)
+        self.assertEqual(result.tv_deletions, ["Other Show S1E1 [standard watched]"])
+
+    def test_run_aborted_outcome_on_unhandled_exception(self):
+        """Unhandled exceptions abort the run and still flush a failure summary."""
+        with patch.object(
+            self.cleanup,
+            "process_watched_episodes",
+            side_effect=RuntimeError("plex exploded"),
+        ), \
+             patch.object(self.cleanup, "process_watched_movies") as mock_movies, \
+             patch.object(self.cleanup, "_flush_run_summary") as mock_flush:
+            result = self.cleanup.run()
+
+        mock_movies.assert_not_called()
+        mock_flush.assert_called_once()
+        self.assertEqual(result.outcome, cleanarr.OUTCOME_ABORTED)
+        self.assertTrue(result.failed)
+        self.assertEqual(result.exit_code(), 1)
+        self.assertEqual(result.message, "plex exploded")
+        self.assertTrue(any("aborted: plex exploded" in err for err in result.errors))
+
+    def test_flush_run_summary_ntfy_reflects_partial_failure(self):
+        """ntfy title/priority must show partial failure, not a success summary."""
+        self.cleanup._record_summary("tv_deletions", "Show S1E1 [standard watched]")
+        self.cleanup._record_summary("errors", "Show S1E2 delete failed [standard watched]")
+
+        with patch.object(self.cleanup, "_send_ntfy_summary") as mock_ntfy, \
+             patch.dict(cleanarr.CONFIG, {"dry_run": False}, clear=False):
+            cleanarr.CONFIG.setdefault("ntfy", {})["topic"] = "test-topic"
+            self.cleanup._flush_run_summary()
+
+        mock_ntfy.assert_called_once()
+        title, lines = mock_ntfy.call_args.args[0], mock_ntfy.call_args.args[1]
+        self.assertIn("FAILED (partial)", title)
+        self.assertTrue(any("Outcome: partial_failure" in line for line in lines))
+        self.assertTrue(any("Errors" in line and "delete failed" in line for line in lines))
+        self.assertEqual(mock_ntfy.call_args.kwargs.get("priority"), "high")
+
+    def test_flush_run_summary_sends_on_errors_without_deletions(self):
+        """Failures with zero successful deletions must still notify."""
+        self.cleanup._record_summary("errors", "orphan delete failed: leftover.part")
+
+        with patch.object(self.cleanup, "_send_ntfy_summary") as mock_ntfy:
+            self.cleanup._flush_run_summary()
+
+        mock_ntfy.assert_called_once()
+        title = mock_ntfy.call_args.args[0]
+        self.assertIn("FAILED (partial)", title)
+
+    def test_delete_episode_failure_marks_partial_outcome(self):
+        """Episode delete failure records error and sets partial_failure taxonomy."""
+        with patch.object(self.cleanup, "delete_sonarr_episode_file", return_value=False):
+            ok = self.cleanup._delete_episode_and_cleanup(
+                "Show S1E1",
+                "standard watched",
+                1,
+                2,
+            )
+
+        self.assertFalse(ok)
+        self.assertEqual(self.cleanup.run_outcome, cleanarr.OUTCOME_PARTIAL_FAILURE)
+        self.assertEqual(
+            self.cleanup.run_summary["errors"],
+            ["Show S1E1 delete failed [standard watched]"],
+        )
+
+    def test_orphan_delete_failure_records_error(self):
+        """Failed orphan file deletes must surface in run_summary errors."""
+        mock_session = MagicMock()
+        mock_session.incomplete_dir_enabled = True
+        mock_session.incomplete_dir = tempfile.mkdtemp()
+        orphan_path = os.path.join(mock_session.incomplete_dir, "orphan.bin")
+        with open(orphan_path, "wb") as handle:
+            handle.write(b"x")
+
+        self.cleanup.transmission.get_torrents.return_value = []
+        self.cleanup.transmission.get_session.return_value = mock_session
+
+        with patch.object(cleanarr.os, "remove", side_effect=OSError("permission denied")), \
+             patch.dict(cleanarr.CONFIG, {
+                 "remove_failed_downloads": False,
+                 "remove_orphan_incomplete_downloads": True,
+                 "disable_torrent_cleanup": False,
+                 "dry_run": False,
+             }, clear=False):
+            self.cleanup.clean_failed_downloads()
+
+        try:
+            self.assertEqual(self.cleanup.run_outcome, cleanarr.OUTCOME_PARTIAL_FAILURE)
+            self.assertTrue(
+                any("orphan delete failed: orphan.bin" in err for err in self.cleanup.run_summary["errors"])
+            )
+        finally:
+            try:
+                os.remove(orphan_path)
+            except OSError:
+                pass
+            os.rmdir(mock_session.incomplete_dir)
+
+
 if __name__ == '__main__':
     unittest.main()

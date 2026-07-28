@@ -73,7 +73,10 @@ class TestLambdaConsumer(unittest.TestCase):
     def test_lambda_handler_runs_scheduled_cleanup_without_records(self):
         """EventBridge/manual invokes with no SQS payload run full library cleanup."""
         cleaner = MagicMock()
-        cleaner.run = MagicMock()
+        result = MagicMock()
+        result.failed = False
+        result.outcome = "success"
+        cleaner.run = MagicMock(return_value=result)
         with patch.object(webhook_app, "process_sqs_queue_messages") as process_queue, \
              patch.object(webhook_app, "process_sqs_event_records") as process_records, \
              patch.object(lambda_main, "MediaCleanup", return_value=cleaner) as cleanup_cls:
@@ -88,7 +91,9 @@ class TestLambdaConsumer(unittest.TestCase):
 
     def test_lambda_handler_runs_scheduled_cleanup_for_eventbridge_source(self):
         cleaner = MagicMock()
-        cleaner.run = MagicMock()
+        result = MagicMock()
+        result.failed = False
+        cleaner.run = MagicMock(return_value=result)
         with patch.object(lambda_main, "MediaCleanup", return_value=cleaner):
             response = lambda_main.lambda_handler(
                 {"source": "aws.scheduler", "detail-type": "Scheduled Event"},
@@ -98,22 +103,55 @@ class TestLambdaConsumer(unittest.TestCase):
         cleaner.run.assert_called_once()
         self.assertEqual(response["statusCode"], 200)
 
+    def test_lambda_handler_reports_partial_cleanup_failure(self):
+        """Partial delete failures must not be reported as successful cleanup."""
+        cleaner = MagicMock()
+        result = MagicMock()
+        result.failed = True
+        result.outcome = "partial_failure"
+        result.errors = ["Show S1E1 delete failed [standard watched]"]
+        result.message = ""
+        cleaner.run = MagicMock(return_value=result)
+
+        with patch.object(lambda_main, "MediaCleanup", return_value=cleaner):
+            response = lambda_main.lambda_handler({}, None)
+
+        self.assertEqual(response["statusCode"], 500)
+        body = json.loads(response["body"])
+        self.assertTrue(body["failed"])
+        self.assertEqual(body["outcome"], "partial_failure")
+        self.assertEqual(body["errors"], ["Show S1E1 delete failed [standard watched]"])
+
 
 class TestScheduledRuntimeBoundary(unittest.TestCase):
     def test_job_main_does_not_poll_webhook_queue(self):
         cleaner = MagicMock()
-        cleaner.run = MagicMock()
+        result = MagicMock()
+        result.exit_code.return_value = 0
+        cleaner.run = MagicMock(return_value=result)
         with patch.object(job_main, "MediaCleanup", return_value=cleaner) as run_cleanup, \
              patch.object(webhook_app, "process_sqs_queue_messages") as process_queue:
-            job_main.main()
+            code = job_main.main()
 
         run_cleanup.assert_called_once()
         process_queue.assert_not_called()
         cleaner.run.assert_called_once()
+        self.assertEqual(code, 0)
+
+    def test_job_main_exits_nonzero_on_partial_failure(self):
+        cleaner = MagicMock()
+        result = MagicMock()
+        result.exit_code.return_value = 1
+        cleaner.run = MagicMock(return_value=result)
+        with patch.object(job_main, "MediaCleanup", return_value=cleaner):
+            code = job_main.main()
+        self.assertEqual(code, 1)
 
     def test_job_lambda_handler_ignores_sqs_records_and_runs_cleanup(self):
         cleaner = MagicMock()
-        cleaner.run = MagicMock()
+        result = MagicMock()
+        result.failed = False
+        cleaner.run = MagicMock(return_value=result)
         with patch.object(cleanup, "MediaCleanup", return_value=cleaner) as cleanup_cls, \
              patch.object(webhook_app, "process_sqs_event_records") as process_records, \
              patch.object(webhook_app, "process_sqs_queue_messages") as process_queue:
@@ -125,6 +163,22 @@ class TestScheduledRuntimeBoundary(unittest.TestCase):
         process_queue.assert_not_called()
         self.assertEqual(response["statusCode"], 200)
         self.assertEqual(response["body"], "Cleanup executed successfully.")
+
+    def test_job_lambda_handler_returns_500_on_partial_failure(self):
+        cleaner = MagicMock()
+        result = MagicMock()
+        result.failed = True
+        result.outcome = "partial_failure"
+        result.errors = ["orphan delete failed: x"]
+        result.message = ""
+        cleaner.run = MagicMock(return_value=result)
+        with patch.object(cleanup, "MediaCleanup", return_value=cleaner):
+            response = job_lambda.lambda_handler({}, None)
+
+        self.assertEqual(response["statusCode"], 500)
+        body = json.loads(response["body"])
+        self.assertTrue(body["failed"])
+        self.assertEqual(body["outcome"], "partial_failure")
 
 
 if __name__ == "__main__":
