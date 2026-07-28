@@ -12,6 +12,7 @@ import requests
 from urllib.parse import urlparse
 from flask import Flask, request, jsonify
 from cleanarr.reporting import DecisionReporter, redact_sensitive_data
+from cleanarr.webhook.auth import verify_from_http
 
 APP = Flask(__name__)
 
@@ -893,16 +894,20 @@ def healthz():
 
 @APP.route("/jellyfin/webhook", methods=["POST"])
 def jellyfin_webhook():
-    # Verify authentication token if configured
-    if JELLYFIN_WEBHOOK_SECRET or JELLYFIN_WEBHOOK_SECRET_PREVIOUS:
-        token_val = request.headers.get('X-Cleanarr-Webhook-Token') or request.headers.get('X-Webhook-Token') or request.args.get('token')
-        token_ok = (
-            token_val == JELLYFIN_WEBHOOK_SECRET
-            or (JELLYFIN_WEBHOOK_SECRET_PREVIOUS and token_val == JELLYFIN_WEBHOOK_SECRET_PREVIOUS)
+    raw_body = request.get_data(cache=True, as_text=False) or b""
+    accepted, auth_reason = verify_from_http(
+        secrets=(JELLYFIN_WEBHOOK_SECRET, JELLYFIN_WEBHOOK_SECRET_PREVIOUS),
+        headers=request.headers,
+        query_token=request.args.get("token"),
+        body=raw_body,
+    )
+    if not accepted:
+        logger.warning(
+            "Unauthorized Jellyfin webhook attempt from %s reason=%s",
+            request.remote_addr,
+            auth_reason,
         )
-        if not token_ok:
-            logger.warning(f"Unauthorized Jellyfin webhook attempt from {request.remote_addr}")
-            return jsonify({"status": "error", "message": "Unauthorized"}), 401
+        return jsonify({"status": "error", "message": "Unauthorized"}), 401
 
     logger.info(
         "Received Jellyfin request: %s %s from %s content_type=%s",
@@ -991,16 +996,20 @@ def jellyfin_webhook():
 
 @APP.route("/plex/webhook", methods=["GET", "POST"])
 def plex_webhook():
-    # Verify authentication token if configured
-    if WEBHOOK_SECRET:
-        token_val = request.headers.get('X-Cleanarr-Webhook-Token') or request.headers.get('X-Webhook-Token') or request.args.get('token')
-        token_ok = (
-            (token_val == WEBHOOK_SECRET)
-            or (WEBHOOK_SECRET_PREVIOUS and token_val == WEBHOOK_SECRET_PREVIOUS)
+    raw_body = request.get_data(cache=True, as_text=False) or b""
+    accepted, auth_reason = verify_from_http(
+        secrets=(WEBHOOK_SECRET, WEBHOOK_SECRET_PREVIOUS),
+        headers=request.headers,
+        query_token=request.args.get("token"),
+        body=raw_body,
+    )
+    if not accepted:
+        logger.warning(
+            "Unauthorized Plex webhook attempt from %s reason=%s",
+            request.remote_addr,
+            auth_reason,
         )
-        if not token_ok:
-            logger.warning(f"Unauthorized webhook attempt from {request.remote_addr}")
-            return jsonify({"status": "error", "message": "Unauthorized"}), 401
+        return jsonify({"status": "error", "message": "Unauthorized"}), 401
 
     # Do not log raw request bodies. Plex sends multipart data and webhook secrets
     # should only arrive via headers, not query parameters that bleed into access logs.

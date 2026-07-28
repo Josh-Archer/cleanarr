@@ -14,11 +14,14 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import parse_qsl, quote, urlencode, urlsplit
 from urllib.request import Request, urlopen
 
+from cleanarr.webhook.auth import extract_token, verify_from_http
+
 LOG = logging.getLogger("cleanarr-webhook-proxy")
 logging.basicConfig(level=logging.INFO)
 
 AWS_REGION = os.environ.get("AWS_REGION", "us-east-1")
 WEBHOOK_SECRET = os.environ.get("WEBHOOK_SECRET", "")
+WEBHOOK_SECRET_PREVIOUS = os.environ.get("WEBHOOK_SECRET_PREVIOUS", "")
 
 AWS_ROLE_ARN = os.environ.get("AWS_ROLE_ARN", "")
 AWS_ROLE_SESSION_NAME = os.environ.get("AWS_ROLE_SESSION_NAME", "cleanarr-webhook-proxy")
@@ -38,6 +41,7 @@ _CREDENTIAL_LOCK = threading.Lock()
 
 
 JELLYFIN_WEBHOOK_SECRET = os.environ.get("JELLYFIN_WEBHOOK_SECRET", "")
+JELLYFIN_WEBHOOK_SECRET_PREVIOUS = os.environ.get("JELLYFIN_WEBHOOK_SECRET_PREVIOUS", "")
 
 
 def _queue_url() -> str:
@@ -568,12 +572,36 @@ class ProxyHandler(BaseHTTPRequestHandler):
             content_len = 0
         body = self.rfile.read(content_len)
         content_type = self.headers.get("Content-Type", "application/json")
+        query = dict(parse_qsl(parsed_url.query, keep_blank_values=True))
 
-        token = (
-            self.headers.get("X-Cleanarr-Webhook-Token")
-            or self.headers.get("X-Webhook-Token")
-            or dict(parse_qsl(parsed_url.query)).get("token")
-            or (WEBHOOK_SECRET if is_plex else JELLYFIN_WEBHOOK_SECRET)
+        secrets = (
+            (WEBHOOK_SECRET, WEBHOOK_SECRET_PREVIOUS)
+            if is_plex
+            else (JELLYFIN_WEBHOOK_SECRET, JELLYFIN_WEBHOOK_SECRET_PREVIOUS)
+        )
+        accepted, auth_reason = verify_from_http(
+            secrets=secrets,
+            headers=self.headers,
+            query_token=query.get("token"),
+            body=body,
+        )
+        if not accepted:
+            LOG.warning(
+                "Unauthorized %s webhook attempt from %s reason=%s",
+                "plex" if is_plex else "jellyfin",
+                self.client_address[0] if self.client_address else "unknown",
+                auth_reason,
+            )
+            self.send_response(401)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(b'{"status":"error","message":"Unauthorized"}\n')
+            return
+
+        # Prefer the caller-provided token when forwarding; fall back to the
+        # configured secret so upstream can re-verify without re-deriving HMAC.
+        token = extract_token(self.headers, query_token=query.get("token")) or (
+            WEBHOOK_SECRET if is_plex else JELLYFIN_WEBHOOK_SECRET
         )
 
         if _queue_url():

@@ -208,9 +208,9 @@ Transmission is optional unless you want torrent maintenance or torrent removal 
 | --- | --- | --- |
 | `PLEX_WEBHOOK_PORT` | `8000` | Port used by the webhook app locally or in container runtime |
 | `PLEX_WEBHOOK_ENABLE_DELETIONS` | `false` | Allows webhook events to trigger deletion handling |
-| `WEBHOOK_SECRET` | unset | Shared secret for Plex accepted in `X-Cleanarr-Webhook-Token` or `X-Webhook-Token` |
+| `WEBHOOK_SECRET` | unset | When set, Plex webhook/proxy require this shared secret (header/query) or a matching HMAC-SHA256 body signature; fails closed if missing/invalid |
 | `WEBHOOK_SECRET_PREVIOUS` | unset | Previous Plex secret accepted during token rotation |
-| `JELLYFIN_WEBHOOK_SECRET` | unset | Shared secret for Jellyfin |
+| `JELLYFIN_WEBHOOK_SECRET` | unset | When set, Jellyfin webhook/proxy require this shared secret or HMAC signature; fails closed if missing/invalid |
 | `JELLYFIN_WEBHOOK_SECRET_PREVIOUS` | unset | Previous Jellyfin secret accepted during token rotation |
 | `CLEANARR_WEBHOOK_QUEUE_MODE` | `direct` | Event handling mode: `direct` (immediate) or `sqs` (staged enqueue + poll) |
 | `CLEANARR_WEBHOOK_QUEUE_URL` | unset | SQS queue URL used in staged mode |

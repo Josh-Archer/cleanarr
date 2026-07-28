@@ -247,5 +247,116 @@ class TestProxyHandler(unittest.TestCase):
 
         handler.send_response.assert_called_with(404)
 
+    @patch("cleanarr.webhook.proxy._forward_webhook_request")
+    @patch("cleanarr.webhook.proxy._publish_webhook_event_to_sqs")
+    def test_do_POST_rejects_missing_secret_when_enabled(self, mock_publish, mock_forward):
+        with patch.object(proxy_module.ProxyHandler, "setup"), \
+             patch.object(proxy_module.ProxyHandler, "handle"), \
+             patch.object(proxy_module.ProxyHandler, "finish"):
+            handler = proxy_module.ProxyHandler(self.mock_request, ("127.0.0.1", 12345), self.mock_server)
+
+        handler.path = "/plex/webhook"
+        handler.command = "POST"
+        handler.headers = {"Content-Length": "2", "Content-Type": "application/json"}
+        handler.rfile = io.BytesIO(b"{}")
+        handler.wfile = io.BytesIO()
+        handler.send_response = MagicMock()
+        handler.send_header = MagicMock()
+        handler.end_headers = MagicMock()
+        handler.client_address = ("127.0.0.1", 12345)
+
+        with patch.object(proxy_module, "WEBHOOK_SECRET", "required-secret"), \
+             patch.object(proxy_module, "WEBHOOK_SECRET_PREVIOUS", ""), \
+             patch.dict(
+                 os.environ,
+                 {"CLEANARR_WEBHOOK_QUEUE_URL": "https://sqs.example/queue"},
+             ):
+            handler.do_POST()
+
+        self.assertEqual(handler.send_response.call_args[0][0], 401)
+        payload = json.loads(handler.wfile.getvalue().decode("utf-8").strip())
+        self.assertEqual(payload["status"], "error")
+        mock_publish.assert_not_called()
+        mock_forward.assert_not_called()
+
+    @patch("cleanarr.webhook.proxy._forward_webhook_request")
+    @patch("cleanarr.webhook.proxy._publish_webhook_event_to_sqs")
+    @patch("cleanarr.webhook.proxy._parse_webhook_event")
+    def test_do_POST_accepts_valid_secret_when_enabled(self, mock_parse, mock_publish, mock_forward):
+        mock_parse.return_value = {
+            "event": "media.scrobble",
+            "recorded": True,
+            "metadata": {"librarySectionTitle": "TV Shows"},
+        }
+        mock_publish.return_value = True
+
+        with patch.object(proxy_module.ProxyHandler, "setup"), \
+             patch.object(proxy_module.ProxyHandler, "handle"), \
+             patch.object(proxy_module.ProxyHandler, "finish"):
+            handler = proxy_module.ProxyHandler(self.mock_request, ("127.0.0.1", 12345), self.mock_server)
+
+        handler.path = "/plex/webhook"
+        handler.command = "POST"
+        handler.headers = {
+            "Content-Length": "2",
+            "Content-Type": "application/json",
+            "X-Cleanarr-Webhook-Token": "required-secret",
+        }
+        handler.rfile = io.BytesIO(b"{}")
+        handler.wfile = io.BytesIO()
+        handler.send_response = MagicMock()
+        handler.send_header = MagicMock()
+        handler.end_headers = MagicMock()
+        handler.client_address = ("127.0.0.1", 12345)
+
+        with patch.object(proxy_module, "WEBHOOK_SECRET", "required-secret"), \
+             patch.object(proxy_module, "WEBHOOK_SECRET_PREVIOUS", ""), \
+             patch.dict(
+                 os.environ,
+                 {"CLEANARR_WEBHOOK_QUEUE_URL": "https://sqs.example/queue"},
+             ):
+            handler.do_POST()
+
+        payload = json.loads(handler.wfile.getvalue().decode("utf-8").strip())
+        self.assertEqual(payload["status"], "ok")
+        handler.send_response.assert_called_with(200)
+        mock_publish.assert_called_once()
+        mock_forward.assert_not_called()
+
+    @patch("cleanarr.webhook.proxy._forward_webhook_request")
+    @patch("cleanarr.webhook.proxy._publish_webhook_event_to_sqs")
+    def test_do_POST_rejects_invalid_hmac_when_enabled(self, mock_publish, mock_forward):
+        body = b'{"event":"media.scrobble"}'
+        with patch.object(proxy_module.ProxyHandler, "setup"), \
+             patch.object(proxy_module.ProxyHandler, "handle"), \
+             patch.object(proxy_module.ProxyHandler, "finish"):
+            handler = proxy_module.ProxyHandler(self.mock_request, ("127.0.0.1", 12345), self.mock_server)
+
+        handler.path = "/plex/webhook"
+        handler.command = "POST"
+        handler.headers = {
+            "Content-Length": str(len(body)),
+            "Content-Type": "application/json",
+            "X-Cleanarr-Signature": "sha256=deadbeef",
+        }
+        handler.rfile = io.BytesIO(body)
+        handler.wfile = io.BytesIO()
+        handler.send_response = MagicMock()
+        handler.send_header = MagicMock()
+        handler.end_headers = MagicMock()
+        handler.client_address = ("127.0.0.1", 12345)
+
+        with patch.object(proxy_module, "WEBHOOK_SECRET", "hmac-secret"), \
+             patch.object(proxy_module, "WEBHOOK_SECRET_PREVIOUS", ""), \
+             patch.dict(
+                 os.environ,
+                 {"CLEANARR_WEBHOOK_QUEUE_URL": "https://sqs.example/queue"},
+             ):
+            handler.do_POST()
+
+        self.assertEqual(handler.send_response.call_args[0][0], 401)
+        mock_publish.assert_not_called()
+        mock_forward.assert_not_called()
+
 if __name__ == "__main__":
     unittest.main()

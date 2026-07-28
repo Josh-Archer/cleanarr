@@ -14,8 +14,8 @@ Optional variables:
 - `CLEANARR_TRANSMISSION_*` for torrent cleanup
 - `CLEANARR_DRY_RUN` to disable destructive actions
 - `CLEANARR_NTFY_*` for run summaries
-- `WEBHOOK_SECRET` to protect the Plex webhook endpoint; send it via `X-Cleanarr-Webhook-Token` or `X-Webhook-Token`
-- `JELLYFIN_WEBHOOK_SECRET` to protect the Jellyfin webhook endpoint (/jellyfin/webhook)
+- `WEBHOOK_SECRET` / `WEBHOOK_SECRET_PREVIOUS` to protect the Plex webhook endpoint (`/plex/webhook`) and the proxy ingress for Plex events
+- `JELLYFIN_WEBHOOK_SECRET` / `JELLYFIN_WEBHOOK_SECRET_PREVIOUS` to protect the Jellyfin webhook endpoint (`/jellyfin/webhook`) and the proxy ingress for Jellyfin events
 - `PLEX_WEBHOOK_ENABLE_DELETIONS` to let the webhook perform deletions
 - `CLEANARR_WEBHOOK_QUEUE_MODE` (`direct` or `sqs`) for staged webhook buffering
 - `CLEANARR_WEBHOOK_QUEUE_URL` and `CLEANARR_WEBHOOK_QUEUE_REGION` for SQS wiring
@@ -34,6 +34,47 @@ Optional variables:
   ```
 
 The webhook, scheduled job runtime, and SQS webhook consumer runtime use the same cleanup configuration surface so downstream operators only need one secret/config contract.
+
+## Webhook authenticity (optional, fail-closed)
+
+When any of the platform secrets above are set, Cleanarr **fails closed**: requests without a valid shared secret or HMAC signature receive `401 Unauthorized` and are not enqueued, forwarded, or processed. When secrets are unset, authenticity checks are disabled (protect the endpoint at ingress/network instead).
+
+### Shared secret (header or query)
+
+Send the secret with one of:
+
+- Header `X-Cleanarr-Webhook-Token: <secret>`
+- Header `X-Webhook-Token: <secret>`
+- Query `?token=<secret>` (prefer headers; query tokens can appear in access logs)
+
+`WEBHOOK_SECRET_PREVIOUS` / `JELLYFIN_WEBHOOK_SECRET_PREVIOUS` are accepted during rotation so callers can cut over without downtime.
+
+### HMAC-SHA256 body signature
+
+Alternatively (or in addition), sign the **raw request body** with the configured secret and send one of:
+
+- `X-Cleanarr-Signature: sha256=<hex>`
+- `X-Hub-Signature-256: sha256=<hex>`
+- `X-Signature-256: sha256=<hex>` (bare hex also accepted)
+
+Example (bash):
+
+```bash
+SECRET='your-shared-secret'
+BODY='{"event":"media.scrobble"}'
+SIG=$(printf '%s' "$BODY" | openssl dgst -sha256 -hmac "$SECRET" | awk '{print $2}')
+curl -X POST "https://cleanarr.example/plex/webhook" \
+  -H "Content-Type: application/json" \
+  -H "X-Cleanarr-Signature: sha256=${SIG}" \
+  --data-binary "$BODY"
+```
+
+### Ingress / proxy notes
+
+- Apply the same secrets on the **webhook app** and the **webhook proxy** (`cleanarr.webhook.proxy`). The proxy verifies before SQS publish or Lambda forward.
+- Prefer putting authenticity at Cleanarr **and** at the edge (Cloudflare Access, mTLS, private network). Edge auth does not replace app-level verification when the path is internet-reachable.
+- Plex Media Server webhooks do not natively attach HMAC headers; use a reverse-proxy/middleware that injects `X-Cleanarr-Webhook-Token`, or a signed forwarder. Jellyfin webhook plugins can typically set custom headers for the shared secret or signature.
+- Rotation: set `*_PREVIOUS` to the old value, deploy callers with the new secret, then clear `*_PREVIOUS`.
 
 Issue #629 staged mode contract:
 
