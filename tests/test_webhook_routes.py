@@ -110,6 +110,27 @@ class TestWebhookRouteSecretGate(unittest.TestCase):
         self.assertEqual(response_previous.get_json().get("status"), "ok")
         self.assertEqual(process_actions.call_count, 2)
 
+    def test_jellyfin_webhook_ignores_protected_path(self):
+        payload = self._jellyfin_payload()
+        payload["Path"] = "/media/protected/Example Movie.mkv"
+
+        with patch.object(webhook_app, "JELLYFIN_WEBHOOK_SECRET", "current-secret"), \
+             patch.object(webhook_app, "JELLYFIN_WEBHOOK_SECRET_PREVIOUS", None), \
+             patch.object(webhook_app, "WEBHOOK_IGNORED_PATH_PREFIXES", ("/media/protected",)), \
+             patch.object(webhook_app, "_start_background_threads"), \
+             patch.object(webhook_app, "_enqueue_webhook_event") as enqueue, \
+             patch.object(webhook_app, "_process_webhook_event_actions") as process_actions:
+            response = self.client.post(
+                "/jellyfin/webhook",
+                headers={"X-Webhook-Token": "current-secret"},
+                json=payload,
+            )
+
+        self.assertEqual(response.status_code, 202)
+        self.assertEqual(response.get_json(), {"status": "ignored", "reason": "ignored_path"})
+        enqueue.assert_not_called()
+        process_actions.assert_not_called()
+
     def test_jellyfin_webhook_accepts_hmac_signature(self):
         secret = "sig-secret"
         body = b'{"NotificationType":"ItemMarkPlayed","ItemType":"Movie","NotificationUsername":"alice","ItemName":"Example Movie"}'

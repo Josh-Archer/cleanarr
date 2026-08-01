@@ -217,6 +217,7 @@ Transmission is optional unless you want torrent maintenance or torrent removal 
 | `WEBHOOK_SECRET_PREVIOUS` | unset | Previous Plex secret accepted during token rotation |
 | `JELLYFIN_WEBHOOK_SECRET` | unset | When set, Jellyfin webhook/proxy require this shared secret or HMAC signature; fails closed if missing/invalid |
 | `JELLYFIN_WEBHOOK_SECRET_PREVIOUS` | unset | Previous Jellyfin secret accepted during token rotation |
+| `CLEANARR_WEBHOOK_IGNORED_PATH_PREFIXES` | unset | Comma-separated media path prefixes whose webhook events are acknowledged but never queued or processed for cleanup |
 | `CLEANARR_WEBHOOK_QUEUE_MODE` | `direct` | Event handling mode: `direct` (immediate) or `sqs` (staged enqueue + poll) |
 | `CLEANARR_WEBHOOK_QUEUE_URL` | unset | SQS queue URL used in staged mode |
 | `CLEANARR_WEBHOOK_QUEUE_REGION` | unset | AWS region for SQS client initialization |

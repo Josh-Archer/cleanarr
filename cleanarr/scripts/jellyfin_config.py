@@ -72,7 +72,8 @@ def configure_jellyfin_webhook():
   "NotificationUsername": "{{NotificationUsername}}",
   "UserId": "{{UserId}}",
   "ItemType": "{{ItemType}}",
-  "Name": "{{Name}}"
+  "Name": "{{Name}}",
+  "Path": "{{Path}}"
 }"""
 
     try:
@@ -94,7 +95,7 @@ def configure_jellyfin_webhook():
             name_el = dest.find("Name")
             if name_el is not None and name_el.text == "Cleanarr Webhook":
                 dest.find("Url").text = webhook_url
-                dest.find("NotificationType").text = "ItemMarkPlayed,PlaybackStart,PlaybackStop"
+                dest.find("NotificationType").text = "ItemMarkPlayed,PlaybackStart,PlaybackStopped"
                 dest.find("IsEnabled").text = "true"
                 dest.find("Template").text = template
                 
@@ -117,7 +118,7 @@ def configure_jellyfin_webhook():
             dest = ET.SubElement(destinations, "GenericDestination")
             ET.SubElement(dest, "Name").text = "Cleanarr Webhook"
             ET.SubElement(dest, "Url").text = webhook_url
-            ET.SubElement(dest, "NotificationType").text = "ItemMarkPlayed,PlaybackStart,PlaybackStop"
+            ET.SubElement(dest, "NotificationType").text = "ItemMarkPlayed,PlaybackStart,PlaybackStopped"
             ET.SubElement(dest, "IsEnabled").text = "true"
             ET.SubElement(dest, "Template").text = template
             header = ET.SubElement(dest, "Header")

@@ -129,6 +129,28 @@ class TestWebhookQueueMode(unittest.TestCase):
         self.assertFalse(summary['enabled'])
         self.assertEqual(summary['reason'], 'queue polling disabled')
 
+    def test_protected_path_is_skipped_before_queued_cleanup(self):
+        event = {
+            'event': 'playbackstopped',
+            'metadata': {
+                'type': 'movie',
+                'title': 'Protected Movie',
+                'path': '/media/protected/Protected Movie.mkv',
+            },
+        }
+
+        with patch.object(webhook_app, 'WEBHOOK_IGNORED_PATH_PREFIXES', ('/media/protected',)), \
+             patch.object(webhook_app, '_background_process_finished') as cleanup:
+            result = webhook_app._process_webhook_event_actions(
+                event,
+                async_mode=False,
+                force_deletions=True,
+            )
+
+        self.assertTrue(result['ignored'])
+        self.assertEqual(result['reason'], 'ignored_path')
+        cleanup.assert_not_called()
+
     def test_process_sqs_event_records_processes_delivered_records(self):
         records = [
             {

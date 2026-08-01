@@ -216,6 +216,49 @@ class TestProxyHandler(unittest.TestCase):
         mock_publish.assert_not_called()
         mock_forward.assert_not_called()
 
+    @patch("cleanarr.webhook.proxy._forward_webhook_request")
+    @patch("cleanarr.webhook.proxy._publish_webhook_event_to_sqs")
+    @patch("cleanarr.webhook.proxy._parse_jellyfin_webhook_event")
+    def test_do_POST_ignores_protected_path_before_enqueue(self, mock_parse, mock_publish, mock_forward):
+        mock_parse.return_value = {
+            "event": "itemmarkplayed",
+            "recorded": True,
+            "metadata": {"path": "/media/protected/Movie.mkv"},
+        }
+
+        with patch.object(proxy_module.ProxyHandler, "setup"), \
+             patch.object(proxy_module.ProxyHandler, "handle"), \
+             patch.object(proxy_module.ProxyHandler, "finish"):
+            handler = proxy_module.ProxyHandler(self.mock_request, ("127.0.0.1", 12345), self.mock_server)
+
+        handler.path = "/jellyfin/webhook"
+        handler.command = "POST"
+        handler.headers = {"Content-Length": "2", "Content-Type": "application/json"}
+        handler.rfile = io.BytesIO(b"{}")
+        handler.wfile = io.BytesIO()
+        handler.send_response = MagicMock()
+        handler.send_header = MagicMock()
+        handler.end_headers = MagicMock()
+        handler.client_address = ("127.0.0.1", 12345)
+
+        with patch.dict(
+            os.environ,
+            {
+                "CLEANARR_WEBHOOK_QUEUE_URL": "https://sqs.us-east-1.amazonaws.com/031332257715/cleanarr-webhook-events",
+                "CLEANARR_WEBHOOK_QUEUE_REGION": "us-east-1",
+                "CLEANARR_WEBHOOK_IGNORED_PATH_PREFIXES": "/media/protected",
+            },
+        ):
+            handler.do_POST()
+
+        payload = json.loads(handler.wfile.getvalue().decode("utf-8").strip())
+        self.assertEqual(payload["status"], "ignored")
+        self.assertEqual(payload["reason"], "ignored_path")
+        self.assertEqual(payload["path_prefix"], "/media/protected")
+        handler.send_response.assert_called_with(202)
+        mock_publish.assert_not_called()
+        mock_forward.assert_not_called()
+
     def test_do_GET_healthz(self):
         with patch.object(proxy_module.ProxyHandler, 'setup'), \
              patch.object(proxy_module.ProxyHandler, 'handle'), \

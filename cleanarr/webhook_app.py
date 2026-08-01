@@ -87,6 +87,38 @@ def _event_media_title(meta):
         or "webhook-event"
     )
 
+
+def _event_path(ev):
+    if not isinstance(ev, dict):
+        return ""
+
+    metadata = ev.get("metadata")
+    payload = ev.get("payload")
+    candidates = []
+    if isinstance(metadata, dict):
+        candidates.extend(metadata.get(key) for key in ("path", "itemPath", "mediaPath"))
+    if isinstance(payload, dict):
+        candidates.extend(payload.get(key) for key in ("Path", "path", "ItemPath", "MediaPath"))
+        for key in ("Item", "Metadata", "metadata"):
+            nested = payload.get(key)
+            if isinstance(nested, dict):
+                candidates.extend(nested.get(candidate) for candidate in ("Path", "path", "ItemPath", "MediaPath"))
+
+    for candidate in candidates:
+        if isinstance(candidate, str) and candidate.strip():
+            return candidate.strip().replace('\\', '/').casefold()
+    return ""
+
+
+def _ignored_path_for_event(ev):
+    event_path = _event_path(ev)
+    if not event_path:
+        return ""
+    for prefix in WEBHOOK_IGNORED_PATH_PREFIXES:
+        if event_path == prefix or event_path.startswith(prefix + '/'):
+            return prefix
+    return ""
+
 # Lazy MediaCleanup instance (created on first event processing)
 _MC = None
 _MC_LOCK = threading.Lock()
@@ -121,6 +153,11 @@ WEBHOOK_QUEUE_POLLING = _env_bool('CLEANARR_WEBHOOK_QUEUE_POLLING', default=Fals
 WEBHOOK_QUEUE_MAX_MESSAGES = max(1, _env_int('CLEANARR_WEBHOOK_QUEUE_MAX_MESSAGES', 50))
 WEBHOOK_QUEUE_WAIT_SECONDS = max(0, _env_int('CLEANARR_WEBHOOK_QUEUE_WAIT_SECONDS', 1))
 WEBHOOK_QUEUE_VISIBILITY_TIMEOUT = max(0, _env_int('CLEANARR_WEBHOOK_QUEUE_VISIBILITY_TIMEOUT', 0))
+WEBHOOK_IGNORED_PATH_PREFIXES = tuple(
+    item.strip().rstrip('/').casefold()
+    for item in (os.environ.get('CLEANARR_WEBHOOK_IGNORED_PATH_PREFIXES', '') or '').split(',')
+    if item.strip()
+)
 _THREADS_STARTED = False
 _HEALTH_LOCK = threading.Lock()
 _HEALTH_STATUS = {
@@ -570,7 +607,7 @@ def _compute_event_flags(ev: dict):
     # Only treat explicit watched events as finished.
     # Do not infer watched state from media.play/media.stop to avoid accidental promotion.
     # Also support Tautulli 'mark_watched' action.
-    if evt == 'media.scrobble' or act == 'mark_watched' or evt in ('itemmarkplayed', 'playbackstopped', 'userdatasaved'):
+    if evt == 'media.scrobble' or act == 'mark_watched' or evt in ('itemmarkplayed', 'playbackstopped'):
         is_finished = True
     elif evt == 'library.remove':
         is_removed = True
@@ -587,6 +624,32 @@ def _compute_event_flags(ev: dict):
 
 
 def _process_webhook_event_actions(ev: dict, async_mode: bool = True, force_deletions: bool = False):
+    ignored_path = _ignored_path_for_event(ev)
+    if ignored_path:
+        metadata = ev.get("metadata") or {}
+        media_type = (metadata.get("type") or "unknown").lower()
+        media_title = (
+            metadata.get("title")
+            or metadata.get("parentTitle")
+            or metadata.get("grandparentTitle")
+            or "webhook-event"
+        )
+        logger.info("Ignoring webhook event from protected path prefix %s", ignored_path)
+        _record_webhook_decision(
+            reason_code="skip",
+            media_type=media_type,
+            media_title=media_title,
+            reason="ignored_path",
+            details={"path_prefix": ignored_path},
+        )
+        return {
+            'actionable': False,
+            'recorded': False,
+            'ignored': True,
+            'reason': 'ignored_path',
+            'path_prefix': ignored_path,
+        }
+
     evt, act, is_finished, is_removed, is_paused, is_stopped = _compute_event_flags(ev)
 
     logger.info(
@@ -1071,11 +1134,12 @@ def jellyfin_webhook():
             "parentTitle": html.unescape(payload.get("SeriesName") or ""),
             "grandparentTitle": html.unescape(payload.get("SeriesName") or ""),
             "title": html.unescape(payload.get("Name") or ""),
+            "path": payload.get("Path") or payload.get("path") or payload.get("ItemPath") or payload.get("MediaPath") or "",
         }
     }
 
     # Compute flags for Jellyfin
-    is_finished = event_name.lower() in ("itemmarkplayed", "playbackstopped", "userdatasaved")
+    is_finished = event_name.lower() in ("itemmarkplayed", "playbackstopped")
     is_paused = event_name.lower() == "playbackpaused"
     is_stopped = event_name.lower() == "playbackstopped"
     
@@ -1083,6 +1147,18 @@ def jellyfin_webhook():
     ev["removed"] = False
     ev["paused"] = is_paused
     ev["stopped"] = is_stopped
+
+    ignored_path = _ignored_path_for_event(ev)
+    if ignored_path:
+        logger.info("Ignoring Jellyfin webhook event from protected path prefix %s", ignored_path)
+        _record_webhook_decision(
+            reason_code="skip",
+            media_type=ev["metadata"].get("type") or "unknown",
+            media_title=ev["metadata"].get("title") or "webhook-event",
+            reason="ignored_path",
+            details={"path_prefix": ignored_path},
+        )
+        return jsonify({"status": "ignored", "reason": "ignored_path"}), 202
     
     actionable = is_finished or is_paused or is_stopped
     recorded = is_finished
