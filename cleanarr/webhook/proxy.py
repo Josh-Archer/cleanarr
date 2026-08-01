@@ -63,6 +63,48 @@ def _ignored_libraries() -> set[str]:
     return {item.strip().casefold() for item in raw.split(",") if item.strip()}
 
 
+def _ignored_path_prefixes() -> tuple[str, ...]:
+    raw = os.environ.get("CLEANARR_WEBHOOK_IGNORED_PATH_PREFIXES", "")
+    prefixes = []
+    for item in raw.split(","):
+        normalized = item.strip().rstrip("/").casefold()
+        if normalized:
+            prefixes.append(normalized)
+    return tuple(prefixes)
+
+
+def _event_path(webhook_event: dict | None) -> str:
+    if not isinstance(webhook_event, dict):
+        return ""
+
+    metadata = webhook_event.get("metadata")
+    payload = webhook_event.get("payload")
+    candidates = []
+    if isinstance(metadata, dict):
+        candidates.extend(metadata.get(key) for key in ("path", "itemPath", "mediaPath"))
+    if isinstance(payload, dict):
+        candidates.extend(payload.get(key) for key in ("Path", "path", "ItemPath", "MediaPath"))
+        for key in ("Item", "Metadata", "metadata"):
+            nested = payload.get(key)
+            if isinstance(nested, dict):
+                candidates.extend(nested.get(candidate) for candidate in ("Path", "path", "ItemPath", "MediaPath"))
+
+    for candidate in candidates:
+        if isinstance(candidate, str) and candidate.strip():
+            return candidate.strip().replace("\\", "/").casefold()
+    return ""
+
+
+def _ignored_path_for_event(webhook_event: dict | None) -> str:
+    event_path = _event_path(webhook_event)
+    if not event_path:
+        return ""
+    for prefix in _ignored_path_prefixes():
+        if event_path == prefix or event_path.startswith(prefix + "/"):
+            return prefix
+    return ""
+
+
 def _proxy_sink_mode() -> str:
     if _queue_url():
         return "sqs"
@@ -106,7 +148,7 @@ def _compute_event_flags(event_name: str, action_name: str, platform: str = "ple
     act = (action_name or "").lower()
 
     if platform == "jellyfin":
-        is_finished = evt == "itemmarkplayed" or evt == "playbackstopped" or evt == "userdatasaved" or evt == "userdatasaved"
+        is_finished = evt == "itemmarkplayed" or evt == "playbackstopped"
         is_removed = False # Jellyfin doesn't typically send library.remove via standard webhooks
         is_paused = evt == "playbackpaused"
         is_stopped = evt == "playbackstopped"
@@ -375,6 +417,7 @@ def _parse_jellyfin_webhook_event(body: bytes, remote_addr: str, method: str) ->
             "parentIndex": payload.get("ParentIndexNumber") or payload.get("SeasonNumber"),
             "year": payload.get("Year") or payload.get("ProductionYear"),
             "grandparentTitle": html.unescape(payload.get("SeriesName") or ""),
+            "path": payload.get("Path") or payload.get("path") or payload.get("ItemPath") or payload.get("MediaPath") or "",
         }
     }
 
@@ -504,6 +547,9 @@ def _library_name_from_event(webhook_event: dict | None) -> str:
 
 
 def _should_ignore_event(webhook_event: dict | None) -> bool:
+    if _ignored_path_for_event(webhook_event):
+        return True
+
     ignored = _ignored_libraries()
     if not ignored:
         return False
@@ -668,12 +714,14 @@ class ProxyHandler(BaseHTTPRequestHandler):
 
             if _should_ignore_event(webhook_event):
                 library_name = _library_name_from_event(webhook_event)
-                LOG.info("Ignoring webhook event from filtered Plex library '%s'", library_name)
+                ignored_path = _ignored_path_for_event(webhook_event)
+                LOG.info("Ignoring webhook event from filtered library '%s' or protected path", library_name)
                 response = json.dumps(
                     {
                         "status": "ignored",
-                        "reason": "ignored_library",
+                        "reason": "ignored_path" if ignored_path else "ignored_library",
                         "library": library_name,
+                        "path_prefix": ignored_path,
                         "sink": _proxy_sink_mode(),
                     }
                 ).encode("utf-8")

@@ -272,7 +272,7 @@ Point Emby Notifications (or a webhook plugin) at `POST /emby/webhook` (or the p
 | Emby event / plugin type | Cleanarr flags | Notes |
 | --- | --- | --- |
 | `item.markplayed`, `item.markwatched` | `finished` + `recorded` | Native mark-as-played |
-| `ItemMarkPlayed`, `UserDataSaved` | `finished` + `recorded` | Plugin / Jellyfin-compatible templates |
+| `ItemMarkPlayed` | `finished` + `recorded` | Plugin / Jellyfin-compatible templates |
 | `playback.stop` / `playback.stopped` | `stopped`; `finished` only if `PlaybackInfo.PlayedToCompletion` (or top-level `PlayedToCompletion`) is true | Avoids deleting on mid-play stops |
 | `PlaybackStopped` | `finished` + `stopped` | Plugin convention (treated as completion) |
 | `playback.pause` / `PlaybackPaused` | `paused` | Non-destructive |
