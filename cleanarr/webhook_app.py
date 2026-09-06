@@ -229,9 +229,10 @@ CLEANARR_DEFAULTS = {
 
 # ntfy/health-check configuration
 NTFY_ENABLE = os.environ.get('NTFY_ENABLE', 'false').lower() in ('1', 'true', 'yes')
-NTFY_TOPIC = os.environ.get('NTFY_TOPIC', '')
-NTFY_URL = os.environ.get('NTFY_URL', f"https://ntfy.sh/{NTFY_TOPIC}" if NTFY_TOPIC else 'https://ntfy.sh')
-NTFY_TOKEN = os.environ.get('NTFY_TOKEN')
+NTFY_BASEURL = (os.environ.get('CLEANARR_NTFY_BASEURL') or os.environ.get('CLEANARR_NTFY_URL') or 'https://ntfy.sh').rstrip('/')
+NTFY_TOPIC = os.environ.get('CLEANARR_NTFY_TOPIC') or os.environ.get('NTFY_TOPIC', '')
+NTFY_URL = os.environ.get('NTFY_URL') or (f"{NTFY_BASEURL}/{NTFY_TOPIC}" if NTFY_TOPIC else NTFY_BASEURL)
+NTFY_TOKEN = os.environ.get('CLEANARR_NTFY_TOKEN') or os.environ.get('NTFY_TOKEN')
 NTFY_HEALTH_INTERVAL = int(os.environ.get('NTFY_HEALTH_INTERVAL', '60'))
 NTFY_COOLDOWN = int(os.environ.get('NTFY_COOLDOWN', '3600'))
 
@@ -359,12 +360,14 @@ def _get_media_cleanup():
             if hasattr(_MC.plex, "_session"):
                 _MC.plex._session.verify = False
             return _MC
-        except SystemExit:
+        except SystemExit as se:
             # MediaCleanup may call sys.exit() on fatal init errors; don't let that kill the webhook
             logger.exception("MediaCleanup attempted to exit during initialization (connection error); webhook will remain running but deletions disabled")
+            _send_ntfy(f"Cleanarr initialization failed: connection error ({se})", title="Cleanarr: Initialization Failed", priority="high")
             return None
-        except BaseException:
+        except BaseException as be:
             logger.exception("Failed to initialize MediaCleanup for webhook-driven deletions")
+            _send_ntfy(f"Cleanarr initialization failed: {be}", title="Cleanarr: Initialization Failed", priority="high")
             return None
 
 
@@ -711,6 +714,8 @@ def _process_webhook_event_actions(ev: dict, async_mode: bool = True, force_dele
                 reason="deletion_processing_error",
                 details={"event": evt, "error": "failed_to_spawn_or_run_deletion"},
             )
+            if not async_mode:
+                raise
 
     # Sync watch/progress state to target Plex if configured.
     # Progress sync uses pause/stop events and is monotonic; watched sync uses scrobble only.
@@ -1522,7 +1527,7 @@ def _background_process_finished(ev: dict):
     mc = _get_media_cleanup()
     if not mc:
         logger.warning("MediaCleanup not available; skipping deletion processing")
-        return
+        raise RuntimeError("MediaCleanup not available; skipping deletion processing")
 
     meta = ev.get('metadata') or {}
     if not meta:
@@ -1997,7 +2002,7 @@ def _background_process_removed(ev: dict):
     mc = _get_media_cleanup()
     if not mc:
         logger.warning("MediaCleanup not available; skipping deletion processing")
-        return
+        raise RuntimeError("MediaCleanup not available; skipping deletion processing")
 
     meta = ev.get('metadata') or {}
     media_type = _event_media_type(meta)

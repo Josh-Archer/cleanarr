@@ -122,6 +122,31 @@ class TestLambdaConsumer(unittest.TestCase):
         self.assertEqual(body["outcome"], "partial_failure")
         self.assertEqual(body["errors"], ["Show S1E1 delete failed [standard watched]"])
 
+    def test_get_media_cleanup_alerts_ntfy_on_system_exit(self):
+        with patch.object(webhook_app, "_MC", None), \
+             patch.object(webhook_app, "_send_ntfy") as mock_ntfy, \
+             patch("cleanarr.cleanup.MediaCleanup", side_effect=SystemExit("403 Forbidden")):
+            cleaner = webhook_app._get_media_cleanup()
+            self.assertIsNone(cleaner)
+            mock_ntfy.assert_called_once()
+            call_args = mock_ntfy.call_args
+            self.assertEqual(call_args.kwargs.get("priority"), "high")
+            self.assertIn("Initialization Failed", call_args.kwargs.get("title", ""))
+
+    def test_sqs_processing_records_failure_when_media_cleanup_unavailable(self):
+        record = {
+            "messageId": "msg-fail-1",
+            "body": json.dumps({
+                "event": "media.scrobble",
+                "metadata": {"type": "episode", "ratingKey": "999"},
+                "account": {"title": "user1"},
+            }),
+        }
+        with patch.object(webhook_app, "ENABLE_WEBHOOK_DELETIONS", True), \
+             patch.object(webhook_app, "_get_media_cleanup", return_value=None):
+            summary = webhook_app.process_sqs_event_records([record], force_deletions=True)
+            self.assertEqual(summary["failed"], 1)
+            self.assertEqual(summary["failed_message_ids"], ["msg-fail-1"])
 
 class TestScheduledRuntimeBoundary(unittest.TestCase):
     def test_job_main_does_not_poll_webhook_queue(self):
