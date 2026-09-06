@@ -439,6 +439,10 @@ Plex / Emby / Jellyfin watch state / webhook events
 | `CLEANARR_RADARR_APIKEY` | Yes | Radarr API key |
 | `CLEANARR_LOG_FILE` | No | Log file path for the runtime |
 | `CLEANARR_DEBUG` | No | Enables verbose logging |
+| `NTFY_ENABLE` | No | Enables ntfy notifications on summary and initialization failure |
+| `CLEANARR_NTFY_BASEURL` / `CLEANARR_NTFY_URL` | No | Base URL for ntfy (default `https://ntfy.sh`) |
+| `CLEANARR_NTFY_TOPIC` / `NTFY_TOPIC` | When ntfy enabled | ntfy topic name |
+| `CLEANARR_NTFY_TOKEN` / `NTFY_TOKEN` | No | Optional Bearer token for protected ntfy topics |
 
 | `JELLYFIN_WEBHOOK_SECRET_PREVIOUS` | unset | Previous Jellyfin secret accepted during token rotation |
 | `EMBY_WEBHOOK_SECRET` | unset | Shared secret for Emby (`/emby/webhook`) |
@@ -452,3 +456,10 @@ Plex / Emby / Jellyfin watch state / webhook events
 | `CLEANARR_WEBHOOK_QUEUE_WAIT_SECONDS` | `1` | Long-poll wait time for SQS receives |
 | `CLEANARR_WEBHOOK_QUEUE_VISIBILITY_TIMEOUT` | `0` | Optional visibility timeout override for consumed messages |
 | `CLEANARR_WEBHOOK_FORWARD_URL` | unset | Optional Lambda URL fallback for the proxy harness when direct SQS publishing is unavailable |
+
+### Webhook Error Handling & Queue Retry
+
+When running in SQS consumer mode (`CLEANARR_WEBHOOK_QUEUE_MODE=sqs`), if downstream media services (Plex, Sonarr, Radarr) are unreachable or reject authentication (such as Cloudflare Access service token expiration):
+
+1. **Immediate High-Priority Alert**: Dispatches an alert to the configured `ntfy` topic on initialization failure so operators are alerted immediately.
+2. **SQS Retry Preservation**: Raises a `RuntimeError` during synchronous record processing, populating `batchItemFailures` in the Lambda return payload. SQS holds and retries the message until downstream services recover, preventing silent data loss.
