@@ -14,7 +14,7 @@ Optional variables:
 - `CLEANARR_TRANSMISSION_*` for torrent cleanup
 - `CLEANARR_DRY_RUN` to disable destructive actions
 - `CLEANARR_DRY_RUN_REPORT_DIR` directory for per-user dry-run report artifacts (`cleanarr-dry-run-report.json` and `.md`). Default: `/logs/dry-run-reports`. Written at end of a **job-mode** dry-run only.
-- `CLEANARR_NTFY_*` for run summaries
+- `CLEANARR_NTFY_*` / `NTFY_*` for run summaries and error alerts (`CLEANARR_NTFY_BASEURL`, `CLEANARR_NTFY_TOPIC`, `CLEANARR_NTFY_TOKEN`, `NTFY_ENABLE`)
 - `WEBHOOK_SECRET` / `WEBHOOK_SECRET_PREVIOUS` to protect the Plex webhook endpoint (`/plex/webhook`) and the proxy ingress for Plex events
 - `JELLYFIN_WEBHOOK_SECRET` / `JELLYFIN_WEBHOOK_SECRET_PREVIOUS` to protect the Jellyfin webhook endpoint (`/jellyfin/webhook`) and the proxy ingress for Jellyfin events
 - `PLEX_WEBHOOK_ENABLE_DELETIONS` to let the webhook perform deletions
