@@ -35,5 +35,11 @@ Queue decoupling (issue #8):
 - Downstream infrastructure can switch back to `direct` mode for automatic fallback when budget alarms trigger.
 - Direct Plex webhook handling remains a first-class runtime mode and is not replaced by the proxy path.
 
+Webhook Error Handling & Queue Retry:
+
+- If downstream media services (Plex, Sonarr, Radarr) fail initialization or reject authentication (such as Cloudflare Access token expiry), `_get_media_cleanup()` sends an immediate high-priority alert to the configured `ntfy` topic.
+- In SQS consumer mode (`async_mode=False`), `RuntimeError` is raised during record processing so `batchItemFailures` are reported to Lambda.
+- SQS retains failed records for automatic retry (up to `maxReceiveCount`) rather than silently discarding them.
+
 - Proxy and webhook runtime behavior stay in this repository; downstream repos own IAM roles, queue resources, manifests, and rollout policy.
 - Optional Lidarr music cleanup is feature-flagged (`CLEANARR_LIDARR_ENABLE`, default off). Plex owns play/listened signals; Lidarr owns managed track files, tags, and deletes.
