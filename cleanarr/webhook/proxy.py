@@ -1,17 +1,18 @@
-import cgi
 import datetime
 import hashlib
 import hmac
-import io
 import json
 import html
 import logging
 import os
 import threading
+import time
 import xml.etree.ElementTree as ET
+from email.parser import BytesParser
+from email.policy import default as email_policy
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from urllib.error import HTTPError, URLError
-from urllib.parse import parse_qsl, quote, urlencode, urlsplit
+from urllib.parse import parse_qs, parse_qsl, quote, urlencode, urlsplit
 from urllib.request import Request, urlopen
 
 from cleanarr.webhook.auth import extract_token, verify_from_http
@@ -185,6 +186,32 @@ def _canonical_query(query: str) -> str:
         f"{quote(k, safe='-_.~')}={quote(v, safe='-_.~')}" for k, v in parts
     )
 
+def _form_fields(body: bytes, content_type: str) -> dict[str, str]:
+    content_type_lower = (content_type or "").lower()
+    if "application/x-www-form-urlencoded" in content_type_lower:
+        parsed = parse_qs(body.decode("utf-8"), keep_blank_values=True)
+        return {key: (values[0] if values else "") for key, values in parsed.items()}
+    if "multipart/form-data" not in content_type_lower:
+        return {}
+
+    header = f"Content-Type: {content_type}\r\nMIME-Version: 1.0\r\n\r\n".encode("utf-8")
+    message = BytesParser(policy=email_policy).parsebytes(header + body)
+    fields: dict[str, str] = {}
+    parts = message.iter_parts() if message.is_multipart() else (message,)
+    for part in parts:
+        name = part.get_param("name", header="content-disposition")
+        if not name:
+            continue
+        payload = part.get_payload(decode=True)
+        if payload is None:
+            content = part.get_content()
+            fields[name] = content if isinstance(content, str) else ""
+            continue
+        charset = part.get_content_charset() or "utf-8"
+        fields[name] = payload.decode(charset, errors="replace")
+    return fields
+
+
 def _fetch_oidc_access_token() -> str:
     body = urlencode(
         {
@@ -194,19 +221,32 @@ def _fetch_oidc_access_token() -> str:
             "scope": OIDC_SCOPE,
         }
     ).encode("utf-8")
-    req = Request(
-        OIDC_TOKEN_URL,
-        data=body,
-        headers={"Content-Type": "application/x-www-form-urlencoded"},
-        method="POST",
-    )
-    with urlopen(req, timeout=15) as resp:
-        payload = json.loads(resp.read().decode("utf-8"))
+    last_error: Exception | None = None
+    for attempt in range(1, 6):
+        req = Request(
+            OIDC_TOKEN_URL,
+            data=body,
+            headers={"Content-Type": "application/x-www-form-urlencoded"},
+            method="POST",
+        )
+        try:
+            with urlopen(req, timeout=5) as resp:
+                payload = json.loads(resp.read().decode("utf-8"))
+        except (URLError, TimeoutError, OSError, json.JSONDecodeError) as exc:
+            last_error = exc
+            LOG.warning("OIDC token fetch failed (attempt %s/5): %s", attempt, exc)
+            time.sleep(0.4 * (2 ** (attempt - 1)))
+            continue
 
-    token = (payload.get("access_token") or "").strip()
-    if not token:
-        raise RuntimeError("OIDC token endpoint returned no access_token")
-    return token
+        token = (payload.get("access_token") or "").strip()
+        if token:
+            return token
+        last_error = RuntimeError("OIDC token endpoint returned no access_token")
+        LOG.warning("OIDC token fetch returned empty access_token (attempt %s/5)", attempt)
+        time.sleep(0.4 * (2 ** (attempt - 1)))
+
+    raise RuntimeError("OIDC token fetch failed after 5 attempts") from last_error
+
 
 def _assume_role_with_web_identity() -> dict:
     token = _fetch_oidc_access_token()
@@ -433,18 +473,10 @@ def _parse_webhook_event(body: bytes, content_type: str, query_string: str, remo
         if "application/json" in content_type_lower:
             payload = json.loads(body.decode("utf-8")) if body else None
         elif "multipart/form-data" in content_type_lower or "application/x-www-form-urlencoded" in content_type_lower:
-            form = cgi.FieldStorage(
-                fp=io.BytesIO(body),
-                environ={
-                    "REQUEST_METHOD": "POST",
-                    "CONTENT_TYPE": content_type,
-                    "CONTENT_LENGTH": str(len(body)),
-                },
-                keep_blank_values=True,
-            )
-            event_name = form.getfirst("event") or parsed_query.get("event")
-            action_name = form.getfirst("action") or parsed_query.get("action")
-            payload_raw = form.getfirst("payload")
+            form = _form_fields(body, content_type)
+            event_name = form.get("event") or parsed_query.get("event")
+            action_name = form.get("action") or parsed_query.get("action")
+            payload_raw = form.get("payload")
             if payload_raw:
                 payload = json.loads(payload_raw)
         else:
