@@ -4,6 +4,7 @@ import io
 import json
 from unittest.mock import patch, MagicMock
 from http.server import HTTPServer
+from urllib.error import URLError
 
 import apps.webhook.main as main_module
 import cleanarr.webhook.proxy as proxy_module
@@ -400,6 +401,47 @@ class TestProxyHandler(unittest.TestCase):
         self.assertEqual(handler.send_response.call_args[0][0], 401)
         mock_publish.assert_not_called()
         mock_forward.assert_not_called()
+
+
+class TestOidcRetryAndFormParse(unittest.TestCase):
+    @patch("cleanarr.webhook.proxy.time.sleep", return_value=None)
+    @patch("cleanarr.webhook.proxy.urlopen")
+    def test_fetch_oidc_retries_connection_refused(self, mock_urlopen, _sleep):
+        success = MagicMock()
+        success.read.return_value = b'{"access_token":"tok-1"}'
+        mock_urlopen.side_effect = [
+            URLError(ConnectionRefusedError("Connection refused")),
+            URLError(ConnectionRefusedError("Connection refused")),
+            MagicMock(__enter__=lambda inner: success, __exit__=MagicMock(return_value=False)),
+        ]
+
+        with patch.object(proxy_module, "OIDC_TOKEN_URL", "http://pocket-id/api/oidc/token"), \
+             patch.object(proxy_module, "OIDC_CLIENT_ID", "client"), \
+             patch.object(proxy_module, "OIDC_CLIENT_SECRET", "secret"):
+            token = proxy_module._fetch_oidc_access_token()
+
+        self.assertEqual(token, "tok-1")
+        self.assertEqual(mock_urlopen.call_count, 3)
+
+    def test_form_fields_urlencoded(self):
+        body = b"event=media.scrobble&payload=%7B%22ok%22%3Atrue%7D"
+        fields = proxy_module._form_fields(body, "application/x-www-form-urlencoded")
+        self.assertEqual(fields["event"], "media.scrobble")
+        self.assertEqual(fields["payload"], '{"ok":true}')
+
+    def test_form_fields_multipart(self):
+        body = (
+            b"--abc\r\n"
+            b'Content-Disposition: form-data; name="event"\r\n\r\n'
+            b"media.play\r\n"
+            b"--abc\r\n"
+            b'Content-Disposition: form-data; name="payload"\r\n\r\n'
+            b'{"librarySectionTitle":"TV"}\r\n'
+            b"--abc--\r\n"
+        )
+        fields = proxy_module._form_fields(body, "multipart/form-data; boundary=abc")
+        self.assertEqual(fields.get("event"), "media.play")
+        self.assertEqual(fields.get("payload"), '{"librarySectionTitle":"TV"}')
 
 if __name__ == "__main__":
     unittest.main()
