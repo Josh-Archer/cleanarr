@@ -144,12 +144,43 @@ def _resolve_user_key(platform: str, identifier: str) -> str:
     return identifier.strip().lower()
 
 
-def _compute_event_flags(event_name: str, action_name: str, platform: str = "plex") -> dict:
+def _is_played_to_completion(payload: dict | None) -> bool:
+    if not isinstance(payload, dict):
+        return False
+    playback = payload.get("PlaybackInfo") or payload.get("Playback")
+    candidates = []
+    if isinstance(playback, dict):
+        candidates.append(playback.get("PlayedToCompletion"))
+    candidates.append(payload.get("PlayedToCompletion"))
+    nested = payload.get("payload")
+    if isinstance(nested, dict):
+        nested_playback = nested.get("PlaybackInfo") or nested.get("Playback")
+        if isinstance(nested_playback, dict):
+            candidates.append(nested_playback.get("PlayedToCompletion"))
+        candidates.append(nested.get("PlayedToCompletion"))
+    for val in candidates:
+        if val is True:
+            return True
+        if isinstance(val, str) and val.strip().lower() in ("true", "1"):
+            return True
+        if val == 1 and not isinstance(val, bool):
+            return True
+    return False
+
+
+def _compute_event_flags(
+    event_name: str,
+    action_name: str,
+    platform: str = "plex",
+    payload: dict | None = None,
+) -> dict:
     evt = (event_name or "").lower()
     act = (action_name or "").lower()
 
     if platform == "jellyfin":
-        is_finished = evt == "itemmarkplayed" or evt == "playbackstopped"
+        is_finished = evt == "itemmarkplayed" or (
+            evt == "playbackstopped" and _is_played_to_completion(payload)
+        )
         is_removed = False # Jellyfin doesn't typically send library.remove via standard webhooks
         is_paused = evt == "playbackpaused"
         is_stopped = evt == "playbackstopped"
@@ -439,7 +470,7 @@ def _parse_jellyfin_webhook_event(body: bytes, remote_addr: str, method: str) ->
         "platform": "jellyfin",
         "event": event_name,
         "action": "",
-        **_compute_event_flags(event_name, "", platform="jellyfin"),
+        **_compute_event_flags(event_name, "", platform="jellyfin", payload=payload),
         "payload": payload,
         "account": {
             "id": payload.get("UserId"),
