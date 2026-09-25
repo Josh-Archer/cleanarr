@@ -122,6 +122,33 @@ class TestWebhookQueueMode(unittest.TestCase):
         self.assertEqual(kwargs.get('force_deletions'), True)
         self.assertEqual(args[0]['queue_message_id'], 'msg-1')
 
+    def test_process_sqs_queue_messages_defaults_to_no_force_deletions(self):
+        fake_client = _FakeSqsClient([
+            {
+                'MessageId': 'msg-1',
+                'ReceiptHandle': 'rh-1',
+                'Body': json.dumps({'event': 'media.scrobble', 'metadata': {'guid': 'plex://movie/1'}}),
+            }
+        ])
+
+        with patch.object(webhook_app, '_queue_polling_enabled', return_value=True), \
+             patch.object(webhook_app, '_get_sqs_client', return_value=fake_client), \
+             patch.object(webhook_app, 'WEBHOOK_QUEUE_URL', 'https://example.com/queue/cleanarr'), \
+             patch.object(webhook_app, '_process_webhook_event_actions') as process_actions:
+            summary = webhook_app.process_sqs_queue_messages(max_messages=1)
+
+        self.assertTrue(summary['enabled'])
+        self.assertEqual(summary['received'], 1)
+        self.assertEqual(summary['processed'], 1)
+        self.assertEqual(summary['deleted'], 1)
+        self.assertEqual(summary['failed'], 0)
+        process_actions.assert_called_once()
+
+        args, kwargs = process_actions.call_args
+        self.assertEqual(kwargs.get('async_mode'), False)
+        self.assertEqual(kwargs.get('force_deletions'), False)
+        self.assertEqual(args[0]['queue_message_id'], 'msg-1')
+
     def test_process_sqs_queue_messages_noop_when_polling_disabled(self):
         with patch.object(webhook_app, '_queue_polling_enabled', return_value=False):
             summary = webhook_app.process_sqs_queue_messages(max_messages=5)
@@ -175,6 +202,32 @@ class TestWebhookQueueMode(unittest.TestCase):
         args, kwargs = process_actions.call_args
         self.assertEqual(kwargs.get('async_mode'), False)
         self.assertEqual(kwargs.get('force_deletions'), True)
+        self.assertEqual(args[0]['queue_message_id'], 'msg-2')
+
+    def test_process_sqs_event_records_defaults_to_no_force_deletions(self):
+        records = [
+            {
+                'messageId': 'msg-2',
+                'MessageId': 'msg-2',
+                'body': json.dumps({'event': 'media.stop', 'metadata': {'guid': 'plex://episode/2'}}),
+                'Body': json.dumps({'event': 'media.stop', 'metadata': {'guid': 'plex://episode/2'}}),
+            }
+        ]
+
+        with patch.object(webhook_app, '_process_webhook_event_actions') as process_actions:
+            summary = webhook_app.process_sqs_event_records(records)
+
+        self.assertTrue(summary['enabled'])
+        self.assertEqual(summary['received'], 1)
+        self.assertEqual(summary['processed'], 1)
+        self.assertEqual(summary['deleted'], 0)
+        self.assertEqual(summary['failed'], 0)
+        self.assertEqual(summary['failed_message_ids'], [])
+        process_actions.assert_called_once()
+
+        args, kwargs = process_actions.call_args
+        self.assertEqual(kwargs.get('async_mode'), False)
+        self.assertEqual(kwargs.get('force_deletions'), False)
         self.assertEqual(args[0]['queue_message_id'], 'msg-2')
 
     def test_process_sqs_event_records_tracks_failed_message_ids(self):
