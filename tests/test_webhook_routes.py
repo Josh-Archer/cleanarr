@@ -380,3 +380,99 @@ class TestWebhookRouteSecretGate(unittest.TestCase):
 
         self.assertEqual(response.status_code, 200)
         process_actions.assert_called_once()
+
+
+class TestJellyfinWebhookPlaybackCompletion(unittest.TestCase):
+    def setUp(self):
+        self.client = webhook_app.APP.test_client()
+
+    def test_jellyfin_playback_stopped_mid_playback_is_not_finished(self):
+        payload = {
+            "NotificationType": "PlaybackStopped",
+            "ItemType": "Movie",
+            "NotificationUsername": "alice",
+            "ItemName": "Example Movie",
+            "PlayedToCompletion": False,
+        }
+
+        with patch.object(webhook_app, "JELLYFIN_WEBHOOK_SECRET", None), \
+             patch.object(webhook_app, "JELLYFIN_WEBHOOK_SECRET_PREVIOUS", None), \
+             patch.object(webhook_app, "_start_background_threads"), \
+             patch.object(webhook_app, "_queue_enqueuing_enabled", return_value=False), \
+             patch.object(webhook_app, "_process_webhook_event_actions") as process_actions:
+            response = self.client.post("/jellyfin/webhook", json=payload)
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.get_json(), {"status": "ok", "recorded": False})
+        process_actions.assert_called_once()
+        passed_event = process_actions.call_args[0][0]
+        self.assertFalse(passed_event["finished"])
+        self.assertTrue(passed_event["stopped"])
+
+    def test_jellyfin_playback_stopped_with_completion_is_finished(self):
+        payload = {
+            "NotificationType": "PlaybackStopped",
+            "ItemType": "Movie",
+            "NotificationUsername": "alice",
+            "ItemName": "Example Movie",
+            "PlayedToCompletion": True,
+        }
+
+        with patch.object(webhook_app, "JELLYFIN_WEBHOOK_SECRET", None), \
+             patch.object(webhook_app, "JELLYFIN_WEBHOOK_SECRET_PREVIOUS", None), \
+             patch.object(webhook_app, "_start_background_threads"), \
+             patch.object(webhook_app, "_queue_enqueuing_enabled", return_value=False), \
+             patch.object(webhook_app, "_process_webhook_event_actions") as process_actions:
+            response = self.client.post("/jellyfin/webhook", json=payload)
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.get_json(), {"status": "ok", "recorded": True})
+        process_actions.assert_called_once()
+        passed_event = process_actions.call_args[0][0]
+        self.assertTrue(passed_event["finished"])
+        self.assertTrue(passed_event["stopped"])
+
+    def test_jellyfin_playback_stopped_with_playbackinfo_completion_is_finished(self):
+        payload = {
+            "NotificationType": "PlaybackStopped",
+            "ItemType": "Movie",
+            "NotificationUsername": "alice",
+            "ItemName": "Example Movie",
+            "PlaybackInfo": {"PlayedToCompletion": True},
+        }
+
+        with patch.object(webhook_app, "JELLYFIN_WEBHOOK_SECRET", None), \
+             patch.object(webhook_app, "JELLYFIN_WEBHOOK_SECRET_PREVIOUS", None), \
+             patch.object(webhook_app, "_start_background_threads"), \
+             patch.object(webhook_app, "_queue_enqueuing_enabled", return_value=False), \
+             patch.object(webhook_app, "_process_webhook_event_actions") as process_actions:
+            response = self.client.post("/jellyfin/webhook", json=payload)
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.get_json(), {"status": "ok", "recorded": True})
+        process_actions.assert_called_once()
+        passed_event = process_actions.call_args[0][0]
+        self.assertTrue(passed_event["finished"])
+        self.assertTrue(passed_event["stopped"])
+
+    def test_jellyfin_playback_stopped_missing_completion_is_not_finished(self):
+        payload = {
+            "NotificationType": "PlaybackStopped",
+            "ItemType": "Movie",
+            "NotificationUsername": "alice",
+            "ItemName": "Example Movie",
+        }
+
+        with patch.object(webhook_app, "JELLYFIN_WEBHOOK_SECRET", None), \
+             patch.object(webhook_app, "JELLYFIN_WEBHOOK_SECRET_PREVIOUS", None), \
+             patch.object(webhook_app, "_start_background_threads"), \
+             patch.object(webhook_app, "_queue_enqueuing_enabled", return_value=False), \
+             patch.object(webhook_app, "_process_webhook_event_actions") as process_actions:
+            response = self.client.post("/jellyfin/webhook", json=payload)
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.get_json(), {"status": "ok", "recorded": False})
+        process_actions.assert_called_once()
+        passed_event = process_actions.call_args[0][0]
+        self.assertFalse(passed_event["finished"])
+        self.assertTrue(passed_event["stopped"])

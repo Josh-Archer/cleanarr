@@ -385,6 +385,69 @@ class TestWebhookQueueMode(unittest.TestCase):
             os.remove(report_path)
             os.environ.pop('CLEANARR_PLEX_TOKEN', None)
 
+    def test_compute_event_flags_jellyfin_playback_stopped(self):
+        ev_mid = {
+            'event': 'playbackstopped',
+            'payload': {'PlayedToCompletion': False},
+        }
+        evt, act, is_finished, is_removed, is_paused, is_stopped = webhook_app._compute_event_flags(ev_mid)
+        self.assertFalse(is_finished)
+        self.assertTrue(is_stopped)
+        self.assertFalse(is_paused)
+
+        ev_completed = {
+            'event': 'playbackstopped',
+            'payload': {'PlayedToCompletion': True},
+        }
+        evt, act, is_finished, is_removed, is_paused, is_stopped = webhook_app._compute_event_flags(ev_completed)
+        self.assertTrue(is_finished)
+        self.assertTrue(is_stopped)
+
+    def test_process_webhook_event_actions_jellyfin_mid_playback_stop_does_not_delete(self):
+        event = {
+            'event': 'playbackstopped',
+            'platform': 'jellyfin',
+            'payload': {'PlayedToCompletion': False},
+            'metadata': {'type': 'movie', 'title': 'Test Movie'},
+        }
+
+        with patch.object(webhook_app, '_background_process_finished') as cleanup, \
+             patch.object(webhook_app, '_append_event') as append_event:
+            result = webhook_app._process_webhook_event_actions(
+                event,
+                async_mode=False,
+                force_deletions=True,
+            )
+
+        self.assertFalse(result['finished'])
+        self.assertTrue(result['stopped'])
+        self.assertFalse(result['recorded'])
+        self.assertTrue(result['actionable'])
+        cleanup.assert_not_called()
+        append_event.assert_not_called()
+
+    def test_process_webhook_event_actions_jellyfin_completed_playback_triggers_delete(self):
+        event = {
+            'event': 'playbackstopped',
+            'platform': 'jellyfin',
+            'payload': {'PlayedToCompletion': True},
+            'metadata': {'type': 'movie', 'title': 'Test Movie'},
+        }
+
+        with patch.object(webhook_app, '_background_process_finished') as cleanup, \
+             patch.object(webhook_app, '_append_event') as append_event:
+            result = webhook_app._process_webhook_event_actions(
+                event,
+                async_mode=False,
+                force_deletions=True,
+            )
+
+        self.assertTrue(result['finished'])
+        self.assertTrue(result['stopped'])
+        self.assertTrue(result['recorded'])
+        cleanup.assert_called_once_with(event)
+        append_event.assert_called_once_with(event)
+
 
 if __name__ == '__main__':
     unittest.main()

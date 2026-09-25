@@ -600,6 +600,30 @@ def _enqueue_webhook_event(ev: dict) -> bool:
         return False
 
 
+def _is_played_to_completion(payload: dict | None) -> bool:
+    if not isinstance(payload, dict):
+        return False
+    playback = payload.get("PlaybackInfo") or payload.get("Playback")
+    candidates = []
+    if isinstance(playback, dict):
+        candidates.append(playback.get("PlayedToCompletion"))
+    candidates.append(payload.get("PlayedToCompletion"))
+    nested = payload.get("payload")
+    if isinstance(nested, dict):
+        nested_playback = nested.get("PlaybackInfo") or nested.get("Playback")
+        if isinstance(nested_playback, dict):
+            candidates.append(nested_playback.get("PlayedToCompletion"))
+        candidates.append(nested.get("PlayedToCompletion"))
+    for val in candidates:
+        if val is True:
+            return True
+        if isinstance(val, str) and val.strip().lower() in ("true", "1"):
+            return True
+        if val == 1 and not isinstance(val, bool):
+            return True
+    return False
+
+
 def _compute_event_flags(ev: dict):
     evt = (ev.get('event') or '').lower() if ev.get('event') else ''
     act = (ev.get('action') or '').lower() if ev.get('action') else ''
@@ -607,16 +631,24 @@ def _compute_event_flags(ev: dict):
     is_finished = False
     is_removed = False
 
+    payload = ev.get('payload') if isinstance(ev.get('payload'), dict) else ev
+    played_to_completion = _is_played_to_completion(payload)
+
     # Only treat explicit watched events as finished.
     # Do not infer watched state from media.play/media.stop to avoid accidental promotion.
     # Also support Tautulli 'mark_watched' action.
-    if evt == 'media.scrobble' or act == 'mark_watched' or evt in ('itemmarkplayed', 'playbackstopped'):
+    if (
+        evt in ('media.scrobble', 'itemmarkplayed', 'item.markplayed', 'item.markwatched', 'library.markplayed')
+        or act == 'mark_watched'
+    ):
         is_finished = True
+    elif evt in ('playbackstopped', 'playback.stop', 'playback.stopped'):
+        is_finished = played_to_completion
     elif evt == 'library.remove':
         is_removed = True
 
-    is_paused = (evt == 'media.pause')
-    is_stopped = (evt == 'media.stop')
+    is_paused = evt in ('media.pause', 'playbackpaused', 'playback.pause', 'playback.paused')
+    is_stopped = evt in ('media.stop', 'playbackstopped', 'playback.stop', 'playback.stopped')
 
     ev['finished'] = bool(is_finished)
     ev['removed'] = bool(is_removed)
@@ -1143,9 +1175,12 @@ def jellyfin_webhook():
     }
 
     # Compute flags for Jellyfin
-    is_finished = event_name.lower() in ("itemmarkplayed", "playbackstopped")
-    is_paused = event_name.lower() == "playbackpaused"
-    is_stopped = event_name.lower() == "playbackstopped"
+    evt_lower = event_name.lower()
+    is_finished = evt_lower == "itemmarkplayed" or (
+        evt_lower == "playbackstopped" and _is_played_to_completion(payload)
+    )
+    is_paused = evt_lower == "playbackpaused"
+    is_stopped = evt_lower == "playbackstopped"
     
     ev["finished"] = is_finished
     ev["removed"] = False

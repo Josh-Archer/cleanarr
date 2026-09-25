@@ -443,5 +443,64 @@ class TestOidcRetryAndFormParse(unittest.TestCase):
         self.assertEqual(fields.get("event"), "media.play")
         self.assertEqual(fields.get("payload"), '{"librarySectionTitle":"TV"}')
 
+
+class TestJellyfinProxyParse(unittest.TestCase):
+    def test_parse_jellyfin_playback_stopped_mid_playback(self):
+        body = b"""{
+            "NotificationType": "PlaybackStopped",
+            "NotificationUsername": "alice",
+            "ItemName": "Movie",
+            "ItemType": "Movie",
+            "PlayedToCompletion": false
+        }"""
+        event = proxy_module._parse_jellyfin_webhook_event(body, "127.0.0.1", "POST")
+        self.assertEqual(event["platform"], "jellyfin")
+        self.assertFalse(event["finished"])
+        self.assertTrue(event["stopped"])
+        self.assertFalse(event["recorded"])
+        self.assertTrue(event["actionable"])
+
+    def test_parse_jellyfin_playback_stopped_with_completion(self):
+        body = b"""{
+            "NotificationType": "PlaybackStopped",
+            "NotificationUsername": "alice",
+            "ItemName": "Movie",
+            "ItemType": "Movie",
+            "PlayedToCompletion": true
+        }"""
+        event = proxy_module._parse_jellyfin_webhook_event(body, "127.0.0.1", "POST")
+        self.assertEqual(event["platform"], "jellyfin")
+        self.assertTrue(event["finished"])
+        self.assertTrue(event["stopped"])
+        self.assertTrue(event["recorded"])
+        self.assertTrue(event["actionable"])
+
+    def test_parse_jellyfin_playback_stopped_with_playbackinfo_completion(self):
+        body = b"""{
+            "NotificationType": "PlaybackStopped",
+            "NotificationUsername": "alice",
+            "ItemName": "Movie",
+            "ItemType": "Movie",
+            "PlaybackInfo": {"PlayedToCompletion": true}
+        }"""
+        event = proxy_module._parse_jellyfin_webhook_event(body, "127.0.0.1", "POST")
+        self.assertEqual(event["platform"], "jellyfin")
+        self.assertTrue(event["finished"])
+        self.assertTrue(event["stopped"])
+
+    def test_parse_jellyfin_item_mark_played(self):
+        body = b"""{
+            "NotificationType": "ItemMarkPlayed",
+            "NotificationUsername": "alice",
+            "ItemName": "Movie",
+            "ItemType": "Movie"
+        }"""
+        event = proxy_module._parse_jellyfin_webhook_event(body, "127.0.0.1", "POST")
+        self.assertEqual(event["platform"], "jellyfin")
+        self.assertTrue(event["finished"])
+        self.assertFalse(event["stopped"])
+        self.assertTrue(event["recorded"])
+
+
 if __name__ == "__main__":
     unittest.main()
