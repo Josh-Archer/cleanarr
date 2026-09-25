@@ -64,11 +64,49 @@ class TestLambdaConsumer(unittest.TestCase):
                 None,
             )
 
-        process_records.assert_called_once()
+        process_records.assert_called_once_with(
+            [{"messageId": "msg-1"}, {"messageId": "msg-2"}]
+        )
         self.assertEqual(
             response,
             {"batchItemFailures": [{"itemIdentifier": "msg-2"}]},
         )
+
+    def test_lambda_handler_sqs_records_does_not_delete_when_deletions_disabled(self):
+        record = {
+            "messageId": "msg-1",
+            "body": json.dumps({
+                "event": "media.scrobble",
+                "metadata": {"type": "episode", "ratingKey": "123"},
+                "account": {"title": "alice"},
+            }),
+        }
+        event = {"Records": [record]}
+        with patch.object(webhook_app, "ENABLE_WEBHOOK_DELETIONS", False), \
+             patch.object(webhook_app, "_append_event"), \
+             patch.object(webhook_app, "_background_process_finished") as process_finished:
+            response = lambda_main.lambda_handler(event, None)
+
+        self.assertEqual(response, {"batchItemFailures": []})
+        process_finished.assert_not_called()
+
+    def test_lambda_handler_sqs_records_deletes_when_deletions_enabled(self):
+        record = {
+            "messageId": "msg-1",
+            "body": json.dumps({
+                "event": "media.scrobble",
+                "metadata": {"type": "episode", "ratingKey": "123"},
+                "account": {"title": "alice"},
+            }),
+        }
+        event = {"Records": [record]}
+        with patch.object(webhook_app, "ENABLE_WEBHOOK_DELETIONS", True), \
+             patch.object(webhook_app, "_append_event"), \
+             patch.object(webhook_app, "_background_process_finished") as process_finished:
+            response = lambda_main.lambda_handler(event, None)
+
+        self.assertEqual(response, {"batchItemFailures": []})
+        process_finished.assert_called_once()
 
     def test_lambda_handler_runs_scheduled_cleanup_without_records(self):
         """EventBridge/manual invokes with no SQS payload run full library cleanup."""
@@ -144,9 +182,26 @@ class TestLambdaConsumer(unittest.TestCase):
         }
         with patch.object(webhook_app, "ENABLE_WEBHOOK_DELETIONS", True), \
              patch.object(webhook_app, "_get_media_cleanup", return_value=None):
-            summary = webhook_app.process_sqs_event_records([record], force_deletions=True)
+            summary = webhook_app.process_sqs_event_records([record])
             self.assertEqual(summary["failed"], 1)
             self.assertEqual(summary["failed_message_ids"], ["msg-fail-1"])
+
+    def test_sqs_processing_records_skips_deletion_when_webhook_deletions_disabled(self):
+        record = {
+            "messageId": "msg-nodelete-1",
+            "body": json.dumps({
+                "event": "media.scrobble",
+                "metadata": {"type": "episode", "ratingKey": "999"},
+                "account": {"title": "user1"},
+            }),
+        }
+        with patch.object(webhook_app, "ENABLE_WEBHOOK_DELETIONS", False), \
+             patch.object(webhook_app, "_append_event"), \
+             patch.object(webhook_app, "_background_process_finished") as process_finished:
+            summary = webhook_app.process_sqs_event_records([record])
+            self.assertEqual(summary["failed"], 0)
+            self.assertEqual(summary["processed"], 1)
+            process_finished.assert_not_called()
 
 class TestScheduledRuntimeBoundary(unittest.TestCase):
     def test_job_main_does_not_poll_webhook_queue(self):

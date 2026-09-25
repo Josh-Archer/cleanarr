@@ -740,7 +740,7 @@ def _process_webhook_event_actions(ev: dict, async_mode: bool = True, force_dele
     }
 
 
-def process_sqs_queue_messages(max_messages: int | None = None, force_deletions: bool = True):
+def process_sqs_queue_messages(max_messages: int | None = None, force_deletions: bool = False):
     """Poll and process queued webhook events.
 
     Returns a summary dictionary suitable for logging and diagnostics.
@@ -803,7 +803,7 @@ def process_sqs_queue_messages(max_messages: int | None = None, force_deletions:
     return summary
 
 
-def _process_sqs_message(message: dict, force_deletions: bool = True):
+def _process_sqs_message(message: dict, force_deletions: bool = False):
     body = message.get('Body') or message.get('body') or '{}'
     parsed = json.loads(body)
     if isinstance(parsed, dict) and isinstance(parsed.get('webhook_event'), dict):
@@ -816,7 +816,7 @@ def _process_sqs_message(message: dict, force_deletions: bool = True):
     return parsed
 
 
-def process_sqs_event_records(records, force_deletions: bool = True):
+def process_sqs_event_records(records, force_deletions: bool = False):
     """Process SQS event source mapping records delivered to Lambda."""
     summary = {
         'enabled': True,

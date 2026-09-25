@@ -102,7 +102,7 @@ def lambda_handler(event, context):
         )
         records = event.get("Records") if isinstance(event, dict) else None
         if records:
-            queue_summary = process_sqs_event_records(records, force_deletions=True)
+            queue_summary = process_sqs_event_records(records)
             failed_message_ids = queue_summary.get("failed_message_ids") or []
             if failed_message_ids:
                 logger.warning(
