@@ -1131,14 +1131,13 @@ def jellyfin_webhook():
         },
         "metadata": {
             "guid": guid,
-            "title": payload.get("ItemName") or payload.get("Name"),
+            "title": html.unescape(payload.get("ItemName") or payload.get("Name") or ""),
             "type": "episode" if mtype in ("episode", "series") else "movie" if mtype == "movie" else mtype,
             "index": payload.get("IndexNumber") or payload.get("EpisodeNumber"),
             "parentIndex": payload.get("ParentIndexNumber") or payload.get("SeasonNumber"),
             "year": payload.get("Year") or payload.get("ProductionYear"),
             "parentTitle": html.unescape(payload.get("SeriesName") or ""),
             "grandparentTitle": html.unescape(payload.get("SeriesName") or ""),
-            "title": html.unescape(payload.get("Name") or ""),
             "path": payload.get("Path") or payload.get("path") or payload.get("ItemPath") or payload.get("MediaPath") or "",
         }
     }

@@ -161,6 +161,99 @@ class TestWebhookRouteSecretGate(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.get_json().get("status"), "ok")
         process_actions.assert_called_once()
+        ev = process_actions.call_args[0][0]
+        self.assertEqual(ev["metadata"]["title"], "Example Movie")
+
+    def test_jellyfin_webhook_stores_title_when_only_item_name_is_set(self):
+        payload = {
+            "NotificationType": "ItemMarkPlayed",
+            "ItemType": "Movie",
+            "NotificationUsername": "alice",
+            "ItemName": "Rick &amp; Morty: The Movie",
+        }
+
+        with patch.object(
+            webhook_app, "JELLYFIN_WEBHOOK_SECRET", None
+        ), patch.object(
+            webhook_app, "_start_background_threads"
+        ), patch.object(
+            webhook_app, "_queue_enqueuing_enabled", return_value=False
+        ), patch.object(
+            webhook_app,
+            "_process_webhook_event_actions",
+            return_value={"recorded": True},
+        ) as process_actions:
+            response = self.client.post(
+                "/jellyfin/webhook",
+                json=payload,
+            )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.get_json().get("status"), "ok")
+        process_actions.assert_called_once()
+        ev = process_actions.call_args[0][0]
+        self.assertEqual(ev["metadata"]["title"], "Rick & Morty: The Movie")
+
+    def test_jellyfin_webhook_stores_title_when_only_name_is_set(self):
+        payload = {
+            "NotificationType": "ItemMarkPlayed",
+            "ItemType": "Movie",
+            "NotificationUsername": "alice",
+            "Name": "Rick &amp; Morty: The Movie",
+        }
+
+        with patch.object(
+            webhook_app, "JELLYFIN_WEBHOOK_SECRET", None
+        ), patch.object(
+            webhook_app, "_start_background_threads"
+        ), patch.object(
+            webhook_app, "_queue_enqueuing_enabled", return_value=False
+        ), patch.object(
+            webhook_app,
+            "_process_webhook_event_actions",
+            return_value={"recorded": True},
+        ) as process_actions:
+            response = self.client.post(
+                "/jellyfin/webhook",
+                json=payload,
+            )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.get_json().get("status"), "ok")
+        process_actions.assert_called_once()
+        ev = process_actions.call_args[0][0]
+        self.assertEqual(ev["metadata"]["title"], "Rick & Morty: The Movie")
+
+    def test_jellyfin_webhook_prefers_item_name_over_name(self):
+        payload = {
+            "NotificationType": "ItemMarkPlayed",
+            "ItemType": "Movie",
+            "NotificationUsername": "alice",
+            "ItemName": "Item Title",
+            "Name": "Name Title",
+        }
+
+        with patch.object(
+            webhook_app, "JELLYFIN_WEBHOOK_SECRET", None
+        ), patch.object(
+            webhook_app, "_start_background_threads"
+        ), patch.object(
+            webhook_app, "_queue_enqueuing_enabled", return_value=False
+        ), patch.object(
+            webhook_app,
+            "_process_webhook_event_actions",
+            return_value={"recorded": True},
+        ) as process_actions:
+            response = self.client.post(
+                "/jellyfin/webhook",
+                json=payload,
+            )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.get_json().get("status"), "ok")
+        process_actions.assert_called_once()
+        ev = process_actions.call_args[0][0]
+        self.assertEqual(ev["metadata"]["title"], "Item Title")
 
     def test_plex_webhook_rejects_invalid_token(self):
         with patch.object(
