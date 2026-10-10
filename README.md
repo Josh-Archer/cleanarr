@@ -187,7 +187,7 @@ The full configuration contract is documented in [docs/configuration.md](./docs/
 | `CLEANARR_REMOVE_ORPHAN_INCOMPLETE_DOWNLOADS` | mirrors `CLEANARR_REMOVE_FAILED_DOWNLOADS` | Deletes orphaned entries from Transmission's incomplete directory when no active torrent still owns them. |
 | `CLEANARR_REMOVE_STALE_TORRENTS` | `true` | Removes stale torrents based on age and activity checks. |
 | `CLEANARR_STALE_TORRENT_HOURS` | `8` | Age threshold for stale torrent cleanup. |
-| `CLEANARR_STALE_TORRENT_REQUIRE_IMPORT` | `false` | In opt-in mode, remove only complete, stopped, old torrents whose exact release title appears in the owning Arr app's import history. Requires that app's API URL/key; missing or unavailable history fails closed. Removes the Transmission record but preserves downloaded data. |
+| `CLEANARR_STALE_TORRENT_REQUIRE_IMPORT` | `false` | In opt-in mode, remove only complete, stopped, old torrents whose exact download hash or release title appears in the owning Arr app's import history. Requires that app's API URL/key; missing or unavailable history fails closed. Removes the Transmission record but preserves downloaded data. |
 | `CLEANARR_TORRENT_CLEANUP_ALLOWED_CATEGORIES` | unset | Comma-separated Transmission download-dir category names allowed for torrent removal, such as `sonarr,radarr,readarr,lidarr`. When unset, Cleanarr keeps current behavior and may clean any category. |
 | `CLEANARR_TRANSMISSION_IO_ERROR_CLEANUP_ENABLED` | `false` | Enables repeated Transmission I/O error cleanup logic. |
 | `CLEANARR_TRANSMISSION_IO_ERROR_THRESHOLD` | `3` | Number of repeated I/O errors before action is taken. |
@@ -357,7 +357,7 @@ Cleanarr is built for setups where Plex or Jellyfin is the source of truth for w
 | `CLEANARR_REMOVE_ORPHAN_INCOMPLETE_DOWNLOADS` | mirrors `CLEANARR_REMOVE_FAILED_DOWNLOADS` | Deletes orphaned entries from Transmission's incomplete directory when no active torrent still owns them. |
 | `CLEANARR_REMOVE_STALE_TORRENTS` | `true` | Removes stale torrents based on age and activity checks. |
 | `CLEANARR_STALE_TORRENT_HOURS` | `8` | Age threshold for stale torrent cleanup. |
-| `CLEANARR_STALE_TORRENT_REQUIRE_IMPORT` | `false` | In opt-in mode, remove only complete, stopped, old torrents whose exact release title appears in the owning Arr app's import history. Requires that app's API URL/key; missing or unavailable history fails closed. Removes the Transmission record but preserves downloaded data. |
+| `CLEANARR_STALE_TORRENT_REQUIRE_IMPORT` | `false` | In opt-in mode, remove only complete, stopped, old torrents whose exact download hash or release title appears in the owning Arr app's import history. Requires that app's API URL/key; missing or unavailable history fails closed. Removes the Transmission record but preserves downloaded data. |
 | `CLEANARR_TORRENT_CLEANUP_ALLOWED_CATEGORIES` | unset | Comma-separated Transmission download-dir category names allowed for torrent removal, such as `sonarr,radarr,readarr,lidarr`. When unset, Cleanarr keeps current behavior and may clean any category. |
 | `CLEANARR_TRANSMISSION_IO_ERROR_CLEANUP_ENABLED` | `false` | Enables repeated Transmission I/O error cleanup logic. |
 | `CLEANARR_TRANSMISSION_IO_ERROR_THRESHOLD` | `3` | Number of repeated I/O errors before action is taken. |

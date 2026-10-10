@@ -1852,13 +1852,14 @@ class MediaCleanup:
             logger.error(f"Error cleaning failed downloads: {e}")
             self._record_summary("errors", f"failed download cleanup error: {e}")
 
-    def _arr_import_history_contains(self, app, title, added_date):
+    def _arr_import_history_contains(self, app, title, added_date, download_id=None):
         """Check an Arr import history for one release title, failing closed."""
         caches = getattr(self, "_stale_torrent_import_history", None)
         if caches is None:
             caches = self._stale_torrent_import_history = {}
         state = caches.setdefault(app, {
             "titles": set(),
+            "download_ids": set(),
             "page": 1,
             "oldest_date": None,
             "total_records": None,
@@ -1866,7 +1867,8 @@ class MediaCleanup:
             "unavailable": False,
         })
         normalized_title = str(title or "").strip().casefold()
-        if normalized_title in state["titles"]:
+        normalized_id = str(download_id or "").strip().casefold()
+        if normalized_title in state["titles"] or normalized_id in state["download_ids"]:
             return True
         if state["unavailable"]:
             return None
@@ -1910,6 +1912,9 @@ class MediaCleanup:
                 ):
                     continue
 
+                event_id = event.get("downloadId")
+                if isinstance(event_id, str) and event_id.strip():
+                    state["download_ids"].add(event_id.strip().casefold())
                 source_title = event.get("sourceTitle")
                 event_data = event.get("data")
                 if isinstance(event_data, str):
@@ -1943,7 +1948,7 @@ class MediaCleanup:
             else:
                 state["page"] += 1
 
-            if normalized_title in state["titles"]:
+            if normalized_title in state["titles"] or normalized_id in state["download_ids"]:
                 return True
             if state["oldest_date"] and state["oldest_date"] < oldest_relevant_date:
                 return False
@@ -1961,7 +1966,9 @@ class MediaCleanup:
         for app in ("sonarr", "radarr", "lidarr"):
             if app not in labels:
                 continue
-            imported = self._arr_import_history_contains(app, torrent_title, added_date)
+            imported = self._arr_import_history_contains(
+                app, torrent_title, added_date, getattr(torrent, "hash_string", None)
+            )
             if imported is True:
                 return True
         return False
