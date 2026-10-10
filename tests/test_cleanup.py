@@ -919,6 +919,95 @@ class TestMediaCleanup(unittest.TestCase):
         self.cleanup.remove_stale_torrents()
         self.cleanup.transmission.remove_torrent.assert_not_called()
 
+    def test_import_verified_stale_cleanup_removes_only_matched_imports(self):
+        cleanarr.CONFIG.update({
+            "stale_torrent_require_import": True,
+            "stale_torrent_hours": 24,
+            "torrent_cleanup_required_labels": {"sonarr"},
+            "torrent_cleanup_allowed_categories": {"sonarr"},
+        })
+        imported = self._make_torrent(
+            torrent_id=305,
+            name="Example.Show.S01E01.1080p",
+            download_dir="/media/downloads/sonarr",
+            labels=["sonarr"],
+            added_hours_ago=48,
+            percent_done=1.0,
+            status=0,
+            peers_connected=0,
+        )
+        unmatched = self._make_torrent(
+            torrent_id=306,
+            name="Never.Imported.Show.S01E01",
+            download_dir="/media/downloads/sonarr",
+            labels=["sonarr"],
+            added_hours_ago=48,
+            percent_done=1.0,
+            status=0,
+            peers_connected=0,
+        )
+        self.cleanup.transmission.get_torrents.return_value = [imported, unmatched]
+
+        with patch.object(
+            self.cleanup,
+            "_stale_torrent_has_arr_import",
+            side_effect=lambda torrent, _added_date: torrent.id == imported.id,
+        ):
+            self.cleanup.remove_stale_torrents()
+
+        self.cleanup.transmission.remove_torrent.assert_called_once_with(305, delete_data=False)
+
+    def test_import_verified_stale_cleanup_keeps_incomplete_torrent(self):
+        cleanarr.CONFIG.update({
+            "stale_torrent_require_import": True,
+            "stale_torrent_hours": 24,
+            "torrent_cleanup_required_labels": {"sonarr"},
+            "torrent_cleanup_allowed_categories": {"sonarr"},
+        })
+        incomplete = self._make_torrent(
+            torrent_id=307,
+            name="Still.Downloading.Show.S01E01",
+            download_dir="/media/downloads/sonarr",
+            labels=["sonarr"],
+            added_hours_ago=48,
+            percent_done=0.8,
+            status=0,
+            peers_connected=0,
+        )
+        self.cleanup.transmission.get_torrents.return_value = [incomplete]
+
+        with patch.object(self.cleanup, "_stale_torrent_has_arr_import") as imported:
+            self.cleanup.remove_stale_torrents()
+
+        imported.assert_not_called()
+        self.cleanup.transmission.remove_torrent.assert_not_called()
+
+    def test_arr_import_history_matches_only_import_events(self):
+        history = {
+            "totalRecords": 2,
+            "records": [
+                {"eventType": 3, "sourceTitle": "  Example.Show.S01E01.1080p  "},
+                {"eventType": 1, "sourceTitle": "Grabbed.But.Not.Imported"},
+                {"eventType": 7, "sourceTitle": "Ignored.Not.Imported"},
+            ],
+        }
+        added_date = datetime.now(timezone.utc) - timedelta(hours=48)
+        with patch.object(self.cleanup, "_sonarr_request", return_value=history) as request:
+            imported = self.cleanup._arr_import_history_contains(
+                "sonarr", "Example.Show.S01E01.1080p", added_date
+            )
+
+        self.assertTrue(imported)
+        request.assert_called_once()
+        self.assertIn("eventType=3", request.call_args.args[0])
+
+    def test_arr_import_history_failure_is_unknown_not_empty_success(self):
+        added_date = datetime.now(timezone.utc) - timedelta(hours=48)
+        with patch.object(self.cleanup, "_radarr_request", return_value=None):
+            self.assertIsNone(
+                self.cleanup._arr_import_history_contains("radarr", "Movie.Release", added_date)
+            )
+
     def test_clean_failed_downloads_skips_unlabelled_when_labels_required(self):
         """Failed-download cleanup must skip torrents that lack the required label."""
         cleanarr.CONFIG["torrent_cleanup_required_labels"] = {"sonarr"}
