@@ -320,6 +320,10 @@ CONFIG = {
     "log_file": _get_env("CLEANARR_LOG_FILE", default="/logs/plex-cleanup.log"),
     "debug": _env_flag("CLEANARR_DEBUG", default="true"),
     "stale_torrent_hours": int(_get_env("CLEANARR_STALE_TORRENT_HOURS", default="8")),
+    "stale_torrent_require_import": _env_flag(
+        "CLEANARR_STALE_TORRENT_REQUIRE_IMPORT",
+        default="false",
+    ),
     "dry_run": _env_flag("CLEANARR_DRY_RUN", default="false"),
     "dry_run_report_dir": _get_env(
         "CLEANARR_DRY_RUN_REPORT_DIR",
@@ -905,9 +909,12 @@ class MediaCleanup:
             return None
         url = urljoin(CONFIG["sonarr"]["baseurl"], endpoint)
         # Use session but ensure API key is present (headers.update merges)
-        self.sonarr_session.headers.update({"X-Api-Key": CONFIG["sonarr"]["apikey"]})
+        session = getattr(self, "sonarr_session", None)
+        if session is None:
+            session = self.sonarr_session = requests.Session()
+        session.headers.update({"X-Api-Key": CONFIG["sonarr"]["apikey"]})
 
-        return self._arr_request("Sonarr", self.sonarr_session, url, endpoint, method, data)
+        return self._arr_request("Sonarr", session, url, endpoint, method, data)
 
     def _radarr_request(self, endpoint, method="GET", data=None):
         """Make a request to the Radarr API."""
@@ -915,9 +922,12 @@ class MediaCleanup:
             logger.error("Missing Radarr API key. Set CLEANARR_RADARR_APIKEY.")
             return None
         url = urljoin(CONFIG["radarr"]["baseurl"], endpoint)
-        self.radarr_session.headers.update({"X-Api-Key": CONFIG["radarr"]["apikey"]})
+        session = getattr(self, "radarr_session", None)
+        if session is None:
+            session = self.radarr_session = requests.Session()
+        session.headers.update({"X-Api-Key": CONFIG["radarr"]["apikey"]})
 
-        return self._arr_request("Radarr", self.radarr_session, url, endpoint, method, data)
+        return self._arr_request("Radarr", session, url, endpoint, method, data)
 
     def _arr_request(self, service_name, session, url, endpoint, method="GET", data=None):
         """Make an ARR API request with light retrying for edge and upstream flakiness."""
@@ -1842,6 +1852,120 @@ class MediaCleanup:
             logger.error(f"Error cleaning failed downloads: {e}")
             self._record_summary("errors", f"failed download cleanup error: {e}")
 
+    def _arr_import_history_contains(self, app, title, added_date):
+        """Check an Arr import history for one release title, failing closed."""
+        caches = getattr(self, "_stale_torrent_import_history", None)
+        if caches is None:
+            caches = self._stale_torrent_import_history = {}
+        state = caches.setdefault(app, {
+            "titles": set(),
+            "page": 1,
+            "oldest_date": None,
+            "total_records": None,
+            "exhausted": False,
+            "unavailable": False,
+        })
+        normalized_title = str(title or "").strip().casefold()
+        if normalized_title in state["titles"]:
+            return True
+        if state["unavailable"]:
+            return None
+
+        requesters = {
+            "sonarr": self._sonarr_request,
+            "radarr": self._radarr_request,
+            "lidarr": self._lidarr_request,
+        }
+        request = requesters.get(app)
+        if request is None:
+            return None
+
+        page_size = 100
+        oldest_relevant_date = added_date - timedelta(days=1)
+        while state["page"] <= 100 and not state["exhausted"]:
+            if state["oldest_date"] and state["oldest_date"] < oldest_relevant_date:
+                return False
+            page = state["page"]
+            response = request(
+                f"history?eventType=3&page={page}&pageSize={page_size}"
+                "&sortKey=date&sortDirection=descending"
+            )
+            if not isinstance(response, dict) or not isinstance(response.get("records"), list):
+                logger.warning(f"{app.title()} import history unavailable; stale torrent cleanup will skip this app")
+                state["unavailable"] = True
+                return None
+
+            records = response["records"]
+            for event in records:
+                event_type = event.get("eventType")
+                event_type_name = str(event_type or "").replace("_", "").casefold()
+                # Arr API event type 3 is DownloadFolderImported. Querying it
+                # server-side keeps large histories bounded and excludes
+                # DownloadIgnored (event type 7).
+                if event_type != 3 and event_type_name not in (
+                    "downloadfolderimported",
+                    "downloadimported",
+                    "moviefolderimported",
+                    "trackfileimported",
+                ):
+                    continue
+
+                source_title = event.get("sourceTitle")
+                event_data = event.get("data")
+                if isinstance(event_data, str):
+                    try:
+                        event_data = json.loads(event_data)
+                    except (TypeError, ValueError):
+                        event_data = None
+                if not source_title and isinstance(event_data, dict):
+                    source_title = event_data.get("sourceTitle")
+                if isinstance(source_title, str) and source_title.strip():
+                    state["titles"].add(source_title.strip().casefold())
+
+                event_date = event.get("date")
+                if isinstance(event_date, str):
+                    try:
+                        parsed_date = datetime.fromisoformat(event_date.replace("Z", "+00:00"))
+                        if parsed_date.tzinfo is None:
+                            parsed_date = parsed_date.replace(tzinfo=timezone.utc)
+                        parsed_date = parsed_date.astimezone(timezone.utc)
+                        if state["oldest_date"] is None or parsed_date < state["oldest_date"]:
+                            state["oldest_date"] = parsed_date
+                    except ValueError:
+                        pass
+
+            total_records = response.get("totalRecords")
+            state["total_records"] = total_records
+            if not records or len(records) < page_size:
+                state["exhausted"] = True
+            elif isinstance(total_records, int) and page * page_size >= total_records:
+                state["exhausted"] = True
+            else:
+                state["page"] += 1
+
+            if normalized_title in state["titles"]:
+                return True
+            if state["oldest_date"] and state["oldest_date"] < oldest_relevant_date:
+                return False
+
+        return False
+
+    def _stale_torrent_has_arr_import(self, torrent, added_date):
+        """Check the import history for the Arr identified by the torrent label."""
+        labels = {
+            str(label).strip().casefold()
+            for label in (getattr(torrent, "labels", None) or [])
+            if str(label).strip()
+        }
+        torrent_title = str(getattr(torrent, "name", "") or "").strip().casefold()
+        for app in ("sonarr", "radarr", "lidarr"):
+            if app not in labels:
+                continue
+            imported = self._arr_import_history_contains(app, torrent_title, added_date)
+            if imported is True:
+                return True
+        return False
+
     def remove_stale_torrents(self):
         """Remove stale torrents from Transmission."""
         if CONFIG.get("disable_torrent_cleanup", False) or not self.transmission:
@@ -1898,6 +2022,35 @@ class MediaCleanup:
 
                     # Log torrent details for debugging
                     logger.debug(f"Torrent {torrent.name}: Age = {age}, Percent Done = {torrent.percent_done * 100:.1f}%, Download Rate = {torrent.rate_download} B/s, Status = {torrent.status}")
+
+                    if CONFIG.get("stale_torrent_require_import", False):
+                        # In import-verified mode, do not infer that old or idle
+                        # means disposable. Require a complete, stopped torrent
+                        # and an exact release-title match in the owning Arr's
+                        # import history before removing its Transmission record.
+                        if not is_complete or torrent.status != 0 or age <= stale_threshold:
+                            logger.debug(
+                                f"Keeping torrent {torrent.name}: import-verified cleanup requires "
+                                "a completed, stopped torrent older than the stale threshold"
+                            )
+                            continue
+                        if not self._stale_torrent_has_arr_import(torrent, added_date):
+                            logger.info(
+                                f"Keeping stale torrent {torrent.name}: no matching Arr import history"
+                            )
+                            continue
+                        if CONFIG["dry_run"]:
+                            logger.info(
+                                f"[DRY RUN] Would remove imported stale torrent record (keep data): "
+                                f"{torrent.name} (ID: {torrent.id})"
+                            )
+                            continue
+                        logger.info(
+                            f"Removing imported stale torrent record: {torrent.name} "
+                            f"(ID: {torrent.id}, Age: {age})"
+                        )
+                        self.transmission.remove_torrent(torrent.id, delete_data=False)
+                        continue
 
                     # Skip torrents that are actively downloading or queued
                     if is_downloading:
@@ -2451,8 +2604,11 @@ class MediaCleanup:
             logger.error("Missing Lidarr API key. Set CLEANARR_LIDARR_APIKEY.")
             return None
         url = urljoin(CONFIG["lidarr"]["baseurl"], endpoint)
-        self.lidarr_session.headers.update({"X-Api-Key": CONFIG["lidarr"]["apikey"]})
-        return self._arr_request("Lidarr", self.lidarr_session, url, endpoint, method, data)
+        session = getattr(self, "lidarr_session", None)
+        if session is None:
+            session = self.lidarr_session = requests.Session()
+        session.headers.update({"X-Api-Key": CONFIG["lidarr"]["apikey"]})
+        return self._arr_request("Lidarr", session, url, endpoint, method, data)
 
     def get_lidarr_tags(self):
         """Get all tags from Lidarr. Returns None on error."""
@@ -3050,4 +3206,3 @@ if __name__ == "__main__":
     cleaner = MediaCleanup()
     result = cleaner.run()
     sys.exit(result.exit_code())
-
