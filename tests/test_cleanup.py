@@ -5,6 +5,7 @@ import sys
 import os
 import tempfile
 import requests
+from transmission_rpc import Torrent as RpcTorrent
 
 # Ensure we can import the local package
 repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -956,6 +957,27 @@ class TestMediaCleanup(unittest.TestCase):
             self.cleanup.remove_stale_torrents()
 
         self.cleanup.transmission.remove_torrent.assert_called_once_with(305, delete_data=False)
+
+    def test_import_verified_cleanup_uses_real_transmission_status(self):
+        cleanarr.CONFIG.update({
+            "stale_torrent_require_import": True,
+            "stale_torrent_hours": 24,
+            "torrent_cleanup_required_labels": {"sonarr"},
+            "torrent_cleanup_allowed_categories": {"sonarr"},
+        })
+        fields = {
+            "id": 308, "name": "Example.Show.S01E01", "status": 0,
+            "addedDate": int((datetime.now(timezone.utc) - timedelta(hours=48)).timestamp()),
+            "percentDone": 1.0, "rateDownload": 0,
+            "downloadDir": "/media/downloads/sonarr", "labels": ["sonarr"],
+        }
+        stopped = RpcTorrent(fields=fields)
+        active = RpcTorrent(fields=dict(fields, id=309, status=6))
+        self.assertEqual(stopped.status, "stopped")
+        self.cleanup.transmission.get_torrents.return_value = [stopped, active]
+        with patch.object(self.cleanup, "_stale_torrent_has_arr_import", return_value=True):
+            self.cleanup.remove_stale_torrents()
+        self.cleanup.transmission.remove_torrent.assert_called_once_with(308, delete_data=False)
 
     def test_import_verified_stale_cleanup_keeps_incomplete_torrent(self):
         cleanarr.CONFIG.update({
