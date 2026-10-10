@@ -1023,6 +1023,19 @@ class TestMediaCleanup(unittest.TestCase):
         request.assert_called_once()
         self.assertIn("eventType=3", request.call_args.args[0])
 
+    def test_arr_import_history_matches_hash_when_import_title_differs(self):
+        added_date = datetime.now(timezone.utc) - timedelta(days=2)
+        event = {"eventType": "downloadFolderImported", "sourceTitle": "Episode.File", "downloadId": "A" * 40}
+        with patch.object(self.cleanup, "_sonarr_request", return_value={"records": [event], "totalRecords": 1}):
+            self.assertTrue(self.cleanup._arr_import_history_contains("sonarr", "Season.Pack", added_date, "a" * 40))
+            self.assertFalse(self.cleanup._arr_import_history_contains("sonarr", "Other.Pack", added_date, "b" * 40))
+
+    def test_matching_hash_in_ignored_event_does_not_qualify(self):
+        added_date = datetime.now(timezone.utc) - timedelta(days=2)
+        event = {"eventType": "downloadIgnored", "sourceTitle": "Episode.File", "downloadId": "A" * 40}
+        with patch.object(self.cleanup, "_radarr_request", return_value={"records": [event], "totalRecords": 1}):
+            self.assertFalse(self.cleanup._arr_import_history_contains("radarr", "Movie.Release", added_date, "a" * 40))
+
     def test_arr_import_history_failure_is_unknown_not_empty_success(self):
         added_date = datetime.now(timezone.utc) - timedelta(hours=48)
         with patch.object(self.cleanup, "_radarr_request", return_value=None):
