@@ -2028,7 +2028,7 @@ class MediaCleanup:
                         # means disposable. Require a complete, stopped torrent
                         # and an exact release-title match in the owning Arr's
                         # import history before removing its Transmission record.
-                        if not is_complete or torrent.status != 0 or age <= stale_threshold:
+                        if not is_complete or torrent.status not in (0, "stopped") or age <= stale_threshold:
                             logger.debug(
                                 f"Keeping torrent {torrent.name}: import-verified cleanup requires "
                                 "a completed, stopped torrent older than the stale threshold"
