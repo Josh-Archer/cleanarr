@@ -13,6 +13,7 @@ Optional variables:
 
 - `CLEANARR_TRANSMISSION_*` for torrent cleanup
 - `CLEANARR_STALE_TORRENT_REQUIRE_IMPORT=true` to require exact Arr import-history evidence before stale torrent record cleanup. Configure the matching Sonarr/Radarr API URL and key; Lidarr additionally requires `CLEANARR_LIDARR_ENABLE=true` and its API URL/key. The torrent must be complete, stopped, and older than `CLEANARR_STALE_TORRENT_HOURS`. API failures and missing import records fail closed. This mode removes the Transmission record with `delete_data=false`, preserving the downloaded files.
+- `CLEANARR_REMOVE_SONARR_EXECUTABLE_DOWNLOADS=true` to remove completed Sonarr import warnings for executable-only torrents through Sonarr's blocklist API. This requires a unique matching Transmission info hash, the `sonarr` label, one fully downloaded `.exe` file, and the exact Sonarr download path. Multi-file torrents and other warning types are skipped. The job must call `MediaCleanup.clean_sonarr_executable_downloads()`; the setting is off by default.
 - `CLEANARR_DRY_RUN` to disable destructive actions
 - `CLEANARR_DRY_RUN_REPORT_DIR` directory for per-user dry-run report artifacts (`cleanarr-dry-run-report.json` and `.md`). Default: `/logs/dry-run-reports`. Written at end of a **job-mode** dry-run only.
 - `CLEANARR_NTFY_*` / `NTFY_*` for run summaries and error alerts (`CLEANARR_NTFY_BASEURL`, `CLEANARR_NTFY_TOPIC`, `CLEANARR_NTFY_TOKEN`, `NTFY_ENABLE`)
