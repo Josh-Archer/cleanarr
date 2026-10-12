@@ -184,6 +184,7 @@ The full configuration contract is documented in [docs/configuration.md](./docs/
 | `CLEANARR_DRY_RUN_REPORT_DIR` | `/logs/dry-run-reports` | When dry-run is enabled, the job writes per-user JSON and Markdown report artifacts here (`cleanarr-dry-run-report.json` / `.md`). Webhook mode does not emit these aggregate artifacts (see [docs/configuration.md](./docs/configuration.md)). |
 | `CLEANARR_DISABLE_TORRENT_CLEANUP` | `false` | Disables stale torrent and failed download cleanup. |
 | `CLEANARR_REMOVE_FAILED_DOWNLOADS` | `false` | Removes failed Transmission downloads when enabled. |
+| `CLEANARR_REMOVE_SONARR_EXECUTABLE_DOWNLOADS` | `false` | Blocklists and removes only completed Sonarr queue warnings whose matching, Sonarr-labeled Transmission torrent contains exactly one fully downloaded `.exe` under `/media/downloads/sonarr`. Requires Sonarr and Transmission access; honors dry run and torrent cleanup filters. |
 | `CLEANARR_REMOVE_ORPHAN_INCOMPLETE_DOWNLOADS` | mirrors `CLEANARR_REMOVE_FAILED_DOWNLOADS` | Deletes orphaned entries from Transmission's incomplete directory when no active torrent still owns them. |
 | `CLEANARR_REMOVE_STALE_TORRENTS` | `true` | Removes stale torrents based on age and activity checks. |
 | `CLEANARR_STALE_TORRENT_HOURS` | `8` | Age threshold for stale torrent cleanup. |
@@ -354,6 +355,7 @@ Cleanarr is built for setups where Plex or Jellyfin is the source of truth for w
 | `CLEANARR_LIDARR_ENABLE` | `false` | Enables optional Lidarr music cleanup. Leave off unless you intentionally want played tracks deleted via Lidarr. |
 | `CLEANARR_DISABLE_TORRENT_CLEANUP` | `false` | Disables stale torrent and failed download cleanup. |
 | `CLEANARR_REMOVE_FAILED_DOWNLOADS` | `false` | Removes failed Transmission downloads when enabled. |
+| `CLEANARR_REMOVE_SONARR_EXECUTABLE_DOWNLOADS` | `false` | Blocklists and removes only completed Sonarr queue warnings whose matching, Sonarr-labeled Transmission torrent contains exactly one fully downloaded `.exe` under `/media/downloads/sonarr`. Requires Sonarr and Transmission access; honors dry run and torrent cleanup filters. |
 | `CLEANARR_REMOVE_ORPHAN_INCOMPLETE_DOWNLOADS` | mirrors `CLEANARR_REMOVE_FAILED_DOWNLOADS` | Deletes orphaned entries from Transmission's incomplete directory when no active torrent still owns them. |
 | `CLEANARR_REMOVE_STALE_TORRENTS` | `true` | Removes stale torrents based on age and activity checks. |
 | `CLEANARR_STALE_TORRENT_HOURS` | `8` | Age threshold for stale torrent cleanup. |

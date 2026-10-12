@@ -331,6 +331,9 @@ CONFIG = {
     ),
     "disable_torrent_cleanup": _env_flag("CLEANARR_DISABLE_TORRENT_CLEANUP", default="false"),
     "remove_failed_downloads": _env_flag("CLEANARR_REMOVE_FAILED_DOWNLOADS", default="false"),
+    "remove_sonarr_executable_downloads": _env_flag(
+        "CLEANARR_REMOVE_SONARR_EXECUTABLE_DOWNLOADS", default="false"
+    ),
     "remove_orphan_incomplete_downloads": _env_flag(
         "CLEANARR_REMOVE_ORPHAN_INCOMPLETE_DOWNLOADS",
         default=_get_env("CLEANARR_REMOVE_FAILED_DOWNLOADS", default="false"),
@@ -1852,6 +1855,103 @@ class MediaCleanup:
             logger.error(f"Error cleaning failed downloads: {e}")
             self._record_summary("errors", f"failed download cleanup error: {e}")
 
+    def clean_sonarr_executable_downloads(self):
+        """Blocklist a completed, Sonarr-owned torrent containing only one .exe.
+
+        Sonarr leaves these as import warnings rather than failed downloads. Its
+        queue DELETE action removes the client payload and records the blocklist
+        entry together, so never remove the torrent directly from Transmission.
+        """
+        if not CONFIG.get("remove_sonarr_executable_downloads", False):
+            return
+        if CONFIG.get("disable_torrent_cleanup", False) or not self.transmission:
+            logger.info("Sonarr executable cleanup skipped: torrent cleanup is disabled")
+            return
+
+        queue = self._sonarr_request(
+            "queue?page=1&pageSize=1000&includeUnknownSeriesItems=true"
+        )
+        if not isinstance(queue, dict) or not isinstance(queue.get("records"), list):
+            self._record_summary("errors", "Sonarr executable cleanup: queue unavailable")
+            return
+        records = queue["records"]
+        if queue.get("totalRecords") != len(records):
+            self._record_summary("errors", "Sonarr executable cleanup: queue is incomplete")
+            return
+
+        try:
+            torrents = self.transmission.get_torrents()
+        except Exception as exc:
+            self._record_summary("errors", f"Sonarr executable cleanup: Transmission unavailable: {exc}")
+            return
+        by_hash = {}
+        for torrent in torrents:
+            hash_string = str(getattr(torrent, "hash_string", "") or "").casefold()
+            if hash_string:
+                by_hash.setdefault(hash_string, []).append(torrent)
+
+        for record in records:
+            if record.get("trackedDownloadStatus") != "warning":
+                continue
+            messages = [
+                message
+                for group in (record.get("statusMessages") or [])
+                for message in (group.get("messages") or [])
+            ]
+            if "Caution: Found executable file with extension: '.exe'" not in messages:
+                continue
+
+            queue_id = record.get("id")
+            download_id = str(record.get("downloadId") or "")
+            output_path = record.get("outputPath")
+            if (not isinstance(queue_id, int) or queue_id < 1
+                    or not re.fullmatch(r"[0-9a-fA-F]{40}", download_id)
+                    or not isinstance(output_path, str)
+                    or os.path.splitext(output_path)[1].casefold() != ".exe"):
+                logger.warning("Sonarr executable warning lacks a safe queue identity; skipping")
+                continue
+            matching = by_hash.get(download_id.casefold(), [])
+            if len(matching) != 1:
+                logger.warning("Sonarr executable warning has no unique Transmission torrent; skipping")
+                continue
+            torrent = matching[0]
+            if not self._torrent_cleanup_allowed(torrent, "Sonarr executable cleanup"):
+                continue
+            if "sonarr" not in {str(label).casefold() for label in (getattr(torrent, "labels", None) or [])}:
+                continue
+            if getattr(torrent, "percent_done", 0) < 1:
+                continue
+            download_dir = getattr(torrent, "download_dir", "")
+            if download_dir != "/media/downloads/sonarr":
+                continue
+            try:
+                files = torrent.get_files()
+            except Exception as exc:
+                logger.warning(f"Cannot inspect Sonarr executable torrent files: {exc}")
+                continue
+            if len(files) != 1:
+                continue
+            file = files[0]
+            relative = file.name
+            if (not isinstance(relative, str) or not relative
+                    or relative.startswith("/") or ".." in Path(relative).parts
+                    or os.path.splitext(relative)[1].casefold() != ".exe"
+                    or file.completed != file.size
+                    or os.path.normpath(os.path.join(download_dir, relative)) != output_path):
+                continue
+
+            if CONFIG["dry_run"]:
+                logger.info(f"[DRY RUN] Would Sonarr-blocklist executable-only torrent {download_id}")
+                continue
+            result = self._sonarr_request(
+                f"queue/{queue_id}?removeFromClient=true&blocklist=true&skipRedownload=true",
+                method="DELETE",
+            )
+            if result is None:
+                self._record_summary("errors", f"Sonarr executable blocklist failed for queue {queue_id}")
+            else:
+                logger.info(f"Sonarr blocklisted executable-only torrent {download_id}")
+
     def _arr_import_history_contains(self, app, title, added_date, download_id=None):
         """Check an Arr import history for one release title, failing closed."""
         caches = getattr(self, "_stale_torrent_import_history", None)
@@ -3182,6 +3282,7 @@ class MediaCleanup:
             self.process_watched_movies()
             self.process_played_tracks()
             self.clean_repeated_io_error_torrents()
+            self.clean_sonarr_executable_downloads()
             self.clean_failed_downloads()
             self.remove_stale_torrents()
         except Exception as e:
