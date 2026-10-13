@@ -56,8 +56,22 @@ if LOKI_URL:
             else:
                 logging.warning("Could not inject Cloudflare Access headers into Loki handler (session not found)")
 
-        logger = logging.getLogger()
-        logger.addHandler(handler)
+        # Keep the loguru logger. Rebinding it to the stdlib root logger sent
+        # webhook decisions to Loki only, and Lambda dropped those INFO records
+        # before they reached CloudWatch.
+        loki_logger = logging.getLogger("cleanarr.webhook.loki")
+        loki_logger.setLevel(logging.INFO)
+        loki_logger.propagate = False
+        loki_logger.addHandler(handler)
+
+        def _forward_to_loki(message):
+            loki_logger.log(message.record["level"].no, message.record["message"])
+
+        logger.add(
+            _forward_to_loki,
+            level="INFO",
+            filter=lambda record: record["name"] == "cleanarr.webhook_app",
+        )
         logger.info(f"Loki logging enabled to {LOKI_URL}")
     except ImportError:
         logger.warning("LOKI_URL set but python-logging-loki not installed; skipping Loki setup")
@@ -1553,6 +1567,31 @@ def _normalize_watched_by(watched_by, platform="plex"):
     return normalized
 
 
+def _watched_by_for_finished_item(mc, plex_item, ev: dict) -> dict:
+    """Watch map for a finished webhook item.
+
+    The scheduled scan asks Plex for every household account. Recording only
+    the account that sent the webhook makes require_all_users wait for that
+    scan even when the other accounts have already watched. The triggering
+    account stays watched so a scrobble still counts before Plex history
+    catches up.
+    """
+    watched_by = {}
+    try:
+        watched_by = dict(mc._get_watch_status(plex_item) or {})
+    except Exception:
+        logger.exception("Failed to read Plex watch status for finished webhook")
+        watched_by = {}
+
+    account = ev.get("account") if isinstance(ev.get("account"), dict) else {}
+    account_title = str(account.get("title") or "").strip()
+    if account_title:
+        watched_by[account_title] = True
+
+    normalized = _normalize_watched_by(watched_by)
+    return normalized or watched_by
+
+
 def _background_process_finished(ev: dict):
     """Process a single finished/watch-complete event and run deletion logic similar to cleanarr.
 
@@ -1829,10 +1868,10 @@ def _background_process_finished(ev: dict):
                 'episode': getattr(plex_item, 'index', None),
                 'title': getattr(plex_item, 'title', None),
                 'file': (plex_item.locations[0] if getattr(plex_item, 'locations', None) else None),
-                'watched_by': {ev.get('account', {}).get('title'): True},
+                'watched_by': _watched_by_for_finished_item(mc, plex_item, ev),
                 'guid': getattr(plex_item, 'guid', None),
                 'rating_key': getattr(plex_item, 'ratingKey', None),
-                'is_watched_override': True,
+                'is_watched_override': False,
             }
 
             sonarr_match = mc.match_episode_to_sonarr(ep)

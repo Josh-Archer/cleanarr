@@ -281,10 +281,16 @@ class TestWebhookQueueMode(unittest.TestCase):
         mc.should_delete_media.return_value = True
         mc.delete_sonarr_episode_file.return_value = True
         mc.unmonitor_sonarr_episode.return_value = True
+        mc._get_watch_status.return_value = {'josharcher354': True, 'Erin': True}
 
         with patch.object(webhook_app, '_get_media_cleanup', return_value=mc), \
              patch.object(webhook_app, '_send_ntfy') as send_ntfy:
             webhook_app._background_process_finished(event)
+
+        watched_by = mc.should_delete_media.call_args.args[2]
+        self.assertTrue(watched_by['josharcher354'])
+        self.assertTrue(watched_by['Erin'])
+        self.assertTrue(watched_by['alice'])
 
         send_ntfy.assert_called_once_with(
             "Webhook: Cleaned up Margo's Got Money Troubles S1E1 - Pilot",
