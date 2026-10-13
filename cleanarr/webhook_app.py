@@ -19,6 +19,61 @@ APP = Flask(__name__)
 # Avoid leaking webhook tokens in access logs (Werkzeug logs full request URLs).
 
 
+def _prepare_loki_handler(handler, cf_id, cf_secret):
+    """Attach Cloudflare headers to every Loki session and swallow push errors.
+
+    LokiEmitter.session is a lazy property. A failed push closes that session,
+    and the next record builds a new one. Headers have to be applied in the
+    session class, not on the first instance.
+    """
+    emitter = handler.emitter
+    if cf_id and cf_secret:
+        headers_to_inject = {
+            "CF-Access-Client-Id": cf_id,
+            "CF-Access-Client-Secret": cf_secret,
+        }
+        base_session = emitter.session_class
+
+        class _HeaderSession(base_session):
+            def __init__(self, *args, **kwargs):
+                super().__init__(*args, **kwargs)
+                self.headers.update(headers_to_inject)
+
+        emitter.session_class = _HeaderSession
+        emitter.close()
+
+    def _emit(record):
+        # A failed push logs a warning, and that warning is forwarded back here.
+        if getattr(handler, "_loki_in_emit", False):
+            return
+        handler._loki_in_emit = True
+        try:
+            try:
+                emitter(record, handler.format(record))
+            except ValueError as exc:
+                status = _loki_failure_status(exc)
+                if status is None:
+                    handler.handleError(record)
+                else:
+                    logger.warning("Loki push failed with status {}", status)
+            except Exception:
+                handler.handleError(record)
+        finally:
+            handler._loki_in_emit = False
+
+    handler.emit = _emit
+    return handler
+
+
+def _loki_failure_status(exc):
+    prefix = "Unexpected Loki API response status code:"
+    text = str(exc)
+    if not text.startswith(prefix):
+        return None
+    status = text[len(prefix):].strip()
+    return status or None
+
+
 # Setup Loki logging if configured
 LOKI_URL = os.environ.get('LOKI_URL')
 if LOKI_URL:
@@ -35,26 +90,7 @@ if LOKI_URL:
             version="1",
         )
 
-        if cf_id and cf_secret:
-            # Monkey-patch headers into the handler's session
-            # python-logging-loki structure might vary, check handler.session or handler.emitter.session
-            injected = False
-            headers_to_inject = {
-                "CF-Access-Client-Id": cf_id,
-                "CF-Access-Client-Secret": cf_secret
-            }
-
-            if hasattr(handler, 'session'):
-                handler.session.headers.update(headers_to_inject)
-                injected = True
-            elif hasattr(handler, 'emitter') and hasattr(handler.emitter, 'session'):
-                handler.emitter.session.headers.update(headers_to_inject)
-                injected = True
-
-            if injected:
-                logging.info("Injected Cloudflare Access headers into Loki handler")
-            else:
-                logging.warning("Could not inject Cloudflare Access headers into Loki handler (session not found)")
+        _prepare_loki_handler(handler, cf_id, cf_secret)
 
         # Keep the loguru logger. Rebinding it to the stdlib root logger sent
         # webhook decisions to Loki only, and Lambda dropped those INFO records
@@ -77,6 +113,7 @@ if LOKI_URL:
         logger.warning("LOKI_URL set but python-logging-loki not installed; skipping Loki setup")
     except Exception:
         logging.exception("Failed to initialize Loki logging")
+
 
 # Where to store incoming webhook events (one JSON object per line)
 EVENTS_FILE = os.environ.get("CLEANARR_EVENTS_FILE", os.path.join("/logs", "plex_events.json"))
@@ -153,7 +190,7 @@ def _env_int(name: str, default: int) -> int:
     try:
         return int(raw)
     except ValueError:
-        logger.warning("Invalid integer for %s=%r, using default=%s", name, raw, default)
+        logger.warning(f"Invalid integer for {name}={raw!r}, using default={default}")
         return default
 
 # If set to 'true', webhook will attempt to run the same deletion logic as cleanarr
@@ -683,7 +720,7 @@ def _process_webhook_event_actions(ev: dict, async_mode: bool = True, force_dele
             or metadata.get("grandparentTitle")
             or "webhook-event"
         )
-        logger.info("Ignoring webhook event from protected path prefix %s", ignored_path)
+        logger.info(f"Ignoring webhook event from protected path prefix {ignored_path}")
         _record_webhook_decision(
             reason_code="skip",
             media_type=media_type,
@@ -702,13 +739,7 @@ def _process_webhook_event_actions(ev: dict, async_mode: bool = True, force_dele
     evt, act, is_finished, is_removed, is_paused, is_stopped = _compute_event_flags(ev)
 
     logger.info(
-        "Webhook received: event='%s', action='%s', is_finished=%s, is_removed=%s, is_paused=%s, is_stopped=%s",
-        evt,
-        act,
-        is_finished,
-        is_removed,
-        is_paused,
-        is_stopped,
+        f"Webhook received: event='{evt}', action='{act}', is_finished={is_finished}, is_removed={is_removed}, is_paused={is_paused}, is_stopped={is_stopped}"
     )
     payload = ev.get('payload')
     if isinstance(payload, dict) and payload.get('Player'):
@@ -944,11 +975,7 @@ def emby_webhook():
             return jsonify({"status": "error", "message": "Unauthorized"}), 401
 
     logger.info(
-        "Received Emby request: %s %s from %s content_type=%s",
-        request.method,
-        request.path,
-        request.remote_addr,
-        request.content_type,
+        f"Received Emby request: {request.method} {request.path} from {request.remote_addr} content_type={request.content_type}"
     )
 
     _start_background_threads()
@@ -1078,9 +1105,7 @@ def _get_target_plex_for_user(event_user_title: str):
     owner_keys = _TARGET_PLEX_OWNER_KEYS_BY_TOKEN.get(token) or set()
     if event_user_key not in owner_keys:
         logger.info(
-            "Skipping sync for user '%s': target token owner mismatch (%s)",
-            event_user_title,
-            sorted(owner_keys),
+            f"Skipping sync for user '{event_user_title}': target token owner mismatch ({sorted(owner_keys)})"
         )
         return None, None
 
@@ -1118,18 +1143,12 @@ def jellyfin_webhook():
     )
     if not accepted:
         logger.warning(
-            "Unauthorized Jellyfin webhook attempt from %s reason=%s",
-            request.remote_addr,
-            auth_reason,
+            f"Unauthorized Jellyfin webhook attempt from {request.remote_addr} reason={auth_reason}"
         )
         return jsonify({"status": "error", "message": "Unauthorized"}), 401
 
     logger.info(
-        "Received Jellyfin request: %s %s from %s content_type=%s",
-        request.method,
-        request.path,
-        request.remote_addr,
-        request.content_type,
+        f"Received Jellyfin request: {request.method} {request.path} from {request.remote_addr} content_type={request.content_type}"
     )
     
     _start_background_threads()
@@ -1203,7 +1222,7 @@ def jellyfin_webhook():
 
     ignored_path = _ignored_path_for_event(ev)
     if ignored_path:
-        logger.info("Ignoring Jellyfin webhook event from protected path prefix %s", ignored_path)
+        logger.info(f"Ignoring Jellyfin webhook event from protected path prefix {ignored_path}")
         _record_webhook_decision(
             reason_code="skip",
             media_type=ev["metadata"].get("type") or "unknown",
@@ -1235,21 +1254,14 @@ def plex_webhook():
     )
     if not accepted:
         logger.warning(
-            "Unauthorized Plex webhook attempt from %s reason=%s",
-            request.remote_addr,
-            auth_reason,
+            f"Unauthorized Plex webhook attempt from {request.remote_addr} reason={auth_reason}"
         )
         return jsonify({"status": "error", "message": "Unauthorized"}), 401
 
     # Do not log raw request bodies. Plex sends multipart data and webhook secrets
     # should only arrive via headers, not query parameters that bleed into access logs.
     logger.info(
-        "Received request: %s %s from %s content_type=%s content_length=%s",
-        request.method,
-        request.path,
-        request.remote_addr,
-        request.content_type,
-        request.content_length,
+        f"Received request: {request.method} {request.path} from {request.remote_addr} content_type={request.content_type} content_length={request.content_length}"
     )
     # Ensure background monitor thread is running (probes will trigger this)
     _start_background_threads()
@@ -1327,10 +1339,7 @@ def plex_webhook():
 
     if actionable and _queue_enqueuing_enabled():
         logger.info(
-            "Queue mode active; enqueuing webhook event='%s' action='%s' (mode=%s)",
-            evt,
-            act,
-            WEBHOOK_QUEUE_MODE,
+            f"Queue mode active; enqueuing webhook event='{evt}' action='{act}' (mode={WEBHOOK_QUEUE_MODE})"
         )
         if _enqueue_webhook_event(ev):
             return jsonify({
@@ -1341,9 +1350,7 @@ def plex_webhook():
             })
 
         logger.warning(
-            "Queue enqueue failed for event='%s' action='%s'; falling back to direct processing",
-            evt,
-            act,
+            f"Queue enqueue failed for event='{evt}' action='{act}'; falling back to direct processing"
         )
 
     event_result = _process_webhook_event_actions(ev, async_mode=True, force_deletions=False)
@@ -1366,16 +1373,14 @@ def _background_sync_watch_state(ev: dict):
     source_url = _normalize_url_key(_get_env('CLEANARR_PLEX_BASEURL', 'PLEX_URL'))
     target_url = _normalize_url_key(TARGET_PLEX_BASEURL)
     if source_url and target_url and source_url == target_url:
-        logger.info("Skipping sync: source and target Plex URLs are the same (%s)", source_url)
+        logger.info(f"Skipping sync: source and target Plex URLs are the same ({source_url})")
         return
 
     source_server_keys = _extract_source_server_keys(payload)
     target_server_keys = _extract_target_server_keys(target_plex)
     if source_server_keys and target_server_keys and source_server_keys.intersection(target_server_keys):
         logger.info(
-            "Skipping sync: event already originated from target Plex (source=%s, target=%s)",
-            sorted(source_server_keys),
-            sorted(target_server_keys),
+            f"Skipping sync: event already originated from target Plex (source={sorted(source_server_keys)}, target={sorted(target_server_keys)})"
         )
         return
 
@@ -1406,7 +1411,7 @@ def _background_sync_watch_state(ev: dict):
             item.markPlayed()
         elif event_type in ('media.pause', 'media.stop') and view_offset is not None:
             if not SYNC_PROGRESS_EVENTS:
-                logger.debug("Progress sync disabled; ignoring %s event", event_type)
+                logger.debug(f"Progress sync disabled; ignoring {event_type} event")
                 return
 
             if STRICT_MONOTONIC_WATCH_SYNC and (getattr(item, 'isPlayed', False) or (getattr(item, 'viewCount', 0) or 0) > 0):
@@ -1422,20 +1427,13 @@ def _background_sync_watch_state(ev: dict):
             target_offset = getattr(item, 'viewOffset', 0) or 0
             if STRICT_MONOTONIC_WATCH_SYNC and incoming_offset <= target_offset:
                 logger.debug(
-                    "Skipping progress sync for %s; incoming viewOffset=%sms is behind or equal to target=%sms",
-                    item.title,
-                    incoming_offset,
-                    target_offset,
+                    f"Skipping progress sync for {item.title}; incoming viewOffset={incoming_offset}ms is behind or equal to target={target_offset}ms"
                 )
                 return
 
             if incoming_offset <= (target_offset + SYNC_PROGRESS_MIN_ADVANCE_MS):
                 logger.debug(
-                    "Skipping progress sync for %s; incoming viewOffset=%sms is not ahead of target=%sms by %sms",
-                    item.title,
-                    incoming_offset,
-                    target_offset,
-                    SYNC_PROGRESS_MIN_ADVANCE_MS,
+                    f"Skipping progress sync for {item.title}; incoming viewOffset={incoming_offset}ms is not ahead of target={target_offset}ms by {SYNC_PROGRESS_MIN_ADVANCE_MS}ms"
                 )
                 return
 
