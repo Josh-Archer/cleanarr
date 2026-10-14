@@ -3,6 +3,8 @@
 The public runtime repository is intentionally split into three layers:
 
 - `cleanarr/`: shared library code used by both runtime harnesses
+- `cleanarr/policy.py`: pure household, tag, watch-ahead, and torrent decisions (no service I/O)
+- `cleanarr/adapters/`: Plex, Jellyfin/Emby, Servarr, and Transmission I/O
 - `apps/job/`: thin cron/job entrypoint around `MediaCleanup`
 - `apps/webhook/`: thin Flask entrypoint around the shared webhook app
 - `apps/lambda/`: AWS Lambda container for SQS webhook consumption and
@@ -15,7 +17,7 @@ Design constraints:
 - Runtime defaults are generic and env-driven so downstream repos can supply their own wiring.
 - Downstream private repos own Kubernetes overlays, secret material, Cloud Run or ingress setup, and image pinning.
 - Proxy and webhook runtime behavior stay in this repository; downstream repos own IAM roles, queue resources, manifests, and rollout policy.
-- Multi-user delete policy defaults to `require_all_users` so shared-library watch state cannot delete media while another household member is still mid-season (exact-item and watched-ahead paths share the same policy). See `docs/configuration.md`.
+- Multi-user delete policy defaults to `require_all_users` so shared-library watch state cannot delete media while another household member is still mid-season (exact-item and watched-ahead paths share the same policy). Scheduled jobs and webhook deletion both call `cleanarr.policy`. See `docs/configuration.md`.
 
 Dry-run reporting:
 
