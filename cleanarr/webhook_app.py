@@ -709,6 +709,23 @@ def _compute_event_flags(ev: dict):
     return evt, act, is_finished, is_removed, is_paused, is_stopped
 
 
+def _safe_webhook_log_value(value, fallback="unknown"):
+    """Keep webhook log labels bounded and free of control characters."""
+    normalized = re.sub(r"[^a-zA-Z0-9_.-]+", "_", str(value or fallback)).strip("_")
+    return normalized[:80] or fallback
+
+
+def _log_webhook_cleanup_outcome(ev, media_type, outcome, reason="operation_result"):
+    logger.info(
+        "Webhook cleanup outcome: "
+        f"platform='{_safe_webhook_log_value(ev.get('platform'))}' "
+        f"event='{_safe_webhook_log_value(ev.get('event'))}' "
+        f"queue_message_id='{_safe_webhook_log_value(ev.get('queue_message_id'), 'direct')}' "
+        f"media_type='{_safe_webhook_log_value(media_type)}' outcome='{outcome}' "
+        f"reason='{_safe_webhook_log_value(reason)}'"
+    )
+
+
 def _process_webhook_event_actions(ev: dict, async_mode: bool = True, force_deletions: bool = False):
     ignored_path = _ignored_path_for_event(ev)
     if ignored_path:
@@ -737,13 +754,14 @@ def _process_webhook_event_actions(ev: dict, async_mode: bool = True, force_dele
         }
 
     evt, act, is_finished, is_removed, is_paused, is_stopped = _compute_event_flags(ev)
+    platform = _safe_webhook_log_value(ev.get("platform"))
+    event_name = _safe_webhook_log_value(evt)
+    action_name = _safe_webhook_log_value(act, "none")
+    queue_message_id = _safe_webhook_log_value(ev.get("queue_message_id"), "direct")
 
     logger.info(
-        f"Webhook received: event='{evt}', action='{act}', is_finished={is_finished}, is_removed={is_removed}, is_paused={is_paused}, is_stopped={is_stopped}"
+        f"Webhook received: event='{event_name}', action='{action_name}', is_finished={is_finished}, is_removed={is_removed}, is_paused={is_paused}, is_stopped={is_stopped}, platform='{platform}', queue_message_id='{queue_message_id}'"
     )
-    payload = ev.get('payload')
-    if isinstance(payload, dict) and payload.get('Player'):
-        logger.info(f"Player state: {payload.get('Player')}")
 
     actionable = bool(is_finished or is_removed or is_paused or is_stopped)
     recorded = bool(is_finished or is_removed)
@@ -769,21 +787,48 @@ def _process_webhook_event_actions(ev: dict, async_mode: bool = True, force_dele
         _append_event(ev)
 
     deletions_enabled = ENABLE_WEBHOOK_DELETIONS or force_deletions
+    cleanup_requested = bool(is_finished or is_removed)
+    cleanup_context = (
+        f"platform='{platform}' event='{event_name}' "
+        f"queue_message_id='{queue_message_id}'"
+    )
 
-    if deletions_enabled and (is_finished or is_removed):
+    if not cleanup_requested:
+        reason = "playback_not_completed" if is_stopped else "event_not_cleanup_trigger"
+        logger.info(
+            f"Webhook cleanup decision: {cleanup_context} outcome='not_run' reason='{reason}'"
+        )
+    elif not deletions_enabled:
+        logger.info(
+            f"Webhook cleanup decision: {cleanup_context} outcome='not_run' reason='webhook_deletions_disabled'"
+        )
+    else:
+        logger.info(
+            f"Webhook cleanup decision: {cleanup_context} outcome='started' reason='finished_or_removed_event'"
+        )
+
+    if deletions_enabled and cleanup_requested:
         try:
             if async_mode:
                 if is_finished:
                     threading.Thread(target=_background_process_finished, args=(ev,), daemon=True).start()
                 elif is_removed:
                     threading.Thread(target=_background_process_removed, args=(ev,), daemon=True).start()
+                processing_status = "dispatched"
             else:
                 if is_finished:
                     _background_process_finished(ev)
                 elif is_removed:
                     _background_process_removed(ev)
+                processing_status = "completed"
+            logger.info(
+                f"Webhook cleanup processing: {cleanup_context} status='{processing_status}'"
+            )
         except Exception:
             logger.exception("Failed to process webhook deletion action")
+            logger.error(
+                f"Webhook cleanup processing: {cleanup_context} status='failed'"
+            )
             _record_webhook_decision(
                 reason_code="error",
                 media_type=media_type,
@@ -1173,8 +1218,8 @@ def jellyfin_webhook():
         except Exception:
             pass
 
-    # Map to internal format
-        logger.info(f"Jellyfin payload: {json.dumps(payload)}")
+    # Map to internal format without logging the raw payload, which may include
+    # user identifiers, media titles, paths, and other private metadata.
     mtype = (payload.get("ItemType") or "").lower()
     provider_ids = {str(k).lower(): v for k, v in (payload.get("ProviderIds") or {}).items() if v}
     guid = None
@@ -1624,6 +1669,14 @@ def _background_process_finished(ev: dict):
 
     try:
         def _emit_result(success: bool, media_type: str, media_title: str, detail: dict | None = None):
+            outcome = (
+                "failed"
+                if not success
+                else "dry_run"
+                if mc.CONFIG.get("dry_run")
+                else "succeeded"
+            )
+            _log_webhook_cleanup_outcome(ev, media_type, outcome)
             if success:
                 _record_webhook_decision(
                     reason_code="dry-run" if mc.CONFIG["dry_run"] else "delete",
@@ -2171,6 +2224,12 @@ def _background_process_removed(ev: dict):
 
             logger.info(f"Webhook-triggered deletion: deleting entire series {title} from Sonarr")
             if mc.delete_sonarr_series(sonarr_series['id']):
+                _log_webhook_cleanup_outcome(
+                    ev,
+                    "episode",
+                    "dry_run" if _is_dry_run() else "succeeded",
+                    "sonarr_series_delete",
+                )
                 _send_ntfy(
                     f"Webhook: Deleted series '{title}' from Sonarr (removed from Plex)",
                     title="Cleanarr Webhook: Series Deleted"
@@ -2183,6 +2242,9 @@ def _background_process_removed(ev: dict):
                     details={"title": title, "series_id": sonarr_series['id']},
                 )
             else:
+                _log_webhook_cleanup_outcome(
+                    ev, "episode", "failed", "sonarr_series_delete"
+                )
                 _send_ntfy(
                     f"Webhook: Failed to delete series '{title}' from Sonarr",
                     title="Cleanarr Webhook: Deletion Failed"
@@ -2276,6 +2338,12 @@ def _background_process_removed(ev: dict):
 
             logger.info(f"Webhook-triggered deletion: deleting movie {title} from Radarr")
             if mc.delete_radarr_movie(radarr_movie['id']):
+                _log_webhook_cleanup_outcome(
+                    ev,
+                    "movie",
+                    "dry_run" if _is_dry_run() else "succeeded",
+                    "radarr_movie_delete",
+                )
                 _send_ntfy(
                     f"Webhook: Deleted movie '{title}' from Radarr (removed from Plex)",
                     title="Cleanarr Webhook: Movie Deleted"
@@ -2288,6 +2356,9 @@ def _background_process_removed(ev: dict):
                     details={"title": title, "movie_id": radarr_movie['id']},
                 )
             else:
+                _log_webhook_cleanup_outcome(
+                    ev, "movie", "failed", "radarr_movie_delete"
+                )
                 _send_ntfy(
                     f"Webhook: Failed to delete movie '{title}' from Radarr",
                     title="Cleanarr Webhook: Deletion Failed"
