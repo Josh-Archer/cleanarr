@@ -693,13 +693,13 @@ def _compute_event_flags(ev: dict):
         or act == 'mark_watched'
     ):
         is_finished = True
-    elif evt in ('playbackstopped', 'playback.stop', 'playback.stopped'):
+    elif evt in ('playbackstop', 'playbackstopped', 'playback.stop', 'playback.stopped'):
         is_finished = played_to_completion
     elif evt == 'library.remove':
         is_removed = True
 
     is_paused = evt in ('media.pause', 'playbackpaused', 'playback.pause', 'playback.paused')
-    is_stopped = evt in ('media.stop', 'playbackstopped', 'playback.stop', 'playback.stopped')
+    is_stopped = evt in ('media.stop', 'playbackstop', 'playbackstopped', 'playback.stop', 'playback.stopped')
 
     ev['finished'] = bool(is_finished)
     ev['removed'] = bool(is_removed)
@@ -1255,10 +1255,10 @@ def jellyfin_webhook():
     # Compute flags for Jellyfin
     evt_lower = event_name.lower()
     is_finished = evt_lower == "itemmarkplayed" or (
-        evt_lower == "playbackstopped" and _is_played_to_completion(payload)
+        evt_lower in ("playbackstop", "playbackstopped") and _is_played_to_completion(payload)
     )
     is_paused = evt_lower == "playbackpaused"
-    is_stopped = evt_lower == "playbackstopped"
+    is_stopped = evt_lower in ("playbackstop", "playbackstopped")
     
     ev["finished"] = is_finished
     ev["removed"] = False
