@@ -179,11 +179,11 @@ def _compute_event_flags(
 
     if platform == "jellyfin":
         is_finished = evt == "itemmarkplayed" or (
-            evt == "playbackstopped" and _is_played_to_completion(payload)
+            evt in ("playbackstop", "playbackstopped") and _is_played_to_completion(payload)
         )
         is_removed = False # Jellyfin doesn't typically send library.remove via standard webhooks
         is_paused = evt == "playbackpaused"
-        is_stopped = evt == "playbackstopped"
+        is_stopped = evt in ("playbackstop", "playbackstopped")
     else:
         is_finished = evt == "media.scrobble" or act == "mark_watched"
         is_removed = evt == "library.remove"

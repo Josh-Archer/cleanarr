@@ -282,11 +282,10 @@ _EMBY_PAUSED_EVENTS = {
 }
 _PLUGIN_FINISHED_TYPES = {
     "itemmarkplayed",
-    "playbackstopped",
     "userdatasaved",
 }
 _PLUGIN_PAUSED_TYPES = {"playbackpaused"}
-_PLUGIN_STOPPED_TYPES = {"playbackstopped"}
+_PLUGIN_STOPPED_TYPES = {"playbackstop", "playbackstopped"}
 
 
 def _resolve_emby_event_name(payload: dict) -> str:
@@ -329,7 +328,7 @@ def compute_emby_event_flags(event_name: str, payload: dict | None = None) -> di
     is_stopped = evt in _EMBY_STOPPED_EVENTS or evt in _PLUGIN_STOPPED_TYPES
 
     # playback.stop only counts as "finished" when Emby reports completion
-    if evt in _EMBY_STOPPED_EVENTS and not is_finished:
+    if (evt in _EMBY_STOPPED_EVENTS or evt in _PLUGIN_STOPPED_TYPES) and not is_finished:
         playback = payload.get("PlaybackInfo") or payload.get("Playback") or {}
         if isinstance(playback, dict) and playback.get("PlayedToCompletion") is True:
             is_finished = True
