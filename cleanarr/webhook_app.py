@@ -5,12 +5,16 @@ import threading
 import logging
 from loguru import logger
 import time
-import re
 import html
 import sys
 import requests
 from urllib.parse import urlparse
 from flask import Flask, request, jsonify
+from cleanarr.policy import (
+    decide_exact_item_delete,
+    ids_include_any_label,
+    protected_ids_from_tags,
+)
 from cleanarr.reporting import DecisionReporter, redact_sensitive_data
 from cleanarr.webhook.auth import verify_from_http
 
@@ -232,22 +236,21 @@ def _get_env(*keys, default=None):
     return default
 
 
-def _normalize_tag_label(label: str) -> str:
-    label = (label or "").strip().lower()
-    label = re.sub(r"^\s*\d+\s*-\s*", "", label)
-    return label
+def household_delete_allowed(user_tags, watched_by, config=None) -> bool:
+    """Exact-item household decision shared with scheduled jobs.
 
-
-def _is_protected_tag_label(label: str) -> bool:
-    return _normalize_tag_label(label) in ("safe", "kids")
-
-
-def _find_tag_by_label(tags, label):
-    target = label
-    for tag in tags or []:
-        if _normalize_tag_label(tag.get('label')) == target:
-            return tag
-    return None
+    ``config`` is the cleanup CONFIG mapping. Service I/O stays in the caller.
+    Webhook deletion still goes through ``MediaCleanup.should_delete_media``,
+    which calls the same ``decide_exact_item_delete`` helper.
+    """
+    config = config or {}
+    return decide_exact_item_delete(
+        user_tags,
+        watched_by,
+        policy=config.get("multi_user_delete_policy", "require_all_users"),
+        primary_user=config.get("primary_user") or "",
+        household_users=config.get("household_users") or set(),
+    ).allowed
 
 
 # Mirror cleanarr.py default CONFIG values so the webhook has the same defaults when
@@ -1793,11 +1796,7 @@ def _background_process_finished(ev: dict):
                                 details={"type": "fallback", "rating_key": ep.get("rating_key")},
                             )
                             return
-                        protected_tag_ids = {
-                            tag['id']
-                            for tag in sonarr_tags
-                            if _is_protected_tag_label(tag.get('label'))
-                        }
+                        protected_tag_ids = protected_ids_from_tags(sonarr_tags)
                         series_tag_ids = set(sonarr_match['series'].get('tags') or [])
                         episode_tag_ids = set(sonarr_match['episode'].get('tags') or [])
                         if protected_tag_ids & (series_tag_ids | episode_tag_ids):
@@ -1868,8 +1867,7 @@ def _background_process_finished(ev: dict):
                             )
                             return
                         movie_tags = radarr_match['movie'].get('tags', [])
-                        safe_tag = _find_tag_by_label(radarr_tags, 'safe')
-                        if safe_tag and safe_tag['id'] in movie_tags:
+                        if ids_include_any_label(radarr_tags, movie_tags, ("safe",)):
                             logger.info(f"Skipping deletion for movie {mv['title']} due to 'safe' tag")
                             _record_webhook_decision(
                                 reason_code="protected",
@@ -1952,11 +1950,7 @@ def _background_process_finished(ev: dict):
                     details={"rating_key": ep.get("rating_key")},
                 )
                 return
-            protected_tag_ids = {
-                tag['id']
-                for tag in sonarr_tags
-                if _is_protected_tag_label(tag.get('label'))
-            }
+            protected_tag_ids = protected_ids_from_tags(sonarr_tags)
             series_tags = sonarr_match['series'].get('tags', [])
             episode_tags = sonarr_match['episode'].get('tags') or []
             series_tag_ids = set(series_tags or [])
@@ -2050,10 +2044,7 @@ def _background_process_finished(ev: dict):
                 )
                 return
             movie_tags = radarr_match['movie'].get('tags', [])
-            safe_tag = _find_tag_by_label(radarr_tags, 'safe')
-            kids_tag = _find_tag_by_label(radarr_tags, 'kids')
-            if ((safe_tag and safe_tag['id'] in movie_tags) or
-                    (kids_tag and kids_tag['id'] in movie_tags)):
+            if ids_include_any_label(radarr_tags, movie_tags, ("safe", "kids")):
                 logger.info(f"Skipping deletion for movie {mv['title']} due to 'safe' or 'kids' tag")
                 _record_webhook_decision(
                     reason_code="protected",
@@ -2209,9 +2200,7 @@ def _background_process_removed(ev: dict):
                 )
                 return
             series_tags = sonarr_series.get('tags', [])
-            safe_tag = _find_tag_by_label(sonarr_tags, 'safe')
-            kids_tag = _find_tag_by_label(sonarr_tags, 'kids')
-            if (safe_tag and safe_tag['id'] in series_tags) or (kids_tag and kids_tag['id'] in series_tags):
+            if ids_include_any_label(sonarr_tags, series_tags, ("safe", "kids")):
                 logger.info(f"Skipping deletion for removed series {title} due to 'safe' or 'kids' tag")
                 _record_webhook_decision(
                     reason_code="protected",
@@ -2324,8 +2313,7 @@ def _background_process_removed(ev: dict):
                 )
                 return
             movie_tags = radarr_movie.get('tags', [])
-            safe_tag = _find_tag_by_label(radarr_tags, 'safe')
-            if safe_tag and safe_tag['id'] in movie_tags:
+            if ids_include_any_label(radarr_tags, movie_tags, ("safe",)):
                 logger.info(f"Skipping deletion for removed movie {title} due to 'safe' tag")
                 _record_webhook_decision(
                     reason_code="protected",

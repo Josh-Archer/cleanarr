@@ -1,6 +1,10 @@
-from . import emby_client
 #!/usr/bin/env python3
-"""Core Cleanarr cleanup logic shared by the job and webhook harnesses."""
+"""Core Cleanarr cleanup logic shared by the job and webhook harnesses.
+
+Deletion policy lives in ``cleanarr.policy``. Plex, Jellyfin/Emby, Servarr,
+and Transmission I/O live in ``cleanarr.adapters``. This module wires those
+pieces together and keeps dry-run reporting.
+"""
 
 import os
 import shutil
@@ -19,9 +23,36 @@ import re
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 import requests
-from urllib.parse import urljoin
 from plexapi.server import PlexServer
 from transmission_rpc import Client as TransmissionClient
+# Kept on this module so callers can patch cleanarr.cleanup.emby_client.
+# JellyfinMediaSource looks up load_watched_state on that same module.
+from . import emby_client
+from cleanarr.adapters.jellyfin import JellyfinMediaSource
+from cleanarr.adapters.plex import PlexMediaSource
+from cleanarr.adapters.servarr import ServarrClient
+from cleanarr.adapters.transmission import (
+    TransmissionClientAdapter,
+    get_torrent_category as _get_torrent_category,
+    iter_expected_incomplete_names as _iter_expected_incomplete_names,
+    normalize_incomplete_name as _normalize_incomplete_name,
+    transmission_labels,
+)
+from cleanarr.policy import (
+    collect_watch_ahead_candidates,
+    decide_exact_item_delete,
+    household_policy_allows_delete as _policy_allows_delete,
+    ids_include_any_label,
+    is_protected_tag_label as _is_protected_tag_label,
+    normalize_multi_user_delete_policy as _normalize_multi_user_delete_policy,
+    normalize_tag_label as _normalize_tag_label,
+    protected_ids_from_tags,
+    protected_labels_for_ids as _policy_protected_labels_for_ids,
+    repeated_io_error_disposition,
+    resolve_household_members as _policy_resolve_household_members,
+    torrent_cleanup_decision,
+    user_tags_from_ids,
+)
 from cleanarr.reporting import DecisionReporter, DryRunReportCollector
 from loguru import logger
 
@@ -59,16 +90,6 @@ def _get_env(*keys, default=None):
     return default
 
 
-def _normalize_tag_label(label: str) -> str:
-    label = (label or "").strip().lower()
-    label = re.sub(r"^\s*\d+\s*-\s*", "", label)
-    return label
-
-
-def _is_protected_tag_label(label: str) -> bool:
-    return _normalize_tag_label(label) in ("safe", "kids")
-
-
 def _env_flag(*keys, default="false"):
     return _get_env(*keys, default=default).lower() in ("true", "1", "yes")
 
@@ -80,181 +101,6 @@ def _env_csv_set(*keys, default=""):
         for value in raw.split(",")
         if value.strip()
     }
-
-
-# Multi-user / household delete policies (issue #20).
-# Default is intentionally the safest option for shared libraries.
-MULTI_USER_DELETE_POLICIES = frozenset({
-    "require_all_users",
-    "majority",
-    "primary_user_only",
-})
-
-_MULTI_USER_DELETE_POLICY_ALIASES = {
-    "require_all": "require_all_users",
-    "require-all-users": "require_all_users",
-    "all": "require_all_users",
-    "all_users": "require_all_users",
-    "majority_users": "majority",
-    "primary": "primary_user_only",
-    "primary-user-only": "primary_user_only",
-    "primary_only": "primary_user_only",
-    "primary-only": "primary_user_only",
-}
-
-
-def _normalize_multi_user_delete_policy(value, *, default="require_all_users"):
-    """Normalize policy name; unknown values fall back to the safe default."""
-    raw = (value or default or "require_all_users").strip().lower().replace("-", "_")
-    # Re-apply alias lookup for hyphen forms that became underscores, and raw.
-    candidates = [
-        (value or "").strip().lower(),
-        raw,
-        raw.replace("_", "-"),
-    ]
-    for candidate in candidates:
-        if not candidate:
-            continue
-        if candidate in MULTI_USER_DELETE_POLICIES:
-            return candidate
-        aliased = _MULTI_USER_DELETE_POLICY_ALIASES.get(candidate)
-        if aliased:
-            return aliased
-        underscored = candidate.replace("-", "_")
-        if underscored in MULTI_USER_DELETE_POLICIES:
-            return underscored
-        aliased = _MULTI_USER_DELETE_POLICY_ALIASES.get(underscored)
-        if aliased:
-            return aliased
-    logger.warning(
-        f"Unknown CLEANARR_MULTI_USER_DELETE_POLICY '{value}'; "
-        f"using safe default '{default}'"
-    )
-    return default if default in MULTI_USER_DELETE_POLICIES else "require_all_users"
-
-
-def _user_names_match(left: str, right: str) -> bool:
-    """Flexible username match used for tags vs Plex account names."""
-    left = (left or "").strip().lower()
-    right = (right or "").strip().lower()
-    if not left or not right:
-        return False
-    if left == right:
-        return True
-    # Keep legacy flexible matching (e.g. tag 'user' matches 'user123').
-    try:
-        return bool(re.search(left, right) or re.search(right, left))
-    except re.error:
-        return False
-
-
-def _user_in_collection(username: str, collection) -> bool:
-    username = (username or "").strip().lower()
-    if not username:
-        return False
-    for entry in collection or []:
-        if _user_names_match(username, entry):
-            return True
-    return False
-
-
-def _resolve_household_members(user_tags, watched_by, household_users=None):
-    """Resolve the household constituency for multi-user delete decisions.
-
-    Priority:
-    1. Explicit CLEANARR_HOUSEHOLD_USERS (or provided set)
-    2. Sonarr/Radarr user tags on the item (shared library ownership tags)
-    3. All accounts present in watched_by (Plex owner + managed users)
-    """
-    if household_users is None:
-        household_users = CONFIG.get("household_users") or set()
-    if household_users:
-        return sorted({str(u).strip().lower() for u in household_users if str(u).strip()})
-    if user_tags:
-        return sorted({str(u).strip().lower() for u in user_tags if str(u).strip()})
-    return sorted({str(u).strip().lower() for u in (watched_by or {}).keys() if str(u).strip()})
-
-
-def _satisfied_household_members(household_members, satisfied_users):
-    """Return household members whose watch state is considered satisfied."""
-    satisfied = []
-    for member in household_members:
-        if _user_in_collection(member, satisfied_users):
-            satisfied.append(member)
-    return satisfied
-
-
-def household_policy_allows_delete(
-    household_members,
-    satisfied_users,
-    *,
-    policy=None,
-    primary_user=None,
-):
-    """Apply multi-user delete policy for a household.
-
-    ``satisfied_users`` is the set of usernames that already meet the deletion
-    precondition (exact-item watched, or watched-ahead for earlier episodes).
-
-    Returns (allowed: bool, detail: str).
-    """
-    policy = _normalize_multi_user_delete_policy(
-        policy if policy is not None else CONFIG.get("multi_user_delete_policy"),
-    )
-    if primary_user is None:
-        primary_user = CONFIG.get("primary_user") or ""
-    primary_user = (primary_user or "").strip().lower()
-
-    members = [m for m in (household_members or []) if m]
-    # No constituency: only allow when at least one satisfied watcher exists.
-    # Callers that already require a watcher keep this as a final guard.
-    if not members:
-        if satisfied_users:
-            return True, "no_household_members_any_watcher"
-        return False, "no_household_members_no_watchers"
-
-    satisfied = _satisfied_household_members(members, satisfied_users)
-    satisfied_count = len(satisfied)
-    member_count = len(members)
-
-    if policy == "primary_user_only":
-        if not primary_user:
-            logger.warning(
-                "CLEANARR_MULTI_USER_DELETE_POLICY=primary_user_only but "
-                "CLEANARR_PRIMARY_USER is unset; falling back to require_all_users"
-            )
-            policy = "require_all_users"
-        else:
-            if _user_in_collection(primary_user, satisfied):
-                return True, f"primary_user_only primary={primary_user}"
-            # Primary may not be listed in household_members (misconfig); still check raw.
-            if _user_in_collection(primary_user, satisfied_users):
-                return True, f"primary_user_only primary={primary_user}"
-            return False, (
-                f"primary_user_only primary={primary_user} not satisfied "
-                f"(satisfied={satisfied}, household={members})"
-            )
-
-    if policy == "majority":
-        # Strict majority: more than half of the household must be satisfied.
-        needed = (member_count // 2) + 1
-        if satisfied_count >= needed:
-            return True, (
-                f"majority {satisfied_count}/{member_count} (needed {needed}) "
-                f"satisfied={satisfied}"
-            )
-        return False, (
-            f"majority {satisfied_count}/{member_count} (needed {needed}) "
-            f"satisfied={satisfied} household={members}"
-        )
-
-    # require_all_users (safe default)
-    if satisfied_count >= member_count:
-        return True, f"require_all_users all {member_count} satisfied={satisfied}"
-    return False, (
-        f"require_all_users {satisfied_count}/{member_count} "
-        f"satisfied={satisfied} household={members}"
-    )
 
 
 CONFIG = {
@@ -389,57 +235,32 @@ IO_ERROR_PATTERNS = (
 )
 
 
-def _normalize_incomplete_name(name: str) -> str:
-    name = (name or "").strip()
-    if name.endswith(".part"):
-        name = name[:-5]
-    return re.sub(r"[^a-z0-9]", "", name.lower())
+def _resolve_household_members(user_tags, watched_by, household_users=None):
+    """Resolve household members, reading CONFIG when the roster is omitted."""
+    if household_users is None:
+        household_users = CONFIG.get("household_users") or set()
+    return _policy_resolve_household_members(user_tags, watched_by, household_users)
 
 
-def _iter_expected_incomplete_names(torrent):
-    names = set()
+def household_policy_allows_delete(
+    household_members,
+    satisfied_users,
+    *,
+    policy=None,
+    primary_user=None,
+):
+    """Apply multi-user delete policy, filling omitted settings from CONFIG."""
+    if policy is None:
+        policy = CONFIG.get("multi_user_delete_policy")
+    if primary_user is None:
+        primary_user = CONFIG.get("primary_user") or ""
+    return _policy_allows_delete(
+        household_members,
+        satisfied_users,
+        policy=policy,
+        primary_user=primary_user,
+    )
 
-    torrent_name = getattr(torrent, "name", None)
-    if torrent_name:
-        names.add(torrent_name)
-
-    for attr in ("download_dir", "downloadDir"):
-        download_dir = getattr(torrent, attr, None)
-        if download_dir:
-            names.add(Path(download_dir).name)
-
-    try:
-        torrent_files = torrent.files()
-    except Exception as e:
-        logger.warning(f"Failed to get files for torrent {torrent_name}: {e}. Falling back to torrent metadata.")
-        return names
-
-    for torrent_file in torrent_files:
-        path = torrent_file.name if hasattr(torrent_file, "name") else torrent_file.get("name")
-        if not path:
-            continue
-        path_obj = Path(path)
-        if path_obj.parts:
-            names.add(path_obj.parts[0])
-        names.add(path_obj.name)
-
-    return names
-
-
-def _get_torrent_download_dir(torrent):
-    for attr in ("download_dir", "downloadDir"):
-        download_dir = getattr(torrent, attr, None)
-        if download_dir:
-            return download_dir
-    return None
-
-
-def _get_torrent_category(torrent):
-    download_dir = _get_torrent_download_dir(torrent)
-    if not download_dir:
-        return None
-    category = Path(download_dir).name.strip().lower()
-    return category or None
 
 # Setup logger
 logger.remove()
@@ -454,7 +275,13 @@ if os.environ.get("CLEANARR_LOG_TO_FILE", "true").lower() in ("true", "1", "yes"
 
 
 class MediaCleanup:
-    """Main class for handling Plex media cleanup operations."""
+    """Main class for handling Plex media cleanup operations.
+
+    ``CONFIG`` is the module mapping so webhook callers can read ``mc.CONFIG``
+    for dry-run reason codes. ``patch.dict`` on the module dict stays visible.
+    """
+
+    CONFIG = CONFIG
 
     def __init__(self):
         """Initialize API connections."""
@@ -488,6 +315,10 @@ class MediaCleanup:
             "radarr_movies": None,
             "sonarr_episodes_by_series_id": {},
             "radarr_managed_movie_roots": None,
+            "lidarr_artists": None,
+            "lidarr_albums_by_artist_id": {},
+            "lidarr_tracks_by_album_id": {},
+            "lidarr_tracks_by_artist_id": {},
         }
         # Prepare headers for Cloudflare Access if present
         self.cf_headers = {}
@@ -574,6 +405,42 @@ class MediaCleanup:
                 logger.error(f"Failed to connect to Transmission: {str(e)}")
                 sys.exit(1)
 
+        self.plex_source = PlexMediaSource(self.plex, self.watch_evidence_by_rating_key)
+        self.jellyfin = (
+            JellyfinMediaSource(self.emby_session, CONFIG["emby"])
+            if self.emby_session is not None else None
+        )
+        self.sonarr_client = ServarrClient(
+            "Sonarr",
+            CONFIG["sonarr"],
+            session=self.sonarr_session,
+            missing_key_env="CLEANARR_SONARR_APIKEY",
+        )
+        self.radarr_client = ServarrClient(
+            "Radarr",
+            CONFIG["radarr"],
+            session=self.radarr_session,
+            missing_key_env="CLEANARR_RADARR_APIKEY",
+        )
+        # Lidarr sessions stay lazy and do not inherit Cloudflare headers.
+        self.lidarr_client = ServarrClient(
+            "Lidarr",
+            CONFIG["lidarr"],
+            session_factory=requests.Session,
+            missing_key_env="CLEANARR_LIDARR_APIKEY",
+        )
+
+    @property
+    def transmission_io(self):
+        """Transmission adapter for the current client.
+
+        Tests and callers may replace ``self.transmission`` after init.
+        The adapter always wraps that object.
+        """
+        if self.transmission is None:
+            return None
+        return TransmissionClientAdapter(self.transmission)
+
     def _mark_partial_failure(self):
         """Mark the run as a partial failure unless already aborted."""
         if self.run_outcome != OUTCOME_ABORTED:
@@ -612,12 +479,7 @@ class MediaCleanup:
 
     def _protected_labels_for_ids(self, tags, tag_ids):
         """Return protected tag labels (safe/kids) present in the given id set."""
-        labels = []
-        id_set = set(tag_ids or [])
-        for tag in tags or []:
-            if tag.get("id") in id_set and _is_protected_tag_label(tag.get("label")):
-                labels.append(_normalize_tag_label(tag.get("label")))
-        return labels
+        return _policy_protected_labels_for_ids(tags, tag_ids)
 
     def _summarize_entries(self, category, label):
         entries = self.run_summary.get(category, [])
@@ -729,44 +591,29 @@ class MediaCleanup:
         self._send_ntfy_summary(title, lines, priority=priority, tags=tags)
 
     def _torrent_cleanup_allowed(self, torrent, reason):
+        """Apply label and category policy. Transmission I/O stays with the caller."""
         torrent_name = getattr(torrent, "name", "unknown torrent")
-
-        # --- Label filter (Transmission labels / tags) ---
-        # When CLEANARR_TORRENT_CLEANUP_REQUIRED_LABELS is configured, only torrents
-        # that carry at least one of the listed labels will be cleaned up.  This is
-        # the safest way to restrict cleanup to *arr-managed torrents while leaving
-        # untagged content (adult material, ebooks, etc.) untouched.
+        # Required labels restrict cleanup to *arr-managed torrents and leave
+        # untagged content untouched. A download-directory name counts as a
+        # label because Readarr does not send Transmission labels.
         required_labels = CONFIG.get("torrent_cleanup_required_labels") or set()
-        if required_labels:
-            torrent_labels = {
-                lbl.strip().lower()
-                for lbl in (getattr(torrent, "labels", None) or [])
-                if lbl and lbl.strip()
-            }
-            # Readarr currently lacks the ability to send labels to Transmission.
-            # As a fallback, if the download directory name matches a required label,
-            # we consider it a match.
-            category = _get_torrent_category(torrent)
-            if category and category in required_labels:
-                torrent_labels.add(category)
-
-            if not torrent_labels.intersection(required_labels):
-                logger.info(
-                    f"Skipping torrent cleanup for {torrent_name} "
-                    f"during {reason}: labels {torrent_labels or set()} do not "
-                    f"match required {sorted(required_labels)}"
-                )
-                return False
-
-        # --- Category (download-directory) filter ---
         allowed_categories = CONFIG.get("torrent_cleanup_allowed_categories") or set()
-        if not allowed_categories:
-            return True
-
         category = _get_torrent_category(torrent)
-        if category in allowed_categories:
+        allowed, skip_kind, effective_labels = torrent_cleanup_decision(
+            labels=transmission_labels(torrent),
+            category=category,
+            required_labels=required_labels,
+            allowed_categories=allowed_categories,
+        )
+        if allowed:
             return True
-
+        if skip_kind == "labels":
+            logger.info(
+                f"Skipping torrent cleanup for {torrent_name} "
+                f"during {reason}: labels {effective_labels or set()} do not "
+                f"match required {sorted(required_labels)}"
+            )
+            return False
         logger.info(
             f"Skipping torrent cleanup for {torrent_name} "
             f"during {reason}: category '{category or 'unknown'}' is not in "
@@ -833,7 +680,7 @@ class MediaCleanup:
         next_state = {}
 
         try:
-            torrents = self.transmission.get_torrents()
+            torrents = self.transmission_io.get_torrents()
         except Exception as exc:
             logger.error(f"Failed to list Transmission torrents for I/O error cleanup: {exc}")
             self._record_summary("errors", f"I/O error cleanup list failed: {exc}")
@@ -862,7 +709,13 @@ class MediaCleanup:
                 "last_seen": current_time,
             }
 
-            if active:
+            disposition = repeated_io_error_disposition(
+                count=count,
+                threshold=threshold,
+                active=active,
+                dry_run=bool(CONFIG["dry_run"]),
+            )
+            if disposition == "leave_active":
                 logger.warning(
                     f"Torrent {torrent.name} is reporting storage I/O errors but is still active; "
                     f"leaving it alone for now ({count}/{threshold})"
@@ -870,14 +723,14 @@ class MediaCleanup:
                 next_state[torrent_key] = entry
                 continue
 
-            if count < threshold:
+            if disposition == "below_threshold":
                 logger.warning(
                     f"Torrent {torrent.name} hit storage I/O error {count}/{threshold}: {error_string}"
                 )
                 next_state[torrent_key] = entry
                 continue
 
-            if CONFIG["dry_run"]:
+            if disposition == "dry_run":
                 logger.info(
                     f"[DRY RUN] Would remove torrent metadata for repeated storage I/O errors: "
                     f"{torrent.name} ({error_string})"
@@ -890,7 +743,7 @@ class MediaCleanup:
                 f"{torrent.name} ({error_string})"
             )
             try:
-                self.transmission.remove_torrent(torrent.id, delete_data=False)
+                self.transmission_io.remove_torrent(torrent.id, delete_data=False)
             except Exception as exc:
                 logger.error(f"Failed to remove torrent {torrent.name} after repeated I/O errors: {exc}")
                 self._record_summary(
@@ -907,99 +760,20 @@ class MediaCleanup:
 
     def _sonarr_request(self, endpoint, method="GET", data=None):
         """Make a request to the Sonarr API."""
-        if not CONFIG["sonarr"]["apikey"]:
-            logger.error("Missing Sonarr API key. Set CLEANARR_SONARR_APIKEY.")
-            return None
-        url = urljoin(CONFIG["sonarr"]["baseurl"], endpoint)
-        # Use session but ensure API key is present (headers.update merges)
-        session = getattr(self, "sonarr_session", None)
-        if session is None:
-            session = self.sonarr_session = requests.Session()
-        session.headers.update({"X-Api-Key": CONFIG["sonarr"]["apikey"]})
-
-        return self._arr_request("Sonarr", session, url, endpoint, method, data)
+        return self.sonarr_client.request(endpoint, method=method, data=data)
 
     def _radarr_request(self, endpoint, method="GET", data=None):
         """Make a request to the Radarr API."""
-        if not CONFIG["radarr"]["apikey"]:
-            logger.error("Missing Radarr API key. Set CLEANARR_RADARR_APIKEY.")
-            return None
-        url = urljoin(CONFIG["radarr"]["baseurl"], endpoint)
-        session = getattr(self, "radarr_session", None)
-        if session is None:
-            session = self.radarr_session = requests.Session()
-        session.headers.update({"X-Api-Key": CONFIG["radarr"]["apikey"]})
-
-        return self._arr_request("Radarr", session, url, endpoint, method, data)
+        return self.radarr_client.request(endpoint, method=method, data=data)
 
     def _arr_request(self, service_name, session, url, endpoint, method="GET", data=None):
-        """Make an ARR API request with light retrying for edge and upstream flakiness."""
-        method = (method or "GET").upper()
-        transient_statuses = {429, 500, 502, 503, 504}
-        max_attempts = 3
-        backoff_seconds = 1.5
-
-        for attempt in range(1, max_attempts + 1):
-            try:
-                request_kwargs = {"timeout": 30}
-                if method == "GET":
-                    response = session.get(url, **request_kwargs)
-                elif method == "DELETE":
-                    response = session.delete(url, **request_kwargs)
-                elif method in {"POST", "PUT"}:
-                    session.headers.update({"Content-Type": "application/json"})
-                    request_kwargs["data"] = json.dumps(data)
-                    response = session.request(method, url, **request_kwargs)
-                else:
-                    response = session.request(method, url, **request_kwargs)
-                if response.status_code in transient_statuses and attempt < max_attempts:
-                    logger.warning(
-                        f"{service_name} API transient response ({method} {endpoint}): "
-                        f"{response.status_code}; retrying ({attempt}/{max_attempts})"
-                    )
-                    time.sleep(backoff_seconds * attempt)
-                    continue
-
-                response.raise_for_status()
-                if not response.text or not response.text.strip():
-                    # Treat empty 2xx responses as success. Sonarr/Radarr DELETEs commonly
-                    # return an empty body, and callers should not interpret that as failure.
-                    return {}
-                try:
-                    return response.json()
-                except ValueError:
-                    return response.text
-            except requests.exceptions.HTTPError as exc:
-                response = exc.response
-                status_code = response.status_code if response is not None else "unknown"
-                response_text = response.text if response is not None else ""
-                if status_code in transient_statuses and attempt < max_attempts:
-                    logger.warning(
-                        f"{service_name} API transient HTTP error ({method} {endpoint}): "
-                        f"{status_code}; retrying ({attempt}/{max_attempts})"
-                    )
-                    time.sleep(backoff_seconds * attempt)
-                    continue
-                logger.error(
-                    f"{service_name} API HTTP error ({method} {endpoint}): "
-                    f"{status_code} - {response_text}"
-                )
-                return None
-            except requests.exceptions.RequestException as exc:
-                if attempt < max_attempts:
-                    logger.warning(
-                        f"{service_name} API request error ({method} {endpoint}): {exc}; "
-                        f"retrying ({attempt}/{max_attempts})"
-                    )
-                    time.sleep(backoff_seconds * attempt)
-                    continue
-                logger.error(f"{service_name} API error ({method} {endpoint}): {exc}")
-                return None
-            except Exception as exc:
-                logger.error(f"{service_name} API error ({method} {endpoint}): {exc}")
-                return None
-
-        return None
+        """Arr request helper retained for callers that already built a URL."""
+        client = ServarrClient(
+            service_name,
+            {"baseurl": "", "apikey": "provided"},
+            session=session,
+        )
+        return client._request(session, url, endpoint, method=method, data=data)
 
     def get_watched_movies(self):
         """Get all watched movies from the configured media source."""
@@ -1008,51 +782,18 @@ class MediaCleanup:
             movies, _ = self._load_emby_watched_state()
             logger.info(f"Found {len(movies)} watched movies")
             return movies
-
-        logger.info("Checking for watched movies in Plex")
-        watched_movies = []
-        try:
-            movie_sections = [section for section in self.plex.library.sections() if section.type == "movie"]
-            for section in movie_sections:
-                for movie in section.search(unwatched=False):
-                    watched_by = self._get_watch_status(movie)
-                    guid_values = []
-                    for guid in getattr(movie, "guids", None) or []:
-                        value = getattr(guid, "id", guid)
-                        if value:
-                            guid_values.append(str(value))
-                    watched_movies.append({
-                        "title": movie.title,
-                        "year": movie.year,
-                        "file": movie.locations[0] if movie.locations else None,
-                        "watched_by": watched_by,
-                        "watch_evidence": self.watch_evidence_by_rating_key.get(movie.ratingKey, {}).copy(),
-                        "guid": movie.guid,
-                        "guids": guid_values,
-                        "rating_key": movie.ratingKey,
-                    })
-            logger.info(f"Found {len(watched_movies)} watched movies")
-            return watched_movies
-        except Exception as e:
-            logger.error(f"Error getting watched movies: {str(e)}")
-            return []
+        return self.plex_source.list_watched_movies()
 
     def _load_emby_watched_state(self):
-        """Load and cache Emby watched movies/episodes for this run."""
+        """Load and cache Jellyfin/Emby watched movies and episodes for this run."""
         if self._emby_watched_cache is not None:
             return self._emby_watched_cache
-        if self.emby_session is None:
+        if self.jellyfin is None:
             logger.error("Emby session is not initialized")
             self._emby_watched_cache = ([], [])
             return self._emby_watched_cache
-        allowed = CONFIG.get("emby", {}).get("users") or set()
         try:
-            movies, episodes = emby_client.load_watched_state(
-                self.emby_session,
-                CONFIG["emby"]["baseurl"],
-                CONFIG["emby"]["apikey"],
-                allowed_usernames=allowed or None,
-            )
+            movies, episodes = self.jellyfin.load_watched_state()
             logger.info(
                 "Loaded Emby watched state: %s movies, %s episodes",
                 len(movies),
@@ -1073,114 +814,10 @@ class MediaCleanup:
             _, episodes = self._load_emby_watched_state()
             logger.info(f"Found {len(episodes)} watched episodes")
             return episodes
-
-        logger.info("Checking for watched episodes in Plex")
-        watched_episodes = []
-        try:
-            all_sections = self.plex.library.sections()
-            logger.debug(f"Found {len(all_sections)} library sections: {[s.title for s in all_sections]}")
-            show_sections = [section for section in all_sections if section.type == "show"]
-            logger.info(f"Found {len(show_sections)} TV show sections: {[s.title for s in show_sections]}")
-            
-            for section in show_sections:
-                shows = section.all()
-                logger.debug(f"Section '{section.title}' has {len(shows)} shows")
-                for show in shows:
-                    episodes = show.episodes()
-                    
-                    # Special debug logging for Full Metal Alchemist
-                    if "metal" in show.title.lower() or "alchemist" in show.title.lower():
-                        logger.info(f"DEBUG: Found show '{show.title}' with {len(episodes)} episodes")
-                        for i, ep in enumerate(episodes[:10]):  # First 10 episodes
-                            logger.info(f"DEBUG: {show.title} S{ep.seasonNumber}E{ep.index} '{ep.title}' - isWatched={ep.isWatched}, viewCount={getattr(ep, 'viewCount', 'N/A')}")
-                    
-                    watched_count = sum(1 for ep in episodes if ep.isWatched)
-                    if watched_count > 0:
-                        logger.debug(f"Show '{show.title}' has {watched_count}/{len(episodes)} watched episodes")
-                    for episode in episodes:
-                        if episode.isWatched:
-                            watch_status = self._get_watch_status(episode)
-                            episode_data = {
-                                "show_title": show.title,
-                                "season": episode.seasonNumber,
-                                "episode": episode.index,
-                                "title": episode.title,
-                                "file": episode.locations[0] if episode.locations else None,
-                                "watched_by": watch_status,
-                                "watch_evidence": self.watch_evidence_by_rating_key.get(episode.ratingKey, {}).copy(),
-                                "guid": episode.guid,
-                                "rating_key": episode.ratingKey,
-                            }
-                            # If episode is watched but no users have watch history, mark for override
-                            if not any(watch_status.values()):
-                                episode_data["is_watched_override"] = True
-                                logger.debug(f"Episode {show.title} S{episode.seasonNumber}E{episode.index} marked as watched but no user history found")
-                            watched_episodes.append(episode_data)
-            logger.info(f"Found {len(watched_episodes)} watched episodes")
-            return watched_episodes
-        except Exception as e:
-            logger.error(f"Error getting watched episodes: {str(e)}")
-            import traceback
-            logger.error(traceback.format_exc())
-            return []
+        return self.plex_source.list_watched_episodes()
 
     def _get_watch_status(self, media_item):
-        watch_status = {}
-        try:
-            rating_key = getattr(media_item, "ratingKey", None)
-            watch_evidence = {}
-            # Get all users, including the server owner
-            account = self.plex.myPlexAccount()
-            users = account.users()
-
-            # Check server owner's watch status separately
-            # Local Plex records owner watches under accountID=1, not the cloud account ID
-            owner_username = account.username or account.title
-            
-            # Check history first
-            history_kwargs = {'ratingKey': media_item.ratingKey, 'accountID': 1}
-            history = self.plex.history(**history_kwargs)
-            
-            # Fallback to isWatched status for owner if history is empty
-            # This handles cases where items are manually marked as watched
-            is_watched = bool(history)
-            if not is_watched and hasattr(media_item, 'isWatched'):
-                is_watched = media_item.isWatched
-                if is_watched:
-                    watch_evidence[owner_username] = "isWatched_fallback"
-                    logger.debug(f"Owner '{owner_username}' marked as watched via isWatched fallback (history was empty)")
-            if owner_username not in watch_evidence:
-                watch_evidence[owner_username] = "history" if history else "not_watched"
-
-            watch_status[owner_username] = is_watched
-            logger.debug(
-                f"Watch status for owner '{owner_username}' (accountID=1): {is_watched}, "
-                f"history items: {len(history)}, evidence={watch_evidence[owner_username]}"
-            )
-
-            # Check managed users' watch status (they use their cloud account IDs)
-            for user in users:
-                username = user.username or user.title
-                user_id = getattr(user, 'id', None)
-                logger.debug(f"Checking user '{username}' with id={user_id}")
-                history_kwargs = {'ratingKey': media_item.ratingKey}
-                if user_id is not None:
-                    history_kwargs['accountID'] = user_id
-                history = self.plex.history(**history_kwargs)
-                watch_status[username] = bool(history)
-                watch_evidence[username] = "history" if history else "not_watched"
-                logger.debug(
-                    f"Watch status for user '{username}' (accountID={user_id}): {bool(history)}, "
-                    f"history items: {len(history)}, evidence={watch_evidence[username]}"
-                )
-
-            logger.info(f"Watch status for {media_item.title}: {watch_status}")
-            if rating_key is not None:
-                self.watch_evidence_by_rating_key[rating_key] = watch_evidence
-            return watch_status
-        except Exception as e:
-            logger.error(f"Error getting watch status for ratingKey {media_item.ratingKey}: {str(e)}")
-            return {}
+        return self.plex_source.watch_status(media_item)
 
     def get_sonarr_tags(self):
         """Get all tags from Sonarr. Returns None on error."""
@@ -1487,15 +1124,8 @@ class MediaCleanup:
         return None
 
     def get_user_tags(self, tags, tag_ids):
-        """Get usernames from tag IDs, excluding 'safe'."""
-        user_tags = []
-        for tag in tags:
-            if tag["id"] in tag_ids and not _is_protected_tag_label(tag.get("label")):
-                # Use the helper to ensure consistent normalization (lower case + strip prefix)
-                cleaned_tag = _normalize_tag_label(tag.get("label"))
-                if cleaned_tag:
-                    user_tags.append(cleaned_tag)
-        return user_tags
+        """Get usernames from tag IDs, excluding 'safe' and 'kids'."""
+        return user_tags_from_ids(tags, tag_ids)
 
     def should_delete_media(self, media_item, user_tags, watched_by):
         """Determine if media should be deleted based on watch status and household policy.
@@ -1546,15 +1176,17 @@ class MediaCleanup:
             logger.info(f"No users have watched {media_name} yet")
             return False
 
-        household = _resolve_household_members(user_tags, watched_by)
         policy = CONFIG.get("multi_user_delete_policy", "require_all_users")
-        allowed, detail = household_policy_allows_delete(
-            household,
-            watched_users,
+        decision = decide_exact_item_delete(
+            user_tags,
+            watched_by,
             policy=policy,
-            primary_user=CONFIG.get("primary_user"),
+            primary_user=CONFIG.get("primary_user") or "",
+            household_users=CONFIG.get("household_users") or set(),
         )
-        if allowed:
+        household = list(decision.household)
+        detail = decision.detail
+        if decision.allowed:
             logger.info(
                 f"Household policy allows delete for {media_name}: "
                 f"policy={policy} {detail} household={household}"
@@ -1720,7 +1352,7 @@ class MediaCleanup:
             return True
         logger.info(f"Searching for torrent with file: {file_path}")
         try:
-            torrents = self.transmission.get_torrents()
+            torrents = self.transmission_io.get_torrents()
             for torrent in torrents:
                 for tf in torrent.files():
                     norm_tf_path = os.path.normpath(tf["name"])
@@ -1735,7 +1367,7 @@ class MediaCleanup:
                             logger.info(f"Skipping removal of torrent {torrent.name} - actively downloading ({torrent.rate_download} B/s)")
                             return False
                         
-                        self.transmission.remove_torrent(torrent.id, delete_data=True)
+                        self.transmission_io.remove_torrent(torrent.id, delete_data=True)
                         logger.info(f"Successfully removed torrent: {torrent.name}")
                         return True
             logger.warning(f"No matching torrent found for file: {file_path}")
@@ -1761,7 +1393,7 @@ class MediaCleanup:
         logger.info("Checking for failed downloads and orphaned incomplete files")
         try:
             # 1. Clean errored torrents
-            torrents = self.transmission.get_torrents()
+            torrents = self.transmission_io.get_torrents()
             removed_torrent_ids = set()
             if remove_failed_downloads:
                 for torrent in torrents:
@@ -1774,7 +1406,7 @@ class MediaCleanup:
                         else:
                             logger.info(f"Removing errored torrent: {torrent.name}")
                             try:
-                                self.transmission.remove_torrent(torrent.id, delete_data=True)
+                                self.transmission_io.remove_torrent(torrent.id, delete_data=True)
                                 removed_torrent_ids.add(torrent.id)
                             except Exception as e:
                                 logger.error(f"Failed to remove errored torrent {torrent.name}: {e}")
@@ -1790,7 +1422,7 @@ class MediaCleanup:
                 logger.info("Orphan incomplete cleanup is disabled")
                 return
 
-            session = self.transmission.get_session()
+            session = self.transmission_io.get_session()
             if not session.incomplete_dir_enabled:
                 logger.info("Incomplete download directory is disabled in Transmission, skipping orphan cleanup")
                 return
@@ -1880,7 +1512,7 @@ class MediaCleanup:
             return
 
         try:
-            torrents = self.transmission.get_torrents()
+            torrents = self.transmission_io.get_torrents()
         except Exception as exc:
             self._record_summary("errors", f"Sonarr executable cleanup: Transmission unavailable: {exc}")
             return
@@ -2083,7 +1715,7 @@ class MediaCleanup:
             return
         logger.info("Checking Transmission for stale torrents")
         try:
-            torrents = self.transmission.get_torrents()
+            torrents = self.transmission_io.get_torrents()
             current_time = datetime.now(timezone.utc)  # Use UTC for consistency
             stale_threshold = timedelta(hours=CONFIG.get("stale_torrent_hours", 8))
 
@@ -2156,7 +1788,7 @@ class MediaCleanup:
                             f"Removing imported stale torrent record: {torrent.name} "
                             f"(ID: {torrent.id}, Age: {age})"
                         )
-                        self.transmission.remove_torrent(torrent.id, delete_data=False)
+                        self.transmission_io.remove_torrent(torrent.id, delete_data=False)
                         continue
 
                     # Skip torrents that are actively downloading or queued
@@ -2175,7 +1807,7 @@ class MediaCleanup:
                             logger.info(f"[DRY RUN] Would remove stale torrent: {torrent.name} (ID: {torrent.id})")
                             continue
                         logger.info(f"Removing stale torrent: {torrent.name} (ID: {torrent.id}, Reason: {reason}, Age: {age})")
-                        self.transmission.remove_torrent(torrent.id, delete_data=True)
+                        self.transmission_io.remove_torrent(torrent.id, delete_data=True)
                     elif torrent.peers_connected == 0 or (is_complete and age > stale_threshold):
                         # Additional check: don't remove if torrent has active status (downloading/seeding)
                         if is_active_status:
@@ -2187,7 +1819,7 @@ class MediaCleanup:
                             logger.info(f"[DRY RUN] Would remove stale torrent: {torrent.name} (ID: {torrent.id})")
                             continue
                         logger.info(f"Removing stale torrent: {torrent.name} (ID: {torrent.id}, Reason: {reason}, Age: {age})")
-                        self.transmission.remove_torrent(torrent.id, delete_data=True)
+                        self.transmission_io.remove_torrent(torrent.id, delete_data=True)
                     else:
                         logger.debug(f"Torrent {torrent.name} not stale (Age: {age}, Complete: {is_complete} | {torrent.percent_done}, Peers: {torrent.peers_connected}, Status: {torrent.status})")
                 except Exception as e:
@@ -2203,56 +1835,7 @@ class MediaCleanup:
 
     def remove_from_plex_watchlist(self, rating_key):
         """Remove an item from the Plex Watchlist for the owner and managed users."""
-        if not rating_key:
-            return
-
-        try:
-            # Get owner account
-            account = self.plex.myPlexAccount()
-            users = account.users()
-            all_accounts = [account] + users
-
-            for acc in all_accounts:
-                try:
-                    # For managed users, we might need to authenticate as them or use their ID
-                    # PlexAPI handling of watchlists for managed users can be tricky.
-                    # Standard 'removeFromWatchlist' usually works on the authenticated user's watchlist.
-                    # For the owner (self.plex), it should work directly.
-                    
-                    # We'll rely on the server connection to remove it from the watchlist
-                    # if the item is found in the watchlist.
-                    
-                    # Currently, the most reliable way via plexapi is to fetch the item and call removeFromWatchlist
-                    # But we might have already deleted the file, so fetching might fail if it relies on file presence?
-                    # Actually, Plex keeps metadata even if file is missing (Trash).
-                    
-                    # Let's try to fetch the item using the library section
-                    pass
-                except Exception:
-                    pass
-            
-            # Simpler approach: Use the server library to fetch the item and call remove
-            # This action is usually per-user. The script runs as the owner (via token).
-            # So this will primarily likely remove from Owner's watchlist.
-            try:
-                item = self.plex.fetchItem(rating_key)
-                if item:
-                    logger.info(f"Attempting to remove {item.title} from Plex Watchlist (Owner)")
-                    # The removeFromWatchlist method exists on the object in newer plexapi versions
-                    # Or we can use account.removeFromWatchlist(item)
-                    
-                    if hasattr(item, 'removeFromWatchlist'):
-                        item.removeFromWatchlist()
-                        logger.info(f"Successfully removed {item.title} from Watchlist")
-                    else:
-                        # Fallback to account method
-                        account.removeFromWatchlist(item)
-                        logger.info(f"Successfully removed {item.title} from Watchlist via Account")
-            except Exception as e:
-                logger.warning(f"Failed to remove item {rating_key} from Watchlist: {e}")
-
-        except Exception as e:
-            logger.error(f"Error in remove_from_plex_watchlist: {e}")
+        self.plex_source.remove_from_watchlist(rating_key)
 
     def process_watched_episodes(self):
         """Process all watched episodes."""
@@ -2285,11 +1868,7 @@ class MediaCleanup:
         # For each show/season, get all episodes (including unwatched)
         # We'll use Sonarr API to get all episodes for each series
         sonarr_series_list = self.get_sonarr_series()
-        protected_tag_ids = {
-            tag["id"]
-            for tag in sonarr_tags
-            if _is_protected_tag_label(tag.get("label"))
-        }
+        protected_tag_ids = protected_ids_from_tags(sonarr_tags)
 
         for series in sonarr_series_list:
             show_title = series["title"]
@@ -2302,33 +1881,12 @@ class MediaCleanup:
             # Aggregate watched-ahead candidates per episode so one household
             # member finishing a season cannot delete while another is mid-season.
             # key -> {users_ahead, later_by_user, ep_obj}
-            ahead_candidates = {}
-            ep_numbers_by_season = defaultdict(list)
-            for (season, epnum) in all_eps:
-                ep_numbers_by_season[season].append(epnum)
-
-            for user in show_user_watched[show_title]:
-                watched_set = show_user_watched[show_title][user]
-                for season, epnums in ep_numbers_by_season.items():
-                    for epnum in sorted(epnums):
-                        ahead_eps = sorted(
-                            watched_epnum
-                            for watched_season, watched_epnum in watched_set
-                            if watched_season == season and watched_epnum >= epnum + 2
-                        )
-                        if not ahead_eps or (season, epnum) in watched_set:
-                            continue
-                        key = (season, epnum)
-                        candidate = ahead_candidates.setdefault(
-                            key,
-                            {
-                                "users_ahead": set(),
-                                "later_by_user": {},
-                                "ep_obj": all_eps[(season, epnum)],
-                            },
-                        )
-                        candidate["users_ahead"].add(str(user).lower())
-                        candidate["later_by_user"][str(user).lower()] = ahead_eps
+            ahead_candidates = collect_watch_ahead_candidates(
+                show_user_watched[show_title],
+                all_eps.keys(),
+            )
+            for key, candidate in ahead_candidates.items():
+                candidate["ep_obj"] = all_eps[key]
 
             # Household for this show: configured users, series tags, else all
             # accounts with any real history on the show (plus any Plex accounts
@@ -2617,10 +2175,7 @@ class MediaCleanup:
                     )
                 continue
             movie_tags = radarr_match["movie"].get("tags", [])
-            kids_tag = next((tag for tag in radarr_tags if _normalize_tag_label(tag.get("label")) == "kids"), None)
-            safe_tag = next((tag for tag in radarr_tags if _normalize_tag_label(tag.get("label")) == "safe"), None)
-            if ((safe_tag and safe_tag["id"] in movie_tags) or
-                    (kids_tag and kids_tag["id"] in movie_tags)):
+            if ids_include_any_label(radarr_tags, movie_tags, ("safe", "kids")):
                 protected_labels = self._protected_labels_for_ids(radarr_tags, movie_tags)
                 logger.info(
                     f"Skipping deletion for {movie['title']} ({movie['year']}) due to 'safe' or 'kids' tag"
@@ -2707,15 +2262,10 @@ class MediaCleanup:
         if not self._lidarr_enabled():
             logger.debug("Lidarr cleanup disabled; skipping Lidarr API call")
             return None
-        if not CONFIG["lidarr"]["apikey"]:
-            logger.error("Missing Lidarr API key. Set CLEANARR_LIDARR_APIKEY.")
-            return None
-        url = urljoin(CONFIG["lidarr"]["baseurl"], endpoint)
-        session = getattr(self, "lidarr_session", None)
-        if session is None:
-            session = self.lidarr_session = requests.Session()
-        session.headers.update({"X-Api-Key": CONFIG["lidarr"]["apikey"]})
-        return self._arr_request("Lidarr", session, url, endpoint, method, data)
+        result = self.lidarr_client.request(endpoint, method=method, data=data)
+        if getattr(self.lidarr_client, "_session", None) is not None:
+            self.lidarr_session = self.lidarr_client._session
+        return result
 
     def get_lidarr_tags(self):
         """Get all tags from Lidarr. Returns None on error."""
@@ -3154,11 +2704,7 @@ class MediaCleanup:
             )
             return
 
-        protected_tag_ids = {
-            tag["id"]
-            for tag in lidarr_tags
-            if _is_protected_tag_label(tag.get("label"))
-        }
+        protected_tag_ids = protected_ids_from_tags(lidarr_tags)
 
         played_tracks = self.get_played_tracks()
         for track in played_tracks:
