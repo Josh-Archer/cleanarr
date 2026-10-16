@@ -226,7 +226,7 @@ Sonarr/Radarr (user tags, `safe`/`kids` protected tags, and `CLEANARR_DRY_RUN`).
 Unmatched or unowned tracks are skipped (never force-deleted from disk outside Lidarr).
 
 | --- | --- | --- |
-| `CLEANARR_MEDIA_SOURCE` | `plex` | `plex` or `emby`. Selects which library provides watched state for the scheduled job. |
+| `CLEANARR_MEDIA_SOURCE` | `plex` | `plex`, `emby`, or `jellyfin`. Selects which library provides watched state for the scheduled job. |
 
 
 ### Emby
@@ -244,6 +244,23 @@ Job mode calls Emby REST:
 
 
 Per-user played flags are merged into the same `watched_by` / `watch_evidence` shape used for Plex (`watch_evidence` value `emby_isplayed`). Matching and delete policy then use Sonarr/Radarr tags as usual.
+
+
+### Jellyfin
+
+
+Required when `CLEANARR_MEDIA_SOURCE=jellyfin`:
+
+| --- | --- | --- |
+| `CLEANARR_JELLYFIN_BASEURL` | `JELLYFIN_URL` | Jellyfin Server base URL (default `http://jellyfin:8096`) |
+| `CLEANARR_JELLYFIN_APIKEY` | `CLEANARR_JELLYFIN_TOKEN`, `JELLYFIN_APIKEY`, `JELLYFIN_TOKEN` | Jellyfin API key (`X-Emby-Token`) |
+| `CLEANARR_JELLYFIN_USERS` | — | Optional comma-separated usernames. Empty = all non-disabled users. |
+
+
+Job mode calls Jellyfin REST:
+
+
+Per-user played flags are merged into the same `watched_by` / `watch_evidence` shape used for Plex. Matching and delete policy then use Sonarr/Radarr tags as usual.
 
 - `JELLYFIN_WEBHOOK_SECRET` to protect the Jellyfin webhook endpoint (`/jellyfin/webhook`)
 - `EMBY_WEBHOOK_SECRET` / `EMBY_WEBHOOK_SECRET_PREVIOUS` to protect the Emby webhook endpoint (`/emby/webhook`); accepted headers: `X-Cleanarr-Webhook-Token`, `X-Webhook-Token`, or `X-Emby-Token`
