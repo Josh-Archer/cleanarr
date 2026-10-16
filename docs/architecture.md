@@ -21,8 +21,8 @@ Design constraints:
 
 Dry-run reporting:
 
-- Job mode (`MediaCleanup.run`) can emit per-user dry-run JSON/Markdown artifacts when `CLEANARR_DRY_RUN=true`.
-- Webhook / SQS consumer paths remain event-scoped and only use decision JSONL; they do not produce the aggregate library dry-run report.
+- Scheduled jobs, direct webhook runs, and SQS consumer runs emit per-user dry-run JSON/Markdown report artifacts (`cleanarr-dry-run-report.json` and `.md`) under `CLEANARR_DRY_RUN_REPORT_DIR` when `CLEANARR_DRY_RUN=true`.
+- Webhook and SQS consumer runs also persist individual decisions to `CLEANARR_DECISION_REPORT_FILE` (JSONL) when configured.
 
 Queue decoupling (issue #8):
 
