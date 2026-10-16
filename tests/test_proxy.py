@@ -502,5 +502,82 @@ class TestJellyfinProxyParse(unittest.TestCase):
         self.assertTrue(event["recorded"])
 
 
+class TestProxyLogging(unittest.TestCase):
+    def setUp(self):
+        self.mock_request = MagicMock()
+        self.mock_server = MagicMock()
+        self.mock_server.server_address = ("0.0.0.0", 8000)
+
+    def test_redact_query_string_unit(self):
+        redact = proxy_module.redact_query_string
+        self.assertEqual(
+            redact('POST /plex/webhook?token=secret123 HTTP/1.1'),
+            'POST /plex/webhook?token=[REDACTED] HTTP/1.1',
+        )
+        self.assertEqual(
+            redact('POST /plex/webhook?token=secret123&action=play HTTP/1.1'),
+            'POST /plex/webhook?token=[REDACTED]&action=play HTTP/1.1',
+        )
+        self.assertEqual(
+            redact('POST /plex/webhook?action=play&token=secret123 HTTP/1.1'),
+            'POST /plex/webhook?action=play&token=[REDACTED] HTTP/1.1',
+        )
+        self.assertEqual(
+            redact('POST /plex/webhook?api_key=mykey&token=mytoken&safe=1 HTTP/1.1'),
+            'POST /plex/webhook?api_key=[REDACTED]&token=[REDACTED]&safe=1 HTTP/1.1',
+        )
+        self.assertEqual(
+            redact('POST /plex/webhook?apikey=k1&access_token=k2&secret=k3&auth=k4&X-Plex-Token=k5 HTTP/1.1'),
+            'POST /plex/webhook?apikey=[REDACTED]&access_token=[REDACTED]&secret=[REDACTED]&auth=[REDACTED]&X-Plex-Token=[REDACTED] HTTP/1.1',
+        )
+        self.assertEqual(
+            redact('GET /healthz HTTP/1.1'),
+            'GET /healthz HTTP/1.1',
+        )
+        self.assertEqual(
+            redact('POST /plex/webhook HTTP/1.1'),
+            'POST /plex/webhook HTTP/1.1',
+        )
+
+    def test_log_message_redacts_token_from_access_log(self):
+        with patch.object(proxy_module.ProxyHandler, 'setup'), \
+             patch.object(proxy_module.ProxyHandler, 'handle'), \
+             patch.object(proxy_module.ProxyHandler, 'finish'):
+            handler = proxy_module.ProxyHandler(self.mock_request, ("127.0.0.1", 12345), self.mock_server)
+
+        secret_token = "ultra-secret-token-xyz-987"
+        with self.assertLogs("cleanarr-webhook-proxy", level="INFO") as cm:
+            handler.log_message('"%s" %s %s', f"POST /plex/webhook?token={secret_token} HTTP/1.1", "200", "-")
+
+        self.assertEqual(len(cm.output), 1)
+        logged_line = cm.output[0]
+        self.assertNotIn(secret_token, logged_line)
+        self.assertIn("POST /plex/webhook?token=[REDACTED] HTTP/1.1", logged_line)
+        self.assertIn("200", logged_line)
+
+    def test_log_message_redacts_all_apikey_like_params(self):
+        with patch.object(proxy_module.ProxyHandler, 'setup'), \
+             patch.object(proxy_module.ProxyHandler, 'handle'), \
+             patch.object(proxy_module.ProxyHandler, 'finish'):
+            handler = proxy_module.ProxyHandler(self.mock_request, ("127.0.0.1", 12345), self.mock_server)
+
+        secrets = ["tok-1", "key-2", "sec-3", "auth-4", "sig-5", "plex-6"]
+        request_line = (
+            f"POST /plex/webhook?token={secrets[0]}&api_key={secrets[1]}&secret={secrets[2]}"
+            f"&auth={secrets[3]}&signature={secrets[4]}&X-Plex-Token={secrets[5]}&safe_param=hello HTTP/1.1"
+        )
+        with self.assertLogs("cleanarr-webhook-proxy", level="INFO") as cm:
+            handler.log_message('"%s" %s %s', request_line, "200", "-")
+
+        self.assertEqual(len(cm.output), 1)
+        logged_line = cm.output[0]
+        for s in secrets:
+            self.assertNotIn(s, logged_line)
+        self.assertIn("safe_param=hello", logged_line)
+        self.assertIn("token=[REDACTED]", logged_line)
+        self.assertIn("api_key=[REDACTED]", logged_line)
+        self.assertIn("secret=[REDACTED]", logged_line)
+
+
 if __name__ == "__main__":
     unittest.main()

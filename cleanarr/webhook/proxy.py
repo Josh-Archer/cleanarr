@@ -5,6 +5,7 @@ import json
 import html
 import logging
 import os
+import re
 import threading
 import time
 import xml.etree.ElementTree as ET
@@ -695,6 +696,17 @@ def _parse_emby_webhook_event(body: bytes, remote_addr: str, method: str) -> dic
     return event
 
 
+SENSITIVE_PARAM_PATTERN = re.compile(
+    r"([?&][a-zA-Z0-9_-]*(?:token|apikey|api[_-]key|secret|auth|password|key|sig(?:nature)?)[a-zA-Z0-9_-]*=)[^&\s\"]*",
+    re.IGNORECASE,
+)
+
+
+def redact_query_string(message: str) -> str:
+    """Redact sensitive query parameters (token, apikey, secret, etc.) from access logs."""
+    return SENSITIVE_PARAM_PATTERN.sub(r"\g<1>[REDACTED]", message)
+
+
 class ProxyHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         if self.path != "/healthz":
@@ -834,7 +846,8 @@ class ProxyHandler(BaseHTTPRequestHandler):
         self.wfile.write(forwarded["payload"])
 
     def log_message(self, format, *args):
-        LOG.info("%s - %s", self.address_string(), format % args)
+        message = format % args
+        LOG.info("%s - %s", self.address_string(), redact_query_string(message))
 
 def run_proxy(port: int):
     LOG.info("Starting cleanarr webhook proxy on :%s (sink=%s)", port, _proxy_sink_mode())
