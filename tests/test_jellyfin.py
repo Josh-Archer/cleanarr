@@ -1,10 +1,12 @@
 """Jellyfin scheduled-job media-source coverage (issue #33)."""
 
+import json
 import os
 import sys
 import tempfile
 import unittest
 from unittest.mock import MagicMock, patch
+from urllib.parse import urlparse
 
 repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if repo_root not in sys.path:
@@ -17,6 +19,70 @@ os.environ.setdefault(
 
 from cleanarr import cleanup as cleanarr  # noqa: E402
 from cleanarr.adapters.jellyfin import JellyfinMediaSource  # noqa: E402
+
+_MUTATING_HTTP_METHODS = {"DELETE", "PUT", "POST", "PATCH"}
+
+
+class _RecordedResponse:
+    """Minimal response object for the recording session."""
+
+    def __init__(self, payload):
+        self.status_code = 200
+        if payload is None:
+            self.text = ""
+            self.content = b""
+            self._payload = None
+        else:
+            self.text = json.dumps(payload)
+            self.content = self.text.encode("utf-8")
+            self._payload = payload
+
+    def json(self):
+        if self._payload is None:
+            raise ValueError("no json body")
+        return self._payload
+
+    def raise_for_status(self):
+        return None
+
+
+class RecordingHttpSession:
+    """Records every HTTP method and never opens a socket.
+
+    This is a plain stand-in rather than a ``requests.Session`` subclass.
+    ``tests/test_cleanup_feature.py`` swaps ``sys.modules['requests']`` for a
+    mock before later test modules import, so subclassing Session is not
+    reliable in the full suite.
+    """
+
+    def __init__(self, payload_for):
+        self.calls = []
+        self.headers = {}
+        self._payload_for = payload_for
+
+    def request(self, method, url, **kwargs):
+        method_name = (method or "GET").upper()
+        self.calls.append((method_name, url))
+        return _RecordedResponse(self._payload_for(method_name, url))
+
+    def get(self, url, **kwargs):
+        return self.request("GET", url, **kwargs)
+
+    def delete(self, url, **kwargs):
+        return self.request("DELETE", url, **kwargs)
+
+    def post(self, url, **kwargs):
+        return self.request("POST", url, **kwargs)
+
+    def put(self, url, **kwargs):
+        return self.request("PUT", url, **kwargs)
+
+    def patch(self, url, **kwargs):
+        return self.request("PATCH", url, **kwargs)
+
+
+def _forbid_real_http(*args, **kwargs):
+    raise AssertionError(f"real HTTP session was used: args={args!r} kwargs={kwargs!r}")
 
 
 class TestMediaCleanupJellyfinSource(unittest.TestCase):
@@ -162,8 +228,91 @@ class TestMediaCleanupJellyfinSource(unittest.TestCase):
 
     def test_get_played_tracks_skips_when_jellyfin(self):
         cleaner = cleanarr.MediaCleanup()
+        plex = MagicMock()
+        section = MagicMock()
+        section.type = "artist"
+        section.title = "Music"
+        section.search.return_value = []
+        plex.library.sections.return_value = [section]
+        cleaner.plex = plex
         tracks = cleaner.get_played_tracks()
         self.assertEqual(tracks, [])
+        plex.library.sections.assert_not_called()
+
+    def _radarr_payload(self, method, url):
+        path = urlparse(url).path.rstrip("/")
+        movie = {
+            "title": "Watched Movie",
+            "year": 2024,
+            "id": 12,
+            "path": "/movies/Watched Movie (2024)",
+            "tags": [],
+            "monitored": True,
+            "movieFile": {"id": 70},
+        }
+        if method == "GET" and path.endswith("/tag"):
+            return []
+        if method == "GET" and path.endswith("/movie"):
+            return [movie]
+        if method == "GET" and "/movie/" in path:
+            return movie
+        return {}
+
+    def _run_watched_movie_cleanup(self, *, dry_run):
+        """Run one Jellyfin watched movie through Radarr on a recording session."""
+        cleanarr.CONFIG["dry_run"] = dry_run
+        self.assertIs(cleanarr.CONFIG["dry_run"], dry_run)
+        cleaner = cleanarr.MediaCleanup()
+        session = RecordingHttpSession(self._radarr_payload)
+        cleaner.radarr_session = session
+        cleaner.radarr_client._session = session
+        watched = (
+            [
+                {
+                    "title": "Watched Movie",
+                    "year": 2024,
+                    "file": "/movies/Watched Movie (2024).mkv",
+                    "watched_by": {"alice": True},
+                    "watch_evidence": {"alice": "emby_isplayed"},
+                    "guid": "tmdb://555",
+                    "guids": ["tmdb://555"],
+                    "rating_key": "jf-movie-1",
+                    "source": "jellyfin",
+                }
+            ],
+            [],
+        )
+        with patch.object(
+            cleanarr.emby_client, "load_watched_state", return_value=watched
+        ), patch("requests.Session.request", side_effect=_forbid_real_http):
+            cleaner.process_watched_movies()
+        return cleaner, session
+
+    def test_dry_run_watched_movie_sends_no_mutating_http(self):
+        """Dry-run (explicitly on) reaches delete but sends only GETs."""
+        cleaner, session = self._run_watched_movie_cleanup(dry_run=True)
+        self.assertTrue(cleanarr.CONFIG["dry_run"])
+        self.assertEqual(
+            cleaner.run_summary["movie_deletions"],
+            ["Watched Movie (2024) [standard watched]"],
+        )
+        self.assertTrue(session.calls, "expected Radarr GET calls in dry-run")
+        mutating = [
+            call for call in session.calls if call[0] in _MUTATING_HTTP_METHODS
+        ]
+        self.assertEqual(mutating, [])
+        self.assertTrue(all(call[0] == "GET" for call in session.calls))
+        self.assertFalse(any("moviefile/70" in call[1] for call in session.calls))
+
+    def test_live_watched_movie_deletes_movie_file(self):
+        """The same harness deletes when dry-run is off, so the guard is real."""
+        _cleaner, session = self._run_watched_movie_cleanup(dry_run=False)
+        self.assertFalse(cleanarr.CONFIG["dry_run"])
+        delete_calls = [call for call in session.calls if call[0] == "DELETE"]
+        self.assertTrue(
+            any(call[1].rstrip("/").endswith("moviefile/70") for call in delete_calls),
+            delete_calls,
+        )
 
     def test_jellyfin_adapter_passes_config(self):
         session = MagicMock()

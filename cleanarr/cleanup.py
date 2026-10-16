@@ -2439,10 +2439,15 @@ class MediaCleanup:
         viewCount — the same family of signals used for TV and movies. Lidarr
         remains the source of truth for whether a track file is managed and
         may be deleted (lifecycle, tags, monitoring).
+
+        Jellyfin job mode never opens a Plex connection, so music lookup is
+        skipped there. Emby keeps this Plex library lookup, including the
+        error path when no Plex client was connected, so Lidarr cleanup is
+        unchanged from before Jellyfin support.
         """
-        if self.media_source in ("emby", "jellyfin") or not self.plex:
+        if self.media_source == "jellyfin":
             logger.info(
-                f"Media source is {self.media_source}; skipping Plex music track lookup"
+                "Media source is jellyfin; skipping Plex music track lookup"
             )
             return []
         logger.info("Checking for played music tracks in Plex")

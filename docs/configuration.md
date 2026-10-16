@@ -240,7 +240,13 @@ Required when `CLEANARR_MEDIA_SOURCE=emby`:
 | `CLEANARR_EMBY_USERS` | — | Optional comma-separated usernames. Empty = all non-disabled users. |
 
 
-Job mode calls Emby REST:
+Job mode calls Emby REST (read-only, header `X-Emby-Token`):
+
+- `GET /Users` — non-disabled users. `CLEANARR_EMBY_USERS`, when set, limits this list to those usernames.
+- `GET /Users/{userId}/Items?IsPlayed=true&Recursive=true&IncludeItemTypes=Movie&Fields=Path,ProviderIds,MediaSources,UserData,SeriesName,ParentIndexNumber,IndexNumber,ProductionYear,Overview&EnableTotalRecordCount=false`
+- `GET /Users/{userId}/Items?IsPlayed=true&Recursive=true&IncludeItemTypes=Episode` with the same `IsPlayed`, `Recursive`, `Fields`, and `EnableTotalRecordCount` query as the movie call.
+
+Paths are relative to `CLEANARR_EMBY_BASEURL`. Optional Lidarr cleanup does not use these calls. Played music tracks are still read from Plex artist libraries, the same as before Jellyfin job mode. An Emby job does not connect to Plex, so that lookup finds no tracks unless a Plex client is already attached.
 
 
 Per-user played flags are merged into the same `watched_by` / `watch_evidence` shape used for Plex (`watch_evidence` value `emby_isplayed`). Matching and delete policy then use Sonarr/Radarr tags as usual.
@@ -257,7 +263,13 @@ Required when `CLEANARR_MEDIA_SOURCE=jellyfin`:
 | `CLEANARR_JELLYFIN_USERS` | — | Optional comma-separated usernames. Empty = all non-disabled users. |
 
 
-Job mode calls Jellyfin REST:
+Job mode calls Jellyfin REST (read-only, header `X-Emby-Token`, the same client as Emby):
+
+- `GET /Users` — non-disabled users. `CLEANARR_JELLYFIN_USERS`, when set, limits this list to those usernames.
+- `GET /Users/{userId}/Items?IsPlayed=true&Recursive=true&IncludeItemTypes=Movie&Fields=Path,ProviderIds,MediaSources,UserData,SeriesName,ParentIndexNumber,IndexNumber,ProductionYear,Overview&EnableTotalRecordCount=false`
+- `GET /Users/{userId}/Items?IsPlayed=true&Recursive=true&IncludeItemTypes=Episode` with the same `IsPlayed`, `Recursive`, `Fields`, and `EnableTotalRecordCount` query as the movie call.
+
+Paths are relative to `CLEANARR_JELLYFIN_BASEURL`. These calls do not load music. Jellyfin job mode skips the Plex played-track lookup, so optional Lidarr cleanup finds no tracks when `CLEANARR_MEDIA_SOURCE=jellyfin`.
 
 
 Per-user played flags are merged into the same `watched_by` / `watch_evidence` shape used for Plex. Matching and delete policy then use Sonarr/Radarr tags as usual.
