@@ -144,6 +144,21 @@ CONFIG = {
         # Optional comma-separated usernames; empty means all non-disabled users.
         "users": _env_csv_set("CLEANARR_EMBY_USERS", default=""),
     },
+    "jellyfin": {
+        "baseurl": _get_env(
+            "CLEANARR_JELLYFIN_BASEURL",
+            "JELLYFIN_URL",
+            default="http://jellyfin:8096",
+        ),
+        "apikey": _get_env(
+            "CLEANARR_JELLYFIN_APIKEY",
+            "CLEANARR_JELLYFIN_TOKEN",
+            "JELLYFIN_APIKEY",
+            "JELLYFIN_TOKEN",
+        ),
+        # Optional comma-separated usernames; empty means all non-disabled users.
+        "users": _env_csv_set("CLEANARR_JELLYFIN_USERS", default=""),
+    },
     # Optional Lidarr music cleanup (default OFF). When disabled, no Lidarr API
     # calls are made and music libraries are left untouched.
     "lidarr": {
@@ -287,10 +302,10 @@ class MediaCleanup:
         """Initialize API connections."""
         logger.info("Initializing Plex Media Cleanup script")
         self.media_source = (CONFIG.get("media_source") or "plex").strip().lower()
-        if self.media_source not in ("plex", "emby"):
+        if self.media_source not in ("plex", "emby", "jellyfin"):
             raise ValueError(
                 f"Unsupported CLEANARR_MEDIA_SOURCE={self.media_source!r}; "
-                "expected 'plex' or 'emby'"
+                "expected 'plex', 'emby', or 'jellyfin'"
             )
         self.watch_evidence_by_rating_key = {}
         self.run_summary = {
@@ -334,6 +349,7 @@ class MediaCleanup:
         self._emby_watched_cache = None
         self.plex = None
         self.emby_session = None
+        self.jellyfin_session = None
         if self.media_source == "emby":
             if not CONFIG.get("emby", {}).get("apikey"):
                 logger.error(
@@ -344,12 +360,22 @@ class MediaCleanup:
             self.emby_session = requests.Session()
             if self.cf_headers:
                 self.emby_session.headers.update(self.cf_headers)
+        elif self.media_source == "jellyfin":
+            if not CONFIG.get("jellyfin", {}).get("apikey"):
+                logger.error(
+                    "Missing Jellyfin API key. Set CLEANARR_JELLYFIN_APIKEY "
+                    "(or CLEANARR_JELLYFIN_TOKEN / JELLYFIN_APIKEY)."
+                )
+                sys.exit(1)
+            self.jellyfin_session = requests.Session()
+            if self.cf_headers:
+                self.jellyfin_session.headers.update(self.cf_headers)
         else:
             if not CONFIG["plex"]["token"]:
                 logger.error("Missing Plex token. Set CLEANARR_PLEX_TOKEN or PLEX_TOKEN.")
                 sys.exit(1)
 
-        if self.media_source != "emby":
+        if self.media_source not in ("emby", "jellyfin"):
             try:
                 # Create session and inject headers *before* PlexServer connects
                 session = requests.Session()
@@ -366,7 +392,9 @@ class MediaCleanup:
             except Exception as e:
                 logger.error(f"Failed to connect to Plex: {str(e)}")
         else:
-            logger.info("Media source is Emby; skipping Plex client connection")
+            logger.info(
+                f"Media source is {self.media_source.capitalize()}; skipping Plex client connection"
+            )
 
         # Initialize Sonarr Session
         self.sonarr_session = requests.Session()
@@ -406,10 +434,16 @@ class MediaCleanup:
                 sys.exit(1)
 
         self.plex_source = PlexMediaSource(self.plex, self.watch_evidence_by_rating_key)
-        self.jellyfin = (
-            JellyfinMediaSource(self.emby_session, CONFIG["emby"])
-            if self.emby_session is not None else None
-        )
+        if self.media_source == "jellyfin":
+            self.jellyfin = (
+                JellyfinMediaSource(self.jellyfin_session, CONFIG["jellyfin"])
+                if self.jellyfin_session is not None else None
+            )
+        else:
+            self.jellyfin = (
+                JellyfinMediaSource(self.emby_session, CONFIG["emby"])
+                if self.emby_session is not None else None
+            )
         self.sonarr_client = ServarrClient(
             "Sonarr",
             CONFIG["sonarr"],
@@ -777,8 +811,8 @@ class MediaCleanup:
 
     def get_watched_movies(self):
         """Get all watched movies from the configured media source."""
-        if self.media_source == "emby":
-            logger.info("Checking for watched movies in Emby")
+        if self.media_source in ("emby", "jellyfin"):
+            logger.info(f"Checking for watched movies in {self.media_source.capitalize()}")
             movies, _ = self._load_emby_watched_state()
             logger.info(f"Found {len(movies)} watched movies")
             return movies
@@ -788,29 +822,41 @@ class MediaCleanup:
         """Load and cache Jellyfin/Emby watched movies and episodes for this run."""
         if self._emby_watched_cache is not None:
             return self._emby_watched_cache
+        source_name = self.media_source.capitalize() if hasattr(self, "media_source") else "Media source"
         if self.jellyfin is None:
-            logger.error("Emby session is not initialized")
+            logger.error(f"{source_name} session is not initialized")
             self._emby_watched_cache = ([], [])
             return self._emby_watched_cache
         try:
             movies, episodes = self.jellyfin.load_watched_state()
             logger.info(
-                "Loaded Emby watched state: %s movies, %s episodes",
+                "Loaded %s watched state: %s movies, %s episodes",
+                source_name,
                 len(movies),
                 len(episodes),
             )
             self._emby_watched_cache = (movies, episodes)
         except Exception as e:
-            logger.error(f"Error loading Emby watched state: {str(e)}")
+            logger.error(f"Error loading {source_name} watched state: {str(e)}")
             import traceback
             logger.error(traceback.format_exc())
             self._emby_watched_cache = ([], [])
         return self._emby_watched_cache
 
+    _load_jellyfin_watched_state = _load_emby_watched_state
+
+    @property
+    def _jellyfin_watched_cache(self):
+        return self._emby_watched_cache
+
+    @_jellyfin_watched_cache.setter
+    def _jellyfin_watched_cache(self, value):
+        self._emby_watched_cache = value
+
     def get_watched_episodes(self):
         """Get all watched episodes from the configured media source."""
-        if self.media_source == "emby":
-            logger.info("Checking for watched episodes in Emby")
+        if self.media_source in ("emby", "jellyfin"):
+            logger.info(f"Checking for watched episodes in {self.media_source.capitalize()}")
             _, episodes = self._load_emby_watched_state()
             logger.info(f"Found {len(episodes)} watched episodes")
             return episodes
@@ -2393,7 +2439,17 @@ class MediaCleanup:
         viewCount — the same family of signals used for TV and movies. Lidarr
         remains the source of truth for whether a track file is managed and
         may be deleted (lifecycle, tags, monitoring).
+
+        Jellyfin job mode never opens a Plex connection, so music lookup is
+        skipped there. Emby keeps this Plex library lookup, including the
+        error path when no Plex client was connected, so Lidarr cleanup is
+        unchanged from before Jellyfin support.
         """
+        if self.media_source == "jellyfin":
+            logger.info(
+                "Media source is jellyfin; skipping Plex music track lookup"
+            )
+            return []
         logger.info("Checking for played music tracks in Plex")
         played_tracks = []
         try:
