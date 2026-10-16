@@ -129,6 +129,13 @@ CONFIG = {
         ),
         "apikey": _get_env("CLEANARR_RADARR_APIKEY"),
     },
+    "readarr": {
+        "baseurl": _get_env(
+            "CLEANARR_READARR_BASEURL",
+            default="http://readarr:8787/api/v1/",
+        ),
+        "apikey": _get_env("CLEANARR_READARR_APIKEY"),
+    },
     "emby": {
         "baseurl": _get_env(
             "CLEANARR_EMBY_BASEURL",
@@ -421,6 +428,12 @@ class MediaCleanup:
             CONFIG["radarr"],
             session=self.radarr_session,
             missing_key_env="CLEANARR_RADARR_APIKEY",
+        )
+        self.readarr_client = ServarrClient(
+            "Readarr",
+            CONFIG["readarr"],
+            session_factory=requests.Session,
+            missing_key_env="CLEANARR_READARR_APIKEY",
         )
         # Lidarr sessions stay lazy and do not inherit Cloudflare headers.
         self.lidarr_client = ServarrClient(
@@ -765,6 +778,10 @@ class MediaCleanup:
     def _radarr_request(self, endpoint, method="GET", data=None):
         """Make a request to the Radarr API."""
         return self.radarr_client.request(endpoint, method=method, data=data)
+
+    def _readarr_request(self, endpoint, method="GET", data=None):
+        """Make a request to the Readarr API."""
+        return self.readarr_client.request(endpoint, method=method, data=data)
 
     def _arr_request(self, service_name, session, url, endpoint, method="GET", data=None):
         """Arr request helper retained for callers that already built a URL."""
@@ -1609,6 +1626,7 @@ class MediaCleanup:
             "sonarr": self._sonarr_request,
             "radarr": self._radarr_request,
             "lidarr": self._lidarr_request,
+            "readarr": self._readarr_request,
         }
         request = requesters.get(app)
         if request is None:
@@ -1694,8 +1712,13 @@ class MediaCleanup:
             for label in (getattr(torrent, "labels", None) or [])
             if str(label).strip()
         }
+        # Readarr commonly identifies downloads by directory category rather
+        # than a Transmission label.
+        category = _get_torrent_category(torrent)
+        if category:
+            labels.add(str(category).strip().casefold())
         torrent_title = str(getattr(torrent, "name", "") or "").strip().casefold()
-        for app in ("sonarr", "radarr", "lidarr"):
+        for app in ("sonarr", "radarr", "lidarr", "readarr"):
             if app not in labels:
                 continue
             imported = self._arr_import_history_contains(

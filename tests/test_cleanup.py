@@ -958,6 +958,34 @@ class TestMediaCleanup(unittest.TestCase):
 
         self.cleanup.transmission.remove_torrent.assert_called_once_with(305, delete_data=False)
 
+    def test_import_verified_readarr_category_removes_only_torrent_record(self):
+        """Readarr category fallback authorizes removal after a confirmed import."""
+        cleanarr.CONFIG.update({
+            "stale_torrent_require_import": True,
+            "stale_torrent_hours": 24,
+            "torrent_cleanup_required_labels": {"readarr"},
+            "torrent_cleanup_allowed_categories": {"readarr"},
+        })
+        book = self._make_torrent(
+            torrent_id=310,
+            name="Example.Audiobook",
+            download_dir="/media/downloads/readarr",
+            labels=[],
+            added_hours_ago=48,
+            percent_done=1.0,
+            status=0,
+        )
+        self.cleanup.transmission.get_torrents.return_value = [book]
+        history = {"records": [{"eventType": 3, "sourceTitle": "Example.Audiobook"}]}
+
+        with patch.object(self.cleanup, "_readarr_request", return_value=history) as request:
+            self.cleanup.remove_stale_torrents()
+
+        request.assert_called_once()
+        self.cleanup.transmission.remove_torrent.assert_called_once_with(
+            310, delete_data=False
+        )
+
     def test_import_verified_cleanup_uses_real_transmission_status(self):
         cleanarr.CONFIG.update({
             "stale_torrent_require_import": True,

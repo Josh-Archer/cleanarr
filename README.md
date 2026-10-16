@@ -173,6 +173,8 @@ The full configuration contract is documented in [docs/configuration.md](./docs/
 | `CLEANARR_SONARR_APIKEY` | Yes | Sonarr API key |
 | `CLEANARR_RADARR_BASEURL` | Yes | Radarr API base URL |
 | `CLEANARR_RADARR_APIKEY` | Yes | Radarr API key |
+| `CLEANARR_READARR_BASEURL` | No | Readarr API base URL for import-verified torrent cleanup (default `http://readarr:8787/api/v1/`) |
+| `CLEANARR_READARR_APIKEY` | When Readarr import checks are used | Readarr API key |
 | `CLEANARR_LOG_FILE` | No | Log file path for the runtime |
 | `CLEANARR_DEBUG` | No | Enables verbose logging |
 
