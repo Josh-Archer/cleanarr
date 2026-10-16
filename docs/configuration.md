@@ -15,7 +15,7 @@ Optional variables:
 - `CLEANARR_STALE_TORRENT_REQUIRE_IMPORT=true` to require exact Arr import-history evidence before stale torrent record cleanup. Configure the matching Sonarr/Radarr API URL and key; Lidarr additionally requires `CLEANARR_LIDARR_ENABLE=true` and its API URL/key. The torrent must be complete, stopped, and older than `CLEANARR_STALE_TORRENT_HOURS`. API failures and missing import records fail closed. This mode removes the Transmission record with `delete_data=false`, preserving the downloaded files.
 - `CLEANARR_REMOVE_SONARR_EXECUTABLE_DOWNLOADS=true` to remove completed Sonarr import warnings for executable-only torrents through Sonarr's blocklist API. This requires a unique matching Transmission info hash, the `sonarr` label, one fully downloaded `.exe` file, and the exact Sonarr download path. Multi-file torrents and other warning types are skipped. The job must call `MediaCleanup.clean_sonarr_executable_downloads()`; the setting is off by default.
 - `CLEANARR_DRY_RUN` to disable destructive actions
-- `CLEANARR_DRY_RUN_REPORT_DIR` directory for per-user dry-run report artifacts (`cleanarr-dry-run-report.json` and `.md`). Default: `/logs/dry-run-reports`. Written at end of a **job-mode** dry-run only.
+- `CLEANARR_DRY_RUN_REPORT_DIR` directory for per-user dry-run report artifacts (`cleanarr-dry-run-report.json` and `.md`). Default: `/logs/dry-run-reports`. Written when `CLEANARR_DRY_RUN=true` for scheduled job, webhook, and SQS runs.
 - `CLEANARR_NTFY_*` / `NTFY_*` for run summaries and error alerts (`CLEANARR_NTFY_BASEURL`, `CLEANARR_NTFY_TOPIC`, `CLEANARR_NTFY_TOKEN`, `NTFY_ENABLE`)
 - `WEBHOOK_SECRET` / `WEBHOOK_SECRET_PREVIOUS` to protect the Plex webhook endpoint (`/plex/webhook`) and the proxy ingress for Plex events
 - `JELLYFIN_WEBHOOK_SECRET` / `JELLYFIN_WEBHOOK_SECRET_PREVIOUS` to protect the Jellyfin webhook endpoint (`/jellyfin/webhook`) and the proxy ingress for Jellyfin events
@@ -146,9 +146,9 @@ Repository boundary:
 - Keep webhook and proxy runtime code in `cleanarr`
 - Keep cluster manifests, Terraform IAM, queue provisioning, and release promotion in the downstream environment repo
 
-## Dry-run report artifacts (job mode)
+## Dry-run report artifacts
 
-When `CLEANARR_DRY_RUN=true`, a completed **scheduled job** run writes structured report artifacts under `CLEANARR_DRY_RUN_REPORT_DIR`:
+When `CLEANARR_DRY_RUN=true`, scheduled job, webhook, and SQS runs write structured report artifacts under `CLEANARR_DRY_RUN_REPORT_DIR`:
 
 | File | Purpose |
 | --- | --- |
@@ -163,13 +163,17 @@ Report contents:
 - Decisions without a known profile appear under `_unattributed`
 - Sensitive values are redacted (same rules as decision JSONL)
 
-### Webhook limitations
+When a report directory is omitted or left empty, Cleanarr defaults to `/logs/dry-run-reports`. If writing fails (for example, read-only filesystem or missing permissions), Cleanarr logs a warning and execution continues normally.
 
-Dry-run **aggregate** report artifacts are a **job-mode** feature (full-library pass). Webhook and SQS consumer runtimes remain event-driven and do **not** write the per-user JSON/Markdown dry-run report files:
+When `CLEANARR_DRY_RUN=false` (live delete mode), no dry-run report artifacts are written.
 
-- They still append individual decisions to `CLEANARR_DECISION_REPORT_FILE` (JSONL) when configured.
-- A single webhook event only evaluates one (or a small set of) titles, so a complete per-user library report is not produced.
-- Operators who need a full “what would be deleted for each profile” artifact should run the job image with `CLEANARR_DRY_RUN=true` and collect files from `CLEANARR_DRY_RUN_REPORT_DIR` (for example via a mounted logs volume or `kubectl cp`).
+### Webhook and SQS reporting
+
+Webhook and SQS consumer runtimes write per-user dry-run report artifacts under `CLEANARR_DRY_RUN_REPORT_DIR` whenever dry-run mode is active:
+
+- Direct webhook runs update the dry-run JSON and Markdown report artifacts as webhook events are evaluated.
+- SQS consumer runs collect batch decisions and write the dry-run report artifacts for the processed messages.
+- Both runtimes also append individual decisions to `CLEANARR_DECISION_REPORT_FILE` (JSONL) when configured.
 
 
 - `CLEANARR_LIDARR_ENABLE` to opt into Lidarr-managed music cleanup (**default `false` / off**)

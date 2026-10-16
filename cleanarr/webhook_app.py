@@ -11,12 +11,18 @@ import sys
 import requests
 from urllib.parse import urlparse
 from flask import Flask, request, jsonify
+import contextvars
 from cleanarr.policy import (
     decide_exact_item_delete,
     ids_include_any_label,
     protected_ids_from_tags,
 )
-from cleanarr.reporting import DecisionReporter, redact_sensitive_data
+from cleanarr.reporting import (
+    DEFAULT_DRY_RUN_REPORT_DIR,
+    DecisionReporter,
+    DryRunReportCollector,
+    redact_sensitive_data,
+)
 from cleanarr.webhook.auth import verify_from_http
 
 APP = Flask(__name__)
@@ -123,10 +129,66 @@ if LOKI_URL:
 # Where to store incoming webhook events (one JSON object per line)
 EVENTS_FILE = os.environ.get("CLEANARR_EVENTS_FILE", os.path.join("/logs", "plex_events.json"))
 DECISION_REPORTER = DecisionReporter(component="webhook")
+DRY_RUN_REPORT = DryRunReportCollector(component="webhook", mode="dry-run")
+_DRY_RUN_LOCK = threading.Lock()
+_CURRENT_DRY_RUN_COLLECTOR: contextvars.ContextVar[DryRunReportCollector | None] = contextvars.ContextVar(
+    "_CURRENT_DRY_RUN_COLLECTOR", default=None
+)
 
 
-def _is_dry_run():
-    return os.environ.get("CLEANARR_DRY_RUN", "").lower() in {"1", "true", "yes"}
+def _is_dry_run() -> bool:
+    env_val = os.environ.get("CLEANARR_DRY_RUN", "").lower()
+    if env_val in {"1", "true", "yes"}:
+        return True
+    if env_val in {"0", "false", "no"}:
+        return False
+    cfg = globals().get("CONFIG")
+    if isinstance(cfg, dict):
+        return bool(cfg.get("dry_run"))
+    return False
+
+
+def _get_dry_run_report_dir() -> str:
+    env_val = os.environ.get("CLEANARR_DRY_RUN_REPORT_DIR")
+    if env_val:
+        return env_val
+    cfg = globals().get("CONFIG")
+    if isinstance(cfg, dict) and cfg.get("dry_run_report_dir"):
+        return str(cfg["dry_run_report_dir"])
+    return DEFAULT_DRY_RUN_REPORT_DIR
+
+
+def _get_current_dry_run_collector() -> DryRunReportCollector:
+    current = _CURRENT_DRY_RUN_COLLECTOR.get()
+    if current is not None:
+        return current
+    return DRY_RUN_REPORT
+
+
+def reset_dry_run_report(component: str = "webhook") -> DryRunReportCollector:
+    global DRY_RUN_REPORT
+    with _DRY_RUN_LOCK:
+        DRY_RUN_REPORT = DryRunReportCollector(component=component, mode="dry-run")
+        return DRY_RUN_REPORT
+
+
+def _write_dry_run_report_artifacts(
+    collector: DryRunReportCollector | None = None,
+    report_dir: str | None = None,
+) -> dict[str, str] | None:
+    if not _is_dry_run():
+        return None
+    collector = collector or _get_current_dry_run_collector()
+    target_dir = report_dir or _get_dry_run_report_dir()
+    paths = collector.write_artifacts(report_dir=target_dir)
+    if not paths:
+        logger.warning("Dry-run report artifacts were not written")
+        return None
+    logger.info(
+        "Wrote dry-run report artifacts: "
+        f"json={paths.get('json')} markdown={paths.get('markdown')}"
+    )
+    return paths
 
 
 def _event_media_type(meta):
@@ -280,6 +342,7 @@ CLEANARR_DEFAULTS = {
     'debug': _get_env('CLEANARR_DEBUG', default='true').lower() in ('true', '1', 'yes'),
     'stale_torrent_hours': int(_get_env('CLEANARR_STALE_TORRENT_HOURS', default='8')),
     'dry_run': _get_env('CLEANARR_DRY_RUN', default='false').lower() in ('true', '1', 'yes'),
+    'dry_run_report_dir': _get_env('CLEANARR_DRY_RUN_REPORT_DIR', default=DEFAULT_DRY_RUN_REPORT_DIR),
 }
 
 # ntfy/health-check configuration
@@ -584,13 +647,20 @@ def _record_webhook_decision(
     reason,
     details=None,
 ):
-    return DECISION_REPORTER.emit(
+    details = dict(details or {})
+    payload = DECISION_REPORTER.emit(
         reason_code=reason_code,
         media_type=media_type,
         media_title=media_title,
         reason=reason,
-        details=details or {},
+        details=details,
     )
+    if _is_dry_run():
+        collector = _get_current_dry_run_collector()
+        with _DRY_RUN_LOCK:
+            collector.add_decision(payload)
+            _write_dry_run_report_artifacts(collector=collector)
+    return payload
 
 
 def _queue_mode_is_sqs() -> bool:
@@ -895,36 +965,43 @@ def process_sqs_queue_messages(max_messages: int | None = None, force_deletions:
     budget = max_messages if max_messages is not None else WEBHOOK_QUEUE_MAX_MESSAGES
     budget = max(1, int(budget))
 
-    while (summary['processed'] + summary['failed']) < budget:
-        remaining = budget - (summary['processed'] + summary['failed'])
-        batch_size = min(10, remaining)
+    sqs_collector = DryRunReportCollector(component="sqs", mode="dry-run")
+    token = _CURRENT_DRY_RUN_COLLECTOR.set(sqs_collector)
+    try:
+        while (summary['processed'] + summary['failed']) < budget:
+            remaining = budget - (summary['processed'] + summary['failed'])
+            batch_size = min(10, remaining)
 
-        receive_args = {
-            'QueueUrl': WEBHOOK_QUEUE_URL,
-            'MaxNumberOfMessages': batch_size,
-            'WaitTimeSeconds': WEBHOOK_QUEUE_WAIT_SECONDS,
-        }
-        if WEBHOOK_QUEUE_VISIBILITY_TIMEOUT > 0:
-            receive_args['VisibilityTimeout'] = WEBHOOK_QUEUE_VISIBILITY_TIMEOUT
+            receive_args = {
+                'QueueUrl': WEBHOOK_QUEUE_URL,
+                'MaxNumberOfMessages': batch_size,
+                'WaitTimeSeconds': WEBHOOK_QUEUE_WAIT_SECONDS,
+            }
+            if WEBHOOK_QUEUE_VISIBILITY_TIMEOUT > 0:
+                receive_args['VisibilityTimeout'] = WEBHOOK_QUEUE_VISIBILITY_TIMEOUT
 
-        response = client.receive_message(**receive_args)
-        messages = response.get('Messages') or []
-        if not messages:
-            break
+            response = client.receive_message(**receive_args)
+            messages = response.get('Messages') or []
+            if not messages:
+                break
 
-        summary['received'] += len(messages)
+            summary['received'] += len(messages)
 
-        for message in messages:
-            try:
-                _process_sqs_message(message, force_deletions=force_deletions)
-                summary['processed'] += 1
-                receipt_handle = message.get('ReceiptHandle')
-                if receipt_handle:
-                    client.delete_message(QueueUrl=WEBHOOK_QUEUE_URL, ReceiptHandle=receipt_handle)
-                    summary['deleted'] += 1
-            except Exception:
-                summary['failed'] += 1
-                logger.exception('Failed to process queued webhook event')
+            for message in messages:
+                try:
+                    _process_sqs_message(message, force_deletions=force_deletions)
+                    summary['processed'] += 1
+                    receipt_handle = message.get('ReceiptHandle')
+                    if receipt_handle:
+                        client.delete_message(QueueUrl=WEBHOOK_QUEUE_URL, ReceiptHandle=receipt_handle)
+                        summary['deleted'] += 1
+                except Exception:
+                    summary['failed'] += 1
+                    logger.exception('Failed to process queued webhook event')
+    finally:
+        if _is_dry_run():
+            _write_dry_run_report_artifacts(collector=sqs_collector)
+        _CURRENT_DRY_RUN_COLLECTOR.reset(token)
 
     return summary
 
@@ -955,17 +1032,24 @@ def process_sqs_event_records(records, force_deletions: bool = False):
         'reason': '',
     }
 
-    for record in records or []:
-        summary['received'] += 1
-        try:
-            _process_sqs_message(record, force_deletions=force_deletions)
-            summary['processed'] += 1
-        except Exception:
-            summary['failed'] += 1
-            message_id = record.get('messageId') or record.get('MessageId')
-            if message_id:
-                summary['failed_message_ids'].append(str(message_id))
-            logger.exception('Failed to process event source mapping SQS record')
+    sqs_collector = DryRunReportCollector(component="sqs", mode="dry-run")
+    token = _CURRENT_DRY_RUN_COLLECTOR.set(sqs_collector)
+    try:
+        for record in records or []:
+            summary['received'] += 1
+            try:
+                _process_sqs_message(record, force_deletions=force_deletions)
+                summary['processed'] += 1
+            except Exception:
+                summary['failed'] += 1
+                message_id = record.get('messageId') or record.get('MessageId')
+                if message_id:
+                    summary['failed_message_ids'].append(str(message_id))
+                logger.exception('Failed to process event source mapping SQS record')
+    finally:
+        if _is_dry_run():
+            _write_dry_run_report_artifacts(collector=sqs_collector)
+        _CURRENT_DRY_RUN_COLLECTOR.reset(token)
 
     return summary
 
@@ -1681,13 +1765,18 @@ def _background_process_finished(ev: dict):
                 else "succeeded"
             )
             _log_webhook_cleanup_outcome(ev, media_type, outcome)
+            details = dict(detail or {})
+            if "user" not in details:
+                event_user = (ev.get("account") or {}).get("title")
+                if event_user:
+                    details["user"] = event_user
             if success:
                 _record_webhook_decision(
                     reason_code="dry-run" if mc.CONFIG["dry_run"] else "delete",
                     media_type=media_type,
                     media_title=media_title,
                     reason="webhook_finished",
-                    details=detail or {},
+                    details=details,
                 )
             else:
                 _record_webhook_decision(
@@ -1695,7 +1784,7 @@ def _background_process_finished(ev: dict):
                     media_type=media_type,
                     media_title=media_title,
                     reason="delete_failed",
-                    details=detail or {},
+                    details=details,
                 )
 
         # Try to fetch the Plex item by rating key if available
@@ -1802,12 +1891,20 @@ def _background_process_finished(ev: dict):
                         episode_tag_ids = set(sonarr_match['episode'].get('tags') or [])
                         if protected_tag_ids & (series_tag_ids | episode_tag_ids):
                             logger.info(f"Skipping deletion for {ep['show_title']} S{ep['season']}E{ep['episode']} due to 'safe' or 'kids' tag")
+                            matched_protected = [
+                                label for label in ("safe", "kids")
+                                if ids_include_any_label(sonarr_tags, series_tag_ids | episode_tag_ids, (label,))
+                            ]
                             _record_webhook_decision(
                                 reason_code="protected",
                                 media_type="episode",
                                 media_title=f"{ep['show_title']} S{ep['season']}E{ep['episode']}",
                                 reason="protected_series_or_episode_tags",
-                                details={"rating_key": ep.get("rating_key")},
+                                details={
+                                    "rating_key": ep.get("rating_key"),
+                                    "protected_labels": matched_protected or ["protected"],
+                                    "user": (ev.get("account") or {}).get("title"),
+                                },
                             )
                             return
                         # For finished events without Plex item, assume it should be deleted if watched
@@ -1868,14 +1965,23 @@ def _background_process_finished(ev: dict):
                             )
                             return
                         movie_tags = radarr_match['movie'].get('tags', [])
-                        if ids_include_any_label(radarr_tags, movie_tags, ("safe",)):
-                            logger.info(f"Skipping deletion for movie {mv['title']} due to 'safe' tag")
+                        if ids_include_any_label(radarr_tags, movie_tags, ("safe", "kids")):
+                            logger.info(f"Skipping deletion for movie {mv['title']} due to 'safe' or 'kids' tag")
+                            matched_protected = [
+                                label for label in ("safe", "kids")
+                                if ids_include_any_label(radarr_tags, movie_tags, (label,))
+                            ]
                             _record_webhook_decision(
                                 reason_code="protected",
                                 media_type="movie",
                                 media_title=f"{mv['title']} ({mv.get('year')})",
                                 reason="protected_series_or_movie_tags",
-                                details={"year": mv.get('year'), "tags": movie_tags},
+                                details={
+                                    "year": mv.get('year'),
+                                    "tags": movie_tags,
+                                    "protected_labels": matched_protected or ["protected"],
+                                    "user": (ev.get("account") or {}).get("title"),
+                                },
                             )
                             return
                         # For finished events without Plex item, assume it should be deleted if watched
@@ -1958,12 +2064,21 @@ def _background_process_finished(ev: dict):
             episode_tag_ids = set(episode_tags)
             if protected_tag_ids & (series_tag_ids | episode_tag_ids):
                 logger.info(f"Skipping deletion for {ep['show_title']} S{ep['season']}E{ep['episode']} due to 'safe' or 'kids' tag")
+                matched_protected = [
+                    label for label in ("safe", "kids")
+                    if ids_include_any_label(sonarr_tags, series_tag_ids | episode_tag_ids, (label,))
+                ]
                 _record_webhook_decision(
                     reason_code="protected",
                     media_type="episode",
                     media_title=f"{ep['show_title']} S{ep['season']}E{ep['episode']}",
                     reason="protected_series_or_episode_tags",
-                    details={"rating_key": ep.get("rating_key")},
+                    details={
+                        "rating_key": ep.get("rating_key"),
+                        "protected_labels": matched_protected or ["protected"],
+                        "watched_by": ep.get("watched_by"),
+                        "user": (ev.get("account") or {}).get("title"),
+                    },
                 )
                 return
 
@@ -1988,14 +2103,24 @@ def _background_process_finished(ev: dict):
                         True,
                         "episode",
                         f"{ep['show_title']} S{ep['season']}E{ep['episode']}",
-                        {"rating_key": ep.get("rating_key"), "file_id": sonarr_match.get('file_id')},
+                        {
+                            "rating_key": ep.get("rating_key"),
+                            "file_id": sonarr_match.get('file_id'),
+                            "watched_by": ep.get("watched_by"),
+                            "user_tags": user_tags,
+                        },
                     )
                 else:
                     _emit_result(
                         False,
                         "episode",
                         f"{ep['show_title']} S{ep['season']}E{ep['episode']}",
-                        {"rating_key": ep.get("rating_key"), "file_id": sonarr_match.get('file_id')},
+                        {
+                            "rating_key": ep.get("rating_key"),
+                            "file_id": sonarr_match.get('file_id'),
+                            "watched_by": ep.get("watched_by"),
+                            "user_tags": user_tags,
+                        },
                     )
             else:
                 _record_webhook_decision(
@@ -2003,7 +2128,12 @@ def _background_process_finished(ev: dict):
                     media_type="episode",
                     media_title=f"{ep['show_title']} S{ep['season']}E{ep['episode']}",
                     reason="tagged_users_not_all_watched",
-                    details={"user_tags": user_tags, "rating_key": ep.get("rating_key")},
+                    details={
+                        "user_tags": user_tags,
+                        "watched_by": ep.get("watched_by"),
+                        "rating_key": ep.get("rating_key"),
+                        "user": (ev.get("account") or {}).get("title"),
+                    },
                 )
 
         elif mtype == 'movie' or plex_item.type == 'movie':
@@ -2047,12 +2177,22 @@ def _background_process_finished(ev: dict):
             movie_tags = radarr_match['movie'].get('tags', [])
             if ids_include_any_label(radarr_tags, movie_tags, ("safe", "kids")):
                 logger.info(f"Skipping deletion for movie {mv['title']} due to 'safe' or 'kids' tag")
+                matched_protected = [
+                    label for label in ("safe", "kids")
+                    if ids_include_any_label(radarr_tags, movie_tags, (label,))
+                ]
                 _record_webhook_decision(
                     reason_code="protected",
                     media_type="movie",
                     media_title=f"{mv['title']} ({mv.get('year')})",
                     reason="protected_series_or_movie_tags",
-                    details={"rating_key": mv.get('rating_key'), "movie_tags": movie_tags},
+                    details={
+                        "rating_key": mv.get('rating_key'),
+                        "movie_tags": movie_tags,
+                        "protected_labels": matched_protected or ["protected"],
+                        "watched_by": mv.get("watched_by"),
+                        "user": (ev.get("account") or {}).get("title"),
+                    },
                 )
                 return
             user_tags = mc.get_user_tags(radarr_tags, movie_tags)
@@ -2070,14 +2210,24 @@ def _background_process_finished(ev: dict):
                         True,
                         "movie",
                         f"{mv['title']} ({mv.get('year')})",
-                        {"rating_key": mv.get('rating_key'), "file_id": radarr_match.get('file_id')},
+                        {
+                            "rating_key": mv.get('rating_key'),
+                            "file_id": radarr_match.get('file_id'),
+                            "watched_by": mv.get("watched_by"),
+                            "user_tags": user_tags,
+                        },
                     )
                 else:
                     _emit_result(
                         False,
                         "movie",
                         f"{mv['title']} ({mv.get('year')})",
-                        {"rating_key": mv.get('rating_key'), "file_id": radarr_match.get('file_id')},
+                        {
+                            "rating_key": mv.get('rating_key'),
+                            "file_id": radarr_match.get('file_id'),
+                            "watched_by": mv.get("watched_by"),
+                            "user_tags": user_tags,
+                        },
                     )
             else:
                 _record_webhook_decision(
@@ -2085,7 +2235,12 @@ def _background_process_finished(ev: dict):
                     media_type="movie",
                     media_title=f"{mv['title']} ({mv.get('year')})",
                     reason="tagged_users_not_all_watched",
-                    details={"user_tags": user_tags, "rating_key": mv.get('rating_key')},
+                    details={
+                        "user_tags": user_tags,
+                        "watched_by": mv.get("watched_by"),
+                        "rating_key": mv.get('rating_key'),
+                        "user": (ev.get("account") or {}).get("title"),
+                    },
                 )
 
         else:
@@ -2203,12 +2358,21 @@ def _background_process_removed(ev: dict):
             series_tags = sonarr_series.get('tags', [])
             if ids_include_any_label(sonarr_tags, series_tags, ("safe", "kids")):
                 logger.info(f"Skipping deletion for removed series {title} due to 'safe' or 'kids' tag")
+                matched_protected = [
+                    label for label in ("safe", "kids")
+                    if ids_include_any_label(sonarr_tags, series_tags, (label,))
+                ]
                 _record_webhook_decision(
                     reason_code="protected",
                     media_type="episode",
                     media_title=media_title,
                     reason="protected_series_or_movie_tags",
-                    details={"title": title, "series_tags": series_tags},
+                    details={
+                        "title": title,
+                        "series_tags": series_tags,
+                        "protected_labels": matched_protected or ["protected"],
+                        "user": (ev.get("account") or {}).get("title"),
+                    },
                 )
                 return
 
@@ -2229,7 +2393,11 @@ def _background_process_removed(ev: dict):
                     media_type="episode",
                     media_title=media_title,
                     reason="webhook_removed",
-                    details={"title": title, "series_id": sonarr_series['id']},
+                    details={
+                        "title": title,
+                        "series_id": sonarr_series['id'],
+                        "user": (ev.get("account") or {}).get("title"),
+                    },
                 )
             else:
                 _log_webhook_cleanup_outcome(
@@ -2314,14 +2482,23 @@ def _background_process_removed(ev: dict):
                 )
                 return
             movie_tags = radarr_movie.get('tags', [])
-            if ids_include_any_label(radarr_tags, movie_tags, ("safe",)):
-                logger.info(f"Skipping deletion for removed movie {title} due to 'safe' tag")
+            if ids_include_any_label(radarr_tags, movie_tags, ("safe", "kids")):
+                logger.info(f"Skipping deletion for removed movie {title} due to 'safe' or 'kids' tag")
+                matched_protected = [
+                    label for label in ("safe", "kids")
+                    if ids_include_any_label(radarr_tags, movie_tags, (label,))
+                ]
                 _record_webhook_decision(
                     reason_code="protected",
                     media_type="movie",
                     media_title=media_title,
                     reason="protected_series_or_movie_tags",
-                    details={"title": title, "movie_tags": movie_tags},
+                    details={
+                        "title": title,
+                        "movie_tags": movie_tags,
+                        "protected_labels": matched_protected or ["protected"],
+                        "user": (ev.get("account") or {}).get("title"),
+                    },
                 )
                 return
 
@@ -2342,7 +2519,11 @@ def _background_process_removed(ev: dict):
                     media_type="movie",
                     media_title=media_title,
                     reason="webhook_removed",
-                    details={"title": title, "movie_id": radarr_movie['id']},
+                    details={
+                        "title": title,
+                        "movie_id": radarr_movie['id'],
+                        "user": (ev.get("account") or {}).get("title"),
+                    },
                 )
             else:
                 _log_webhook_cleanup_outcome(
