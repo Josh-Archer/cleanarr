@@ -1712,14 +1712,15 @@ class MediaCleanup:
             for label in (getattr(torrent, "labels", None) or [])
             if str(label).strip()
         }
-        # Readarr commonly identifies downloads by directory category rather
-        # than a Transmission label.
         category = _get_torrent_category(torrent)
-        if category:
-            labels.add(str(category).strip().casefold())
+        category_name = str(category).strip().casefold() if category else None
         torrent_title = str(getattr(torrent, "name", "") or "").strip().casefold()
         for app in ("sonarr", "radarr", "lidarr", "readarr"):
-            if app not in labels:
+            # Readarr commonly identifies downloads by directory category rather
+            # than a Transmission label. Sonarr, Radarr, and Lidarr match strictly
+            # on Transmission labels.
+            has_app_label = app in labels or (app == "readarr" and category_name == "readarr")
+            if not has_app_label:
                 continue
             imported = self._arr_import_history_contains(
                 app, torrent_title, added_date, getattr(torrent, "hash_string", None)

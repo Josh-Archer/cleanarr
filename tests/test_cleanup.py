@@ -4,6 +4,7 @@ from unittest.mock import MagicMock, patch
 import sys
 import os
 import tempfile
+import json
 import requests
 from transmission_rpc import Torrent as RpcTorrent
 
@@ -16,6 +17,51 @@ if repo_root not in sys.path:
 os.environ['CLEANARR_LOG_FILE'] = os.path.join(tempfile.gettempdir(), 'cleanarr_test.log')
 
 from cleanarr import cleanup as cleanarr
+
+
+class RecordingSession(requests.Session):
+    """Session that records HTTP requests and returns stubbed responses."""
+
+    def __init__(self, response=None):
+        super().__init__()
+        self.recorded_requests = []
+        self._default_response = response
+        self.request_calls = []
+
+    def _make_response(self):
+        if self._default_response is not None:
+            return self._default_response
+        res = requests.Response()
+        res.status_code = 200
+        res._content = b"{}"
+        return res
+
+    def get(self, url, **kwargs):
+        self.recorded_requests.append(("GET", url, kwargs))
+        return self._make_response()
+
+    def delete(self, url, **kwargs):
+        self.recorded_requests.append(("DELETE", url, kwargs))
+        return self._make_response()
+
+    def post(self, url, **kwargs):
+        self.recorded_requests.append(("POST", url, kwargs))
+        return self._make_response()
+
+    def put(self, url, **kwargs):
+        self.recorded_requests.append(("PUT", url, kwargs))
+        return self._make_response()
+
+    def patch(self, url, **kwargs):
+        self.recorded_requests.append(("PATCH", url, kwargs))
+        return self._make_response()
+
+    def request(self, method, url, **kwargs):
+        method_upper = method.upper()
+        self.request_calls.append((method_upper, url, kwargs))
+        self.recorded_requests.append((method_upper, url, kwargs))
+        return self._make_response()
+
 
 class TestMediaCleanup(unittest.TestCase):
 
@@ -985,6 +1031,226 @@ class TestMediaCleanup(unittest.TestCase):
         self.cleanup.transmission.remove_torrent.assert_called_once_with(
             310, delete_data=False
         )
+
+    def test_import_verified_readarr_dry_run_with_recording_session(self):
+        """Dry-run verifies Readarr import without sending destructive HTTP methods or removing torrent."""
+        cleanarr.CONFIG.update({
+            "dry_run": True,
+            "stale_torrent_require_import": True,
+            "stale_torrent_hours": 24,
+            "torrent_cleanup_required_labels": {"readarr"},
+            "torrent_cleanup_allowed_categories": {"readarr"},
+            "readarr": {
+                "baseurl": "http://readarr:8787/api/v1/",
+                "apikey": "mock-readarr-key",
+            },
+        })
+        self.cleanup.readarr_client.config = cleanarr.CONFIG["readarr"]
+
+        book = self._make_torrent(
+            torrent_id=310,
+            name="Example.Audiobook",
+            download_dir="/media/downloads/readarr",
+            labels=[],
+            added_hours_ago=48,
+            percent_done=1.0,
+            status=0,
+        )
+        self.cleanup.transmission.get_torrents.return_value = [book]
+
+        history_payload = {
+            "totalRecords": 1,
+            "records": [{"eventType": 3, "sourceTitle": "Example.Audiobook"}],
+        }
+        mock_response = requests.Response()
+        mock_response.status_code = 200
+        mock_response._content = json.dumps(history_payload).encode("utf-8")
+
+        recording_session = RecordingSession(response=mock_response)
+        self.cleanup.readarr_client._session = recording_session
+
+        with patch.object(self.cleanup, "_readarr_request", wraps=self.cleanup._readarr_request) as mock_req:
+            self.cleanup.remove_stale_torrents()
+
+        # Transmission torrent must not be removed in dry-run
+        self.cleanup.transmission.remove_torrent.assert_not_called()
+
+        # Every _readarr_request is a GET
+        self.assertTrue(mock_req.called)
+        for call_item in mock_req.call_args_list:
+            self.assertEqual(call_item.kwargs.get("method", "GET"), "GET")
+
+        # Recording HTTP session recorded requests
+        self.assertTrue(recording_session.recorded_requests)
+        sent_methods = [method for method, _, _ in recording_session.recorded_requests]
+        self.assertTrue(all(method == "GET" for method in sent_methods))
+
+        # Assert no DELETE, PUT, POST, or PATCH is sent
+        for disallowed in ("DELETE", "PUT", "POST", "PATCH"):
+            self.assertNotIn(disallowed, sent_methods)
+
+        # requests.Session.request was never reached
+        self.assertEqual(recording_session.request_calls, [])
+
+    def test_import_verified_readarr_unverified_import_keeps_torrent(self):
+        """Unverified Readarr import leaves the torrent in place without deletion."""
+        cleanarr.CONFIG.update({
+            "dry_run": False,
+            "stale_torrent_require_import": True,
+            "stale_torrent_hours": 24,
+            "torrent_cleanup_required_labels": {"readarr"},
+            "torrent_cleanup_allowed_categories": {"readarr"},
+            "readarr": {
+                "baseurl": "http://readarr:8787/api/v1/",
+                "apikey": "mock-readarr-key",
+            },
+        })
+        book = self._make_torrent(
+            torrent_id=310,
+            name="Unverified.Audiobook",
+            download_dir="/media/downloads/readarr",
+            labels=[],
+            added_hours_ago=48,
+            percent_done=1.0,
+            status=0,
+        )
+        self.cleanup.transmission.get_torrents.return_value = [book]
+        history = {
+            "totalRecords": 1,
+            "records": [{"eventType": 3, "sourceTitle": "Different.Audiobook"}],
+        }
+
+        with patch.object(self.cleanup, "_readarr_request", return_value=history) as request:
+            self.cleanup.remove_stale_torrents()
+
+        request.assert_called_once()
+        self.cleanup.transmission.remove_torrent.assert_not_called()
+
+    def test_import_verified_readarr_api_failure_logs_error_and_does_not_remove(self):
+        """Readarr API failure logs an error and leaves torrent untouched (fails closed)."""
+        cleanarr.CONFIG.update({
+            "dry_run": False,
+            "stale_torrent_require_import": True,
+            "stale_torrent_hours": 24,
+            "torrent_cleanup_required_labels": {"readarr"},
+            "torrent_cleanup_allowed_categories": {"readarr"},
+            "readarr": {
+                "baseurl": "http://readarr:8787/api/v1/",
+                "apikey": "mock-readarr-key",
+            },
+        })
+        self.cleanup.readarr_client.config = cleanarr.CONFIG["readarr"]
+
+        book = self._make_torrent(
+            torrent_id=310,
+            name="Example.Audiobook",
+            download_dir="/media/downloads/readarr",
+            labels=[],
+            added_hours_ago=48,
+            percent_done=1.0,
+            status=0,
+        )
+        self.cleanup.transmission.get_torrents.return_value = [book]
+
+        mock_session = MagicMock()
+        mock_session.get.side_effect = requests.exceptions.RequestException("connection refused")
+        self.cleanup.readarr_client._session = mock_session
+
+        with patch("cleanarr.adapters.servarr.time.sleep"), \
+             patch.object(cleanarr.logger, "error") as mock_error, \
+             patch.object(cleanarr.logger, "warning") as mock_warning:
+            self.cleanup.remove_stale_torrents()
+
+        self.cleanup.transmission.remove_torrent.assert_not_called()
+        mock_error.assert_called()
+        self.assertTrue(
+            any("Readarr API error" in str(arg) for call_args in mock_error.call_args_list for arg in call_args[0])
+        )
+        mock_warning.assert_called()
+        self.assertTrue(
+            any("Readarr import history unavailable" in str(arg) for call_args in mock_warning.call_args_list for arg in call_args[0])
+        )
+
+    def test_import_verified_readarr_history_unavailable_fails_closed(self):
+        """Unavailable Readarr history (None) fails closed without removing torrents."""
+        cleanarr.CONFIG.update({
+            "dry_run": False,
+            "stale_torrent_require_import": True,
+            "stale_torrent_hours": 24,
+            "torrent_cleanup_required_labels": {"readarr"},
+            "torrent_cleanup_allowed_categories": {"readarr"},
+        })
+        book = self._make_torrent(
+            torrent_id=310,
+            name="Example.Audiobook",
+            download_dir="/media/downloads/readarr",
+            labels=[],
+            added_hours_ago=48,
+            percent_done=1.0,
+            status=0,
+        )
+        self.cleanup.transmission.get_torrents.return_value = [book]
+
+        with patch.object(self.cleanup, "_readarr_request", return_value=None):
+            self.cleanup.remove_stale_torrents()
+
+        self.cleanup.transmission.remove_torrent.assert_not_called()
+
+    def test_category_as_label_fallback_limited_to_readarr_only(self):
+        """Directory category fallback applies only to Readarr; Sonarr and Radarr require labels."""
+        cleanarr.CONFIG.update({
+            "stale_torrent_require_import": True,
+            "stale_torrent_hours": 24,
+            "torrent_cleanup_required_labels": {"sonarr", "radarr", "readarr"},
+            "torrent_cleanup_allowed_categories": {"sonarr", "radarr", "readarr"},
+        })
+        added_date = datetime.now(timezone.utc) - timedelta(hours=48)
+        sonarr_torrent = self._make_torrent(
+            torrent_id=401,
+            name="Show.S01E01",
+            download_dir="/media/downloads/sonarr",
+            labels=[],
+            added_hours_ago=48,
+            percent_done=1.0,
+            status=0,
+        )
+        radarr_torrent = self._make_torrent(
+            torrent_id=402,
+            name="Movie.2025",
+            download_dir="/media/downloads/radarr",
+            labels=[],
+            added_hours_ago=48,
+            percent_done=1.0,
+            status=0,
+        )
+        readarr_torrent = self._make_torrent(
+            torrent_id=403,
+            name="Audiobook.Title",
+            download_dir="/media/downloads/readarr",
+            labels=[],
+            added_hours_ago=48,
+            percent_done=1.0,
+            status=0,
+        )
+
+        with patch.object(self.cleanup, "_arr_import_history_contains", return_value=True) as mock_contains:
+            # Sonarr and Radarr without labels must return False and never query import history
+            self.assertFalse(self.cleanup._stale_torrent_has_arr_import(sonarr_torrent, added_date))
+            self.assertFalse(self.cleanup._stale_torrent_has_arr_import(radarr_torrent, added_date))
+            # Readarr with category fallback queries import history and returns True
+            self.assertTrue(self.cleanup._stale_torrent_has_arr_import(readarr_torrent, added_date))
+            self.assertEqual(mock_contains.call_count, 1)
+            self.assertEqual(mock_contains.call_args[0][0], "readarr")
+
+        # Check remove_stale_torrents end-to-end: unlabelled Sonarr/Radarr torrents are not removed
+        self.cleanup.transmission.get_torrents.return_value = [sonarr_torrent, radarr_torrent]
+        with patch.object(self.cleanup, "_sonarr_request") as mock_sonarr, \
+             patch.object(self.cleanup, "_radarr_request") as mock_radarr:
+            self.cleanup.remove_stale_torrents()
+
+        mock_sonarr.assert_not_called()
+        mock_radarr.assert_not_called()
+        self.cleanup.transmission.remove_torrent.assert_not_called()
 
     def test_import_verified_cleanup_uses_real_transmission_status(self):
         cleanarr.CONFIG.update({
