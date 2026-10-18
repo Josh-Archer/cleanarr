@@ -85,7 +85,12 @@ jobs:
       - uses: docker/setup-qemu-action@v4
       - uses: docker/setup-buildx-action@v4
         with:
-          driver-opts: image=public.ecr.aws/vend/moby/buildkit:buildx-stable-1
+          # NOTE: do not point this at public.ecr.aws — its anonymous
+          # quotas throttle shared GitHub runners ("toomanyrequests: Data
+          # limit exceeded"), failing builds before any layer builds.
+          # mirror.gcr.io is the same Docker Hub mirror the Dockerfiles
+          # already pull base images from successfully.
+          driver-opts: image=mirror.gcr.io/moby/buildkit:buildx-stable-1
       - uses: docker/login-action@v4
         with:
           registry: ghcr.io
