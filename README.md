@@ -181,7 +181,7 @@ The full configuration contract is documented in [docs/configuration.md](./docs/
 | Variable | Default | What It Does |
 | --- | --- | --- |
 | `CLEANARR_DRY_RUN` | `false` | Disables destructive delete operations. Start here first. |
-| `CLEANARR_DRY_RUN_REPORT_DIR` | `/logs/dry-run-reports` | When dry-run is enabled, the job writes per-user JSON and Markdown report artifacts here (`cleanarr-dry-run-report.json` / `.md`). Webhook mode does not emit these aggregate artifacts (see [docs/configuration.md](./docs/configuration.md)). |
+| `CLEANARR_DRY_RUN_REPORT_DIR` | `/logs/dry-run-reports` | When dry-run is enabled, scheduled job, webhook, and SQS runs write per-user JSON and Markdown report artifacts here (`cleanarr-dry-run-report.json` / `.md`). |
 | `CLEANARR_DISABLE_TORRENT_CLEANUP` | `false` | Disables stale torrent and failed download cleanup. |
 | `CLEANARR_REMOVE_FAILED_DOWNLOADS` | `false` | Removes failed Transmission downloads when enabled. |
 | `CLEANARR_REMOVE_SONARR_EXECUTABLE_DOWNLOADS` | `false` | Blocklists and removes only completed Sonarr queue warnings whose matching, Sonarr-labeled Transmission torrent contains exactly one fully downloaded `.exe` under `/media/downloads/sonarr`. Requires Sonarr and Transmission access; honors dry run and torrent cleanup filters. |

@@ -313,6 +313,9 @@ class DryRunReportCollector:
         self.items.append(item)
         return item
 
+    def clear(self) -> None:
+        self.items.clear()
+
     def build(self) -> Dict[str, Any]:
         return build_dry_run_report(
             self.items,
@@ -472,7 +475,7 @@ def write_dry_run_report_artifacts(
     try:
         target_dir.mkdir(parents=True, exist_ok=True)
         with open(paths["json"], "w", encoding="utf-8") as handle:
-            json.dump(report, handle, indent=2, ensure_ascii=False)
+            json.dump(report, handle, indent=2, ensure_ascii=False, default=str)
             handle.write("\n")
         with open(paths["markdown"], "w", encoding="utf-8") as handle:
             handle.write(render_dry_run_markdown(report))

@@ -1835,6 +1835,9 @@ class MediaCleanup:
 
     def remove_from_plex_watchlist(self, rating_key):
         """Remove an item from the Plex Watchlist for the owner and managed users."""
+        if CONFIG["dry_run"]:
+            logger.info(f"[DRY RUN] Would remove item {rating_key} from Plex Watchlist")
+            return
         self.plex_source.remove_from_watchlist(rating_key)
 
     def process_watched_episodes(self):

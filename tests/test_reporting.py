@@ -292,6 +292,32 @@ class TestDryRunReportShape(unittest.TestCase):
         self.assertIn("carol", lowered)
         self.assertIn("bob", lowered)
 
+    def test_dry_run_report_collector_clear_and_components(self):
+        collector = reporting.DryRunReportCollector(component="webhook", mode="dry-run")
+        decision = {
+            "recorded_at": "2026-10-16T00:00:00+00:00",
+            "component": "webhook",
+            "reason_code": "dry-run",
+            "media_type": "movie",
+            "media_title": "Webhook Movie",
+            "reason": "webhook_finished",
+            "details": {"user": "alice"},
+        }
+        collector.add_decision(decision)
+        report = collector.build()
+        self.assertEqual(report["component"], "webhook")
+        self.assertEqual(len(collector.items), 1)
+
+        collector.clear()
+        self.assertEqual(len(collector.items), 0)
+        report_empty = collector.build()
+        self.assertEqual(report_empty["summary"]["would_delete"], 0)
+
+        sqs_collector = reporting.DryRunReportCollector(component="sqs", mode="dry-run")
+        sqs_collector.add_decision(decision)
+        sqs_report = sqs_collector.build()
+        self.assertEqual(sqs_report["component"], "sqs")
+
 
 if __name__ == '__main__':
     unittest.main()
