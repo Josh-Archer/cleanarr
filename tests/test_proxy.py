@@ -531,6 +531,10 @@ class TestProxyLogging(unittest.TestCase):
             'POST /plex/webhook?apikey=[REDACTED]&access_token=[REDACTED]&secret=[REDACTED]&auth=[REDACTED]&X-Plex-Token=[REDACTED] HTTP/1.1',
         )
         self.assertEqual(
+            redact('POST /plex/webhook?TOKEN=secret123&ApiKey=mykey HTTP/1.1'),
+            'POST /plex/webhook?TOKEN=[REDACTED]&ApiKey=[REDACTED] HTTP/1.1',
+        )
+        self.assertEqual(
             redact('GET /healthz HTTP/1.1'),
             'GET /healthz HTTP/1.1',
         )
