@@ -19,6 +19,11 @@ spec:
                 name: cleanarr-secrets
             - configMapRef:
                 name: cleanarr-config
+            # Optional configMap keys: CLEANARR_GRACE_DAYS=0,
+            # CLEANARR_LEAVING_SOON_COLLECTION=Leaving Soon, and
+            # CLEANARR_LEAVING_SOON_STATE_FILE=/logs/leaving-soon-state.json.
+            # Share a persistent state volume with the webhook deployment before
+            # enabling a non-zero grace period.
             volumeMounts:
             - name: logs
               mountPath: /logs

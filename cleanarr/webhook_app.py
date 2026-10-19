@@ -1909,6 +1909,9 @@ def _background_process_finished(ev: dict):
                             return
                         # For finished events without Plex item, assume it should be deleted if watched
                         logger.info(f"Webhook-triggered deletion (fallback): deleting {ep['show_title']} S{ep['season']}E{ep['episode']}")
+                        if not mc.leaving_soon_allows_delete(mc.leaving_soon_key(ep), f"{ep['show_title']} S{ep['season']}E{ep['episode']}", ep.get('rating_key')):
+                            _record_webhook_decision(reason_code="skip", media_type="episode", media_title=f"{ep['show_title']} S{ep['season']}E{ep['episode']}", reason="leaving_soon_grace_period", details={"rating_key": ep.get("rating_key")})
+                            return
                         if mc.delete_sonarr_episode_file(sonarr_match.get('file_id')):
                             if mc.unmonitor_sonarr_episode(sonarr_match['episode']['id']):
                                 _notify_episode_cleanup_success(ep)
@@ -1986,6 +1989,9 @@ def _background_process_finished(ev: dict):
                             return
                         # For finished events without Plex item, assume it should be deleted if watched
                         logger.info(f"Webhook-triggered deletion (fallback): deleting movie {mv['title']}")
+                        if not mc.leaving_soon_allows_delete(mc.leaving_soon_key(mv), f"{mv['title']} ({mv.get('year')})", mv.get('rating_key')):
+                            _record_webhook_decision(reason_code="skip", media_type="movie", media_title=mv['title'], reason="leaving_soon_grace_period", details={"rating_key": mv.get("rating_key")})
+                            return
                         if mc.delete_radarr_movie_file(radarr_match.get('file_id')):
                             mc.unmonitor_radarr_movie(radarr_match['movie']['id'])
                             # Since we don't have a Plex item, we can't reliably get the ratingKey if it's not in metadata
@@ -2091,6 +2097,9 @@ def _background_process_finished(ev: dict):
             logger.info(f"Should delete: {should_delete}")
             
             if should_delete:
+                if not mc.leaving_soon_allows_delete(mc.leaving_soon_key(ep), f"{ep['show_title']} S{ep['season']}E{ep['episode']}", ep.get('rating_key')):
+                    _record_webhook_decision(reason_code="skip", media_type="episode", media_title=f"{ep['show_title']} S{ep['season']}E{ep['episode']}", reason="leaving_soon_grace_period", details={"rating_key": ep.get("rating_key")})
+                    return
                 logger.info(f"Webhook-triggered deletion: deleting {ep['show_title']} S{ep['season']}E{ep['episode']}")
                 if mc.delete_sonarr_episode_file(sonarr_match.get('file_id')):
                     if mc.unmonitor_sonarr_episode(sonarr_match['episode']['id']):
@@ -2199,6 +2208,9 @@ def _background_process_finished(ev: dict):
             # Filter out force-delete tags since we're removing that logic
             user_tags = [tag for tag in user_tags if tag.lower() != 'force-delete']
             if mc.should_delete_media(mv, user_tags, mv['watched_by']):
+                if not mc.leaving_soon_allows_delete(mc.leaving_soon_key(mv), f"{mv['title']} ({mv['year']})", mv.get('rating_key')):
+                    _record_webhook_decision(reason_code="skip", media_type="movie", media_title=f"{mv['title']} ({mv['year']})", reason="leaving_soon_grace_period", details={"rating_key": mv.get("rating_key")})
+                    return
                 logger.info(f"Webhook-triggered deletion: deleting movie {mv['title']}")
                 if mc.delete_radarr_movie_file(radarr_match.get('file_id')):
                     mc.unmonitor_radarr_movie(radarr_match['movie']['id'])
@@ -2376,6 +2388,14 @@ def _background_process_removed(ev: dict):
                 )
                 return
 
+            removal_key = mc.leaving_soon_key({"rating_key": meta.get("ratingKey"), "guid": guid})
+            if not mc.leaving_soon_allows_delete(removal_key, title, meta.get("ratingKey")):
+                _record_webhook_decision(
+                    reason_code="skip", media_type="episode", media_title=media_title,
+                    reason="leaving_soon_grace_period",
+                    details={"rating_key": meta.get("ratingKey")},
+                )
+                return
             logger.info(f"Webhook-triggered deletion: deleting entire series {title} from Sonarr")
             if mc.delete_sonarr_series(sonarr_series['id']):
                 _log_webhook_cleanup_outcome(
@@ -2502,6 +2522,14 @@ def _background_process_removed(ev: dict):
                 )
                 return
 
+            removal_key = mc.leaving_soon_key({"rating_key": meta.get("ratingKey"), "guid": guid})
+            if not mc.leaving_soon_allows_delete(removal_key, title, meta.get("ratingKey")):
+                _record_webhook_decision(
+                    reason_code="skip", media_type="movie", media_title=media_title,
+                    reason="leaving_soon_grace_period",
+                    details={"rating_key": meta.get("ratingKey")},
+                )
+                return
             logger.info(f"Webhook-triggered deletion: deleting movie {title} from Radarr")
             if mc.delete_radarr_movie(radarr_movie['id']):
                 _log_webhook_cleanup_outcome(
