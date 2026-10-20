@@ -531,7 +531,8 @@ class MediaCleanup:
             if not isinstance(record, str):
                 state[key] = now.isoformat()
                 self.run_summary.setdefault("leaving_soon_entering", []).append(title)
-                self._save_leaving_soon_state(state)
+                if not CONFIG.get("dry_run"):
+                    self._save_leaving_soon_state(state)
                 self._leaving_soon_eligible[key] = state[key]
                 self._sync_leaving_soon_collection(state)
                 return False
@@ -544,7 +545,8 @@ class MediaCleanup:
                 first = now
                 state[key] = now.isoformat()
                 record = state[key]
-                self._save_leaving_soon_state(state)
+                if not CONFIG.get("dry_run"):
+                    self._save_leaving_soon_state(state)
             expired = now >= first + timedelta(days=grace_days)
             return expired
 
@@ -565,6 +567,13 @@ class MediaCleanup:
     def _sync_leaving_soon(self):
         """Drop entries that are no longer eligible and sync their Plex collection."""
         if int(CONFIG.get("grace_days", 0) or 0) <= 0:
+            return
+        if self.run_outcome != OUTCOME_SUCCESS:
+            # An earlier step aborted or partially failed, so the eligible set
+            # is incomplete; pruning would reset grace clocks.
+            logger.warning("Skipping Leaving Soon pruning: earlier steps did not complete successfully")
+            return
+        if CONFIG.get("dry_run"):
             return
         with _LEAVING_SOON_LOCK:
             state = self._load_leaving_soon_state()

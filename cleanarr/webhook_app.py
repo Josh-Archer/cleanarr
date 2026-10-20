@@ -2388,14 +2388,8 @@ def _background_process_removed(ev: dict):
                 )
                 return
 
-            removal_key = mc.leaving_soon_key({"rating_key": meta.get("ratingKey"), "guid": guid})
-            if not mc.leaving_soon_allows_delete(removal_key, title, meta.get("ratingKey")):
-                _record_webhook_decision(
-                    reason_code="skip", media_type="episode", media_title=media_title,
-                    reason="leaving_soon_grace_period",
-                    details={"rating_key": meta.get("ratingKey")},
-                )
-                return
+            # Removed events fire once and are never replayed, so they are exempt
+            # from the Leaving Soon grace period (otherwise they would be lost).
             logger.info(f"Webhook-triggered deletion: deleting entire series {title} from Sonarr")
             if mc.delete_sonarr_series(sonarr_series['id']):
                 _log_webhook_cleanup_outcome(
@@ -2522,14 +2516,8 @@ def _background_process_removed(ev: dict):
                 )
                 return
 
-            removal_key = mc.leaving_soon_key({"rating_key": meta.get("ratingKey"), "guid": guid})
-            if not mc.leaving_soon_allows_delete(removal_key, title, meta.get("ratingKey")):
-                _record_webhook_decision(
-                    reason_code="skip", media_type="movie", media_title=media_title,
-                    reason="leaving_soon_grace_period",
-                    details={"rating_key": meta.get("ratingKey")},
-                )
-                return
+            # Removed events fire once and are never replayed, so they are exempt
+            # from the Leaving Soon grace period (otherwise they would be lost).
             logger.info(f"Webhook-triggered deletion: deleting movie {title} from Radarr")
             if mc.delete_radarr_movie(radarr_movie['id']):
                 _log_webhook_cleanup_outcome(

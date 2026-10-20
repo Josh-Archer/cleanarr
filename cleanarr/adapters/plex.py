@@ -237,6 +237,9 @@ class PlexMediaSource:
             existing = next((c for c in section.collections() if c.title == name), None)
             if existing is None and not wanted_items:
                 continue
+            if dry_run:
+                logger.info(f"[DRY RUN] Would sync Leaving Soon collection '{name}' in {section.title}")
+                continue
             if existing is None:
                 existing = section.createCollection(name, items=wanted_items)
             else:

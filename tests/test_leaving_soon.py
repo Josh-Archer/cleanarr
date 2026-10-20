@@ -103,6 +103,63 @@ class TestLeavingSoonState(unittest.TestCase):
         with open(self.state_path, encoding="utf-8") as state_file:
             self.assertIn("plex:123", json.load(state_file))
 
+    def test_webhook_removed_movie_bypasses_grace_period(self):
+        movie = {"id": 44, "title": "Example", "year": 2024, "tags": []}
+        with patch.object(webhook_app, "_get_media_cleanup", return_value=self.cleaner), \
+             patch.object(webhook_app, "_record_webhook_decision"), \
+             patch.object(webhook_app, "_log_webhook_cleanup_outcome"), \
+             patch.object(self.cleaner, "_radarr_request", return_value=[]), \
+             patch.object(self.cleaner, "get_radarr_movies", return_value=[movie]), \
+             patch.object(self.cleaner, "get_radarr_tags", return_value=[]), \
+             patch.object(self.cleaner, "delete_radarr_movie", return_value=True) as delete_movie:
+            webhook_app._background_process_removed({
+                "event": "library.deleted",
+                "metadata": {"type": "movie", "title": "Example", "year": 2024,
+                             "ratingKey": "123", "guid": "tmdb://1"},
+            })
+        delete_movie.assert_called_once_with(44)
+        self.assertFalse(os.path.exists(self.state_path))
+
+    def test_dry_run_does_not_write_state(self):
+        cleanup.CONFIG["dry_run"] = True
+        self.assertFalse(self.cleaner.leaving_soon_allows_delete("plex:123", "Example", 123))
+        self.assertFalse(os.path.exists(self.state_path))
+        self.cleaner._sync_leaving_soon()
+        self.assertFalse(os.path.exists(self.state_path))
+
+    def test_prune_skipped_after_abort_or_partial_failure(self):
+        for outcome in (cleanup.OUTCOME_ABORTED, cleanup.OUTCOME_PARTIAL_FAILURE):
+            with self.subTest(outcome=outcome):
+                state = {"plex:123": datetime.now(timezone.utc).isoformat()}
+                with open(self.state_path, "w", encoding="utf-8") as state_file:
+                    json.dump(state, state_file)
+                self.cleaner.run_outcome = outcome
+                self.cleaner._leaving_soon_eligible.clear()
+                self.cleaner._sync_leaving_soon()
+                with open(self.state_path, encoding="utf-8") as state_file:
+                    self.assertEqual(json.load(state_file), state)
+
+
+class TestPlexLeavingSoonDryRun(unittest.TestCase):
+    def test_dry_run_makes_no_plex_mutations(self):
+        from cleanarr.adapters.plex import PlexMediaSource
+        server = MagicMock()
+        item = MagicMock(ratingKey=1)
+        section = MagicMock()
+        item.section.return_value = section
+        server.fetchItem.return_value = item
+        server.library.sections.return_value = [section]
+        existing = MagicMock(title="Leaving Soon")
+        existing.items.return_value = []
+        for collections in ([], [existing]):
+            section.collections.return_value = collections
+            PlexMediaSource(server, {}).sync_leaving_soon_collection(
+                "Leaving Soon", ["1"], dry_run=True
+            )
+        section.createCollection.assert_not_called()
+        for method in ("addItems", "removeItems", "modeUpdate", "visibility"):
+            getattr(existing, method).assert_not_called()
+
 
 if __name__ == "__main__":
     unittest.main()
