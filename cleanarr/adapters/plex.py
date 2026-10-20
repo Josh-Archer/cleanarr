@@ -211,3 +211,49 @@ class PlexMediaSource:
 
         except Exception as exc:
             logger.error(f"Error in remove_from_plex_watchlist: {exc}")
+
+    def sync_leaving_soon_collection(self, name, rating_keys, removed_rating_keys=(), dry_run=False):
+        """Synchronize a named manual collection and promote it to Plex hubs.
+
+        Plex collections belong to one library section and cannot mix media
+        types, so a shared name may produce one collection in each section.
+        """
+        desired = {str(key) for key in rating_keys if key}
+        for key in removed_rating_keys:
+            desired.discard(str(key))
+        items_by_section = {}
+        for rating_key in desired:
+            try:
+                item = self.server.fetchItem(int(rating_key))
+                section = item.section()
+                items_by_section.setdefault(section, []).append(item)
+            except Exception as exc:
+                logger.warning(f"Could not resolve Leaving Soon Plex item {rating_key}: {exc}")
+
+        sections = self.server.library.sections()
+        for section in sections:
+            wanted_items = items_by_section.get(section, [])
+            wanted_keys = {str(item.ratingKey) for item in wanted_items}
+            existing = next((c for c in section.collections() if c.title == name), None)
+            if existing is None and not wanted_items:
+                continue
+            if dry_run:
+                logger.info(f"[DRY RUN] Would sync Leaving Soon collection '{name}' in {section.title}")
+                continue
+            if existing is None:
+                existing = section.createCollection(name, items=wanted_items)
+            else:
+                present = existing.items()
+                present_by_key = {str(item.ratingKey): item for item in present}
+                remove_items = [item for key, item in present_by_key.items() if key not in wanted_keys]
+                add_items = [item for item in wanted_items if str(item.ratingKey) not in present_by_key]
+                if remove_items:
+                    existing.removeItems(remove_items)
+                if add_items:
+                    existing.addItems(add_items)
+            # Plex calls the corresponding advanced setting "showItems" and
+            # exposes Home/Recommended promotion through ManagedHub.
+            existing.modeUpdate("showItems")
+            hub = existing.visibility()
+            hub.promoteHome()
+            hub.promoteRecommended()
