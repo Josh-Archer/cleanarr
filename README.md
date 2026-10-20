@@ -392,7 +392,7 @@ Cleanarr is built for setups where Plex, Emby, or Jellyfin is the source of trut
 - send run summaries and health notifications to `ntfy`
 
 
-- connect to Plex or Emby (`CLEANARR_MEDIA_SOURCE`)
+- connect to Plex, Emby, or Jellyfin (`CLEANARR_MEDIA_SOURCE`)
 - load watched episodes and movies
 - match content in Sonarr and Radarr
 - apply deletion policy
@@ -436,12 +436,15 @@ Plex / Emby / Jellyfin watch state / webhook events
 - decoupled: Plex / Emby / Jellyfin -> in-cluster proxy -> SQS -> webhook consumer runtime
 
 | --- | --- | --- |
-| `CLEANARR_MEDIA_SOURCE` | No | Job watched-state source: `plex` (default) or `emby` |
+| `CLEANARR_MEDIA_SOURCE` | No | Job watched-state source: `plex` (default), `emby`, or `jellyfin` |
 | `CLEANARR_PLEX_BASEURL` | When source is plex | Plex base URL used for watch state, item lookups, and watchlist cleanup |
 | `CLEANARR_PLEX_TOKEN` | When source is plex | Plex auth token |
 | `CLEANARR_EMBY_BASEURL` | When source is emby | Emby Server base URL |
 | `CLEANARR_EMBY_APIKEY` | When source is emby | Emby API key (`X-Emby-Token`) |
 | `CLEANARR_EMBY_USERS` | No | Optional comma-separated Emby usernames for job watched state |
+| `CLEANARR_JELLYFIN_BASEURL` | When source is jellyfin | Jellyfin Server base URL |
+| `CLEANARR_JELLYFIN_APIKEY` | When source is jellyfin | Jellyfin API key (`X-Emby-Token`) |
+| `CLEANARR_JELLYFIN_USERS` | No | Optional comma-separated Jellyfin usernames for job watched state |
 | `CLEANARR_SONARR_BASEURL` | Yes | Sonarr API base URL |
 | `CLEANARR_SONARR_APIKEY` | Yes | Sonarr API key |
 | `CLEANARR_RADARR_BASEURL` | Yes | Radarr API base URL |

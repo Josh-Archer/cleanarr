@@ -2,8 +2,9 @@
 
 Jellyfin and Emby share the same REST shape used here (``X-Emby-Token`` and
 ``/Users/{id}/Items?IsPlayed=true``). Job mode selects this source with
-``CLEANARR_MEDIA_SOURCE=emby``. Webhook payload mapping stays in the webhook
-app; this adapter only loads library watch state.
+``CLEANARR_MEDIA_SOURCE=jellyfin`` or ``CLEANARR_MEDIA_SOURCE=emby``. Webhook
+payload mapping stays in the webhook app; this adapter only loads library watch
+state.
 """
 
 from __future__ import annotations
@@ -16,7 +17,7 @@ class JellyfinMediaSource:
 
     def __init__(self, session, config):
         self.session = session
-        # Same dict as CONFIG["emby"] so later env/test patches stay visible.
+        # Same dict as CONFIG["jellyfin"] or CONFIG["emby"] so later env/test patches stay visible.
         self.config = config
 
     def load_watched_state(self):

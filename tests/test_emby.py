@@ -1,4 +1,4 @@
-﻿"""Emby media-source and webhook coverage (issue #16)."""
+"""Emby media-source and webhook coverage (issue #16)."""
 
 import os
 import sys
@@ -327,6 +327,72 @@ class TestMediaCleanupEmbySource(unittest.TestCase):
         self.assertFalse(
             cleaner.should_delete_media(media, ["bob"], media["watched_by"])
         )
+
+    def test_get_played_tracks_still_reads_plex_library(self):
+        """Emby keeps the historical Plex music lookup used by Lidarr cleanup."""
+        cleaner = cleanarr.MediaCleanup()
+        self.assertEqual(cleaner.media_source, "emby")
+        self.assertIsNone(cleaner.plex)
+
+        track = MagicMock()
+        track.title = "Yellow"
+        track.isWatched = True
+        track.viewCount = 1
+        track.grandparentTitle = "Coldplay"
+        track.originalTitle = None
+        track.parentTitle = "Parachutes"
+        track.index = 5
+        track.trackNumber = 5
+        track.year = 2000
+        track.parentYear = 2000
+        track.locations = ["/music/Coldplay/Parachutes/05 - Yellow.flac"]
+        track.guids = []
+        track.guid = "plex://track/yellow"
+        track.ratingKey = 101
+
+        section = MagicMock()
+        section.type = "artist"
+        section.title = "Music"
+        section.search.return_value = [track]
+        plex = MagicMock()
+        plex.library.sections.return_value = [section]
+        cleaner.plex = plex
+
+        tracks = cleaner.get_played_tracks()
+
+        self.assertEqual(len(tracks), 1)
+        self.assertEqual(tracks[0]["title"], "Yellow")
+        self.assertEqual(tracks[0]["artist"], "Coldplay")
+        self.assertEqual(tracks[0]["album"], "Parachutes")
+        self.assertEqual(
+            tracks[0]["file"],
+            "/music/Coldplay/Parachutes/05 - Yellow.flac",
+        )
+        plex.library.sections.assert_called_once()
+        section.search.assert_called_once_with(libtype="track")
+
+    def test_get_played_tracks_without_plex_still_attempts_lookup(self):
+        """Emby with no Plex client still enters the Plex lookup and returns nothing.
+
+        That is the pre-Jellyfin behavior. It must not take the Jellyfin skip,
+        which returns before touching the client.
+        """
+        cleaner = cleanarr.MediaCleanup()
+        self.assertIsNone(cleaner.plex)
+        self.assertEqual(cleaner.get_played_tracks(), [])
+
+        accessed = []
+
+        class _PlexProbe:
+            @property
+            def library(self):
+                accessed.append("library")
+                raise RuntimeError("plex client unavailable")
+
+        cleaner.plex = _PlexProbe()
+        tracks = cleaner.get_played_tracks()
+        self.assertEqual(tracks, [])
+        self.assertEqual(accessed, ["library"])
 
 
 class TestEmbyWebhookRoutes(unittest.TestCase):
