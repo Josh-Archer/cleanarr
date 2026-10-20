@@ -615,7 +615,9 @@ class MediaCleanup:
             state = self._load_leaving_soon_state()
         now = datetime.now(timezone.utc)
         changed = False
-        for key, record in state.items():
+        # Work on a snapshot because finalized records are removed from state
+        # below. Mutating the dictionary being iterated aborts the whole run.
+        for key, record in list(state.items()):
             if not isinstance(record, dict) or record.get("source") != "removed_event":
                 continue
             try:
@@ -634,6 +636,12 @@ class MediaCleanup:
                 if not movie:
                     continue
                 if movie.get("movieFile") or movie.get("hasFile"):
+                    if record.pop("no_file_seen_at", None) is not None:
+                        changed = True
+                    continue
+                if not record.get("no_file_seen_at"):
+                    record["no_file_seen_at"] = now.isoformat()
+                    changed = True
                     continue
                 if not self.delete_radarr_movie(arr_id, delete_files=False):
                     continue
@@ -643,20 +651,32 @@ class MediaCleanup:
                     continue
                 stats = series.get("statistics") or {}
                 if int(stats.get("episodeFileCount", 0) or 0) > 0:
+                    if record.pop("no_file_seen_at", None) is not None:
+                        changed = True
+                    continue
+                if not record.get("no_file_seen_at"):
+                    record["no_file_seen_at"] = now.isoformat()
+                    changed = True
                     continue
                 if not self.delete_sonarr_series(arr_id, delete_files=False):
                     continue
             elif media_type == "episode":
                 series_id = arr_id
                 episodes = self._sonarr_request(f"episode?seriesId={series_id}") if series_id else None
-                if not episodes:
+                if episodes is None:
                     continue
                 episode = next((
                     item for item in episodes
                     if item.get("seasonNumber") == record.get("season")
                     and item.get("episodeNumber") == record.get("episode")
                 ), None)
-                if not episode or episode.get("hasFile") or episode.get("episodeFileId"):
+                if episode and (episode.get("hasFile") or episode.get("episodeFileId")):
+                    if record.pop("no_file_seen_at", None) is not None:
+                        changed = True
+                    continue
+                if not record.get("no_file_seen_at"):
+                    record["no_file_seen_at"] = now.isoformat()
+                    changed = True
                     continue
             else:
                 continue

@@ -186,6 +186,84 @@ class TestLeavingSoonState(unittest.TestCase):
                 with open(self.state_path, encoding="utf-8") as state_file:
                     self.assertEqual(json.load(state_file), state)
 
+    def test_expired_removed_movie_and_episode_finish_run_and_save_state(self):
+        old = (datetime.now(timezone.utc) - timedelta(days=3)).isoformat()
+        state = {
+            "plex:movie": {
+                "first_eligible": old, "source": "removed_event",
+                "media_type": "movie", "arr_id": 44,
+            },
+            "plex:episode": {
+                "first_eligible": old, "source": "removed_event",
+                "media_type": "episode", "arr_id": 99,
+                "season": 1, "episode": 2,
+            },
+        }
+        with open(self.state_path, "w", encoding="utf-8") as state_file:
+            json.dump(state, state_file)
+
+        no_op_methods = (
+            "process_watched_episodes", "process_watched_movies",
+            "process_played_tracks", "clean_repeated_io_error_torrents",
+            "clean_sonarr_executable_downloads", "clean_failed_downloads",
+            "remove_stale_torrents", "_flush_run_summary",
+        )
+        patches = [patch.object(self.cleaner, name) for name in no_op_methods]
+        for method_patch in patches:
+            method_patch.start()
+            self.addCleanup(method_patch.stop)
+
+        with patch.object(self.cleaner, "_radarr_request", return_value={
+            "id": 44, "movieFile": None, "hasFile": False,
+        }), patch.object(self.cleaner, "_sonarr_request", return_value=[]), \
+             patch.object(self.cleaner, "delete_radarr_movie", return_value=True) as delete_movie, \
+             patch.object(self.cleaner, "delete_sonarr_series", return_value=True) as delete_series:
+            first_run = self.cleaner.run()
+            self.assertEqual(first_run.outcome, cleanup.OUTCOME_SUCCESS)
+            with open(self.state_path, encoding="utf-8") as state_file:
+                after_first_run = json.load(state_file)
+            self.assertTrue(after_first_run["plex:movie"].get("no_file_seen_at"))
+            self.assertTrue(after_first_run["plex:episode"].get("no_file_seen_at"))
+            delete_movie.assert_not_called()
+            delete_series.assert_not_called()
+
+            second_run = self.cleaner.run()
+
+        self.assertEqual(second_run.outcome, cleanup.OUTCOME_SUCCESS)
+        delete_movie.assert_called_once_with(44, delete_files=False)
+        delete_series.assert_not_called()
+        with open(self.state_path, encoding="utf-8") as state_file:
+            self.assertEqual(json.load(state_file), {})
+
+    def test_arr_file_reappearance_resets_no_file_confirmation(self):
+        old = (datetime.now(timezone.utc) - timedelta(days=3)).isoformat()
+        state = {"plex:movie": {
+            "first_eligible": old, "source": "removed_event",
+            "media_type": "movie", "arr_id": 44,
+        }}
+        with open(self.state_path, "w", encoding="utf-8") as state_file:
+            json.dump(state, state_file)
+
+        with patch.object(self.cleaner, "_radarr_request", side_effect=[
+            {"id": 44, "movieFile": None, "hasFile": False},
+            {"id": 44, "movieFile": {"id": 55}, "hasFile": True},
+            {"id": 44, "movieFile": None, "hasFile": False},
+            {"id": 44, "movieFile": None, "hasFile": False},
+        ]), patch.object(self.cleaner, "delete_radarr_movie", return_value=True) as delete_movie:
+            self.cleaner._finalize_removed_events()
+            with open(self.state_path, encoding="utf-8") as state_file:
+                self.assertIn("no_file_seen_at", json.load(state_file)["plex:movie"])
+            self.cleaner._finalize_removed_events()
+            with open(self.state_path, encoding="utf-8") as state_file:
+                self.assertNotIn("no_file_seen_at", json.load(state_file)["plex:movie"])
+            self.cleaner._finalize_removed_events()
+            delete_movie.assert_not_called()
+            self.cleaner._finalize_removed_events()
+
+        delete_movie.assert_called_once_with(44, delete_files=False)
+        with open(self.state_path, encoding="utf-8") as state_file:
+            self.assertEqual(json.load(state_file), {})
+
 
 class TestPlexLeavingSoonDryRun(unittest.TestCase):
     def test_dry_run_makes_no_plex_mutations(self):
