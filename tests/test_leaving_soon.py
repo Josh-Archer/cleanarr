@@ -103,22 +103,69 @@ class TestLeavingSoonState(unittest.TestCase):
         with open(self.state_path, encoding="utf-8") as state_file:
             self.assertIn("plex:123", json.load(state_file))
 
-    def test_webhook_removed_movie_bypasses_grace_period(self):
-        movie = {"id": 44, "title": "Example", "year": 2024, "tags": []}
+    def test_removed_movie_with_existing_file_is_not_deleted(self):
+        cleanup.CONFIG["grace_days"] = 0
+        movie_path = os.path.join(self.tempdir.name, "example.mkv")
+        with open(movie_path, "w", encoding="utf-8") as media_file:
+            media_file.write("media")
+        movie = {
+            "id": 44, "title": "Example", "year": 2024, "tags": [],
+            "movieFile": {"id": 55, "path": movie_path},
+        }
         with patch.object(webhook_app, "_get_media_cleanup", return_value=self.cleaner), \
              patch.object(webhook_app, "_record_webhook_decision"), \
              patch.object(webhook_app, "_log_webhook_cleanup_outcome"), \
              patch.object(self.cleaner, "_radarr_request", return_value=[]), \
              patch.object(self.cleaner, "get_radarr_movies", return_value=[movie]), \
              patch.object(self.cleaner, "get_radarr_tags", return_value=[]), \
-             patch.object(self.cleaner, "delete_radarr_movie", return_value=True) as delete_movie:
+             patch.object(self.cleaner, "delete_radarr_movie", return_value=True) as delete_movie, \
+             patch.object(self.cleaner, "delete_radarr_movie_file", return_value=True) as delete_file:
             webhook_app._background_process_removed({
                 "event": "library.deleted",
                 "metadata": {"type": "movie", "title": "Example", "year": 2024,
                              "ratingKey": "123", "guid": "tmdb://1"},
             })
-        delete_movie.assert_called_once_with(44)
-        self.assertFalse(os.path.exists(self.state_path))
+        delete_movie.assert_not_called()
+        delete_file.assert_not_called()
+
+    def test_webhook_removed_movie_honors_grace_and_persists_removed_marker(self):
+        movie = {"id": 44, "title": "Example", "year": 2024, "tags": []}
+        with patch.object(webhook_app, "_get_media_cleanup", return_value=self.cleaner), \
+             patch.object(webhook_app, "_record_webhook_decision"), \
+             patch.object(self.cleaner, "_radarr_request", return_value=[]), \
+             patch.object(self.cleaner, "get_radarr_movies", return_value=[movie]), \
+             patch.object(self.cleaner, "get_radarr_tags", return_value=[]), \
+             patch.object(self.cleaner, "delete_radarr_movie", return_value=True) as delete_movie, \
+             patch.object(self.cleaner, "delete_radarr_movie_file", return_value=True) as delete_file:
+            webhook_app._background_process_removed({
+                "event": "library.remove",
+                "metadata": {"type": "movie", "title": "Example", "year": 2024,
+                             "ratingKey": "123", "guid": "tmdb://1"},
+            })
+        delete_movie.assert_not_called()
+        delete_file.assert_not_called()
+        with open(self.state_path, encoding="utf-8") as state_file:
+            state = json.load(state_file)
+        self.assertEqual(state["plex:123"]["source"], "removed_event")
+        self.assertEqual(state["plex:123"]["media_type"], "movie")
+        self.cleaner._sync_leaving_soon()
+        with open(self.state_path, encoding="utf-8") as state_file:
+            self.assertIn("plex:123", json.load(state_file))
+
+    def test_removed_episode_never_deletes_series(self):
+        series = {"id": 99, "title": "Example Show", "tags": []}
+        with patch.object(webhook_app, "_get_media_cleanup", return_value=self.cleaner), \
+             patch.object(webhook_app, "_record_webhook_decision"), \
+             patch.object(self.cleaner, "_sonarr_request", return_value=[]), \
+             patch.object(self.cleaner, "get_sonarr_series", return_value=[series]), \
+             patch.object(self.cleaner, "get_sonarr_tags", return_value=[]), \
+             patch.object(self.cleaner, "delete_sonarr_series", return_value=True) as delete_series:
+            webhook_app._background_process_removed({
+                "event": "library.remove",
+                "metadata": {"type": "episode", "grandparentTitle": "Example Show",
+                             "title": "Episode 1", "ratingKey": "321", "guid": "tvdb://9"},
+            })
+        delete_series.assert_not_called()
 
     def test_dry_run_does_not_write_state(self):
         cleanup.CONFIG["dry_run"] = True

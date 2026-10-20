@@ -528,7 +528,8 @@ class MediaCleanup:
         with _LEAVING_SOON_LOCK:
             state = self._load_leaving_soon_state()
             record = state.get(key)
-            if not isinstance(record, str):
+            timestamp = record.get("first_eligible") if isinstance(record, dict) else record
+            if not isinstance(timestamp, str):
                 state[key] = now.isoformat()
                 self.run_summary.setdefault("leaving_soon_entering", []).append(title)
                 if not CONFIG.get("dry_run"):
@@ -538,7 +539,7 @@ class MediaCleanup:
                 return False
             self._leaving_soon_eligible[key] = record
             try:
-                first = datetime.fromisoformat(record)
+                first = datetime.fromisoformat(timestamp)
                 if first.tzinfo is None:
                     first = first.replace(tzinfo=timezone.utc)
             except (TypeError, ValueError):
@@ -549,6 +550,27 @@ class MediaCleanup:
                     self._save_leaving_soon_state(state)
             expired = now >= first + timedelta(days=grace_days)
             return expired
+
+    def record_removed_event(self, key, title, media_type, arr_id, rating_key=None, **details):
+        """Persist a one-shot Plex removal so scheduled pruning cannot lose its grace clock."""
+        if not key or int(CONFIG.get("grace_days", 0) or 0) <= 0:
+            return
+        now = datetime.now(timezone.utc).isoformat()
+        with _LEAVING_SOON_LOCK:
+            state = self._load_leaving_soon_state()
+            record = state.get(key)
+            if isinstance(record, str):
+                record = {"first_eligible": record}
+            if not isinstance(record, dict):
+                record = {"first_eligible": now}
+            record.update({"source": "removed_event", "media_type": media_type, "arr_id": arr_id})
+            record.update({name: value for name, value in details.items() if value is not None})
+            state[key] = record
+            if not CONFIG.get("dry_run"):
+                self._save_leaving_soon_state(state)
+            self._leaving_soon_eligible[key] = record
+            self.run_summary.setdefault("leaving_soon_entering", []).append(title)
+            self._sync_leaving_soon_collection(state)
 
     def _sync_leaving_soon_collection(self, state):
         collection_name = CONFIG.get("leaving_soon_collection")
@@ -577,9 +599,74 @@ class MediaCleanup:
             return
         with _LEAVING_SOON_LOCK:
             state = self._load_leaving_soon_state()
-            retained = {key: value for key, value in state.items() if key in self._leaving_soon_eligible}
+            retained = {
+                key: value for key, value in state.items()
+                if key in self._leaving_soon_eligible
+                or (isinstance(value, dict) and value.get("source") == "removed_event")
+            }
             self._save_leaving_soon_state(retained)
         self._sync_leaving_soon_collection(retained)
+
+    def _finalize_removed_events(self):
+        """Finalize expired one-shot removals only after Arr confirms no files remain."""
+        if int(CONFIG.get("grace_days", 0) or 0) <= 0 or CONFIG.get("dry_run"):
+            return
+        with _LEAVING_SOON_LOCK:
+            state = self._load_leaving_soon_state()
+        now = datetime.now(timezone.utc)
+        changed = False
+        for key, record in state.items():
+            if not isinstance(record, dict) or record.get("source") != "removed_event":
+                continue
+            try:
+                first = datetime.fromisoformat(record["first_eligible"])
+                if first.tzinfo is None:
+                    first = first.replace(tzinfo=timezone.utc)
+            except (KeyError, TypeError, ValueError):
+                continue
+            if now < first + timedelta(days=int(CONFIG.get("grace_days", 0) or 0)):
+                continue
+
+            media_type = record.get("media_type")
+            arr_id = record.get("arr_id")
+            if media_type == "movie":
+                movie = self._radarr_request(f"movie/{arr_id}") if arr_id else None
+                if not movie:
+                    continue
+                if movie.get("movieFile") or movie.get("hasFile"):
+                    continue
+                if not self.delete_radarr_movie(arr_id, delete_files=False):
+                    continue
+            elif media_type == "show":
+                series = self._sonarr_request(f"series/{arr_id}") if arr_id else None
+                if not series:
+                    continue
+                stats = series.get("statistics") or {}
+                if int(stats.get("episodeFileCount", 0) or 0) > 0:
+                    continue
+                if not self.delete_sonarr_series(arr_id, delete_files=False):
+                    continue
+            elif media_type == "episode":
+                series_id = arr_id
+                episodes = self._sonarr_request(f"episode?seriesId={series_id}") if series_id else None
+                if not episodes:
+                    continue
+                episode = next((
+                    item for item in episodes
+                    if item.get("seasonNumber") == record.get("season")
+                    and item.get("episodeNumber") == record.get("episode")
+                ), None)
+                if not episode or episode.get("hasFile") or episode.get("episodeFileId"):
+                    continue
+            else:
+                continue
+
+            state.pop(key, None)
+            self._leaving_soon_eligible.pop(key, None)
+            changed = True
+        if changed:
+            with _LEAVING_SOON_LOCK:
+                self._save_leaving_soon_state(state)
 
     def _record_decision(
         self,
@@ -1450,25 +1537,31 @@ class MediaCleanup:
             logger.error(f"Failed to retrieve movie {movie_id} for unmonitoring")
             return False
 
-    def delete_sonarr_series(self, series_id):
+    def delete_sonarr_series(self, series_id, delete_files=True):
         """Delete an entire series from Sonarr."""
         if CONFIG["dry_run"]:
             logger.info(f"[DRY RUN] Would delete series {series_id} from Sonarr")
             return True
         logger.info(f"Deleting series {series_id} from Sonarr")
-        result = self._sonarr_request(f"series/{series_id}?deleteFiles=true&addImportListExclusion=false", method="DELETE")
+        result = self._sonarr_request(
+            f"series/{series_id}?deleteFiles={str(bool(delete_files)).lower()}&addImportListExclusion=false",
+            method="DELETE",
+        )
         if result is None:
             return False
         logger.info(f"Successfully deleted series: {series_id}")
         return True
 
-    def delete_radarr_movie(self, movie_id):
+    def delete_radarr_movie(self, movie_id, delete_files=True):
         """Delete an entire movie from Radarr."""
         if CONFIG["dry_run"]:
             logger.info(f"[DRY RUN] Would delete movie {movie_id} from Radarr")
             return True
         logger.info(f"Deleting movie {movie_id} from Radarr")
-        result = self._radarr_request(f"movie/{movie_id}?deleteFiles=true&addImportListExclusion=false", method="DELETE")
+        result = self._radarr_request(
+            f"movie/{movie_id}?deleteFiles={str(bool(delete_files)).lower()}&addImportListExclusion=false",
+            method="DELETE",
+        )
         if result is None:
             return False
         logger.info(f"Successfully deleted movie: {movie_id}")
@@ -2992,6 +3085,7 @@ class MediaCleanup:
         try:
             self.process_watched_episodes()
             self.process_watched_movies()
+            self._finalize_removed_events()
             self._sync_leaving_soon()
             self.process_played_tracks()
             self.clean_repeated_io_error_torrents()

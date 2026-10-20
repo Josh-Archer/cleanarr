@@ -739,7 +739,9 @@ class TestRealDeleteMethodsDryRunHttpLayer(unittest.TestCase):
             self.assertTrue(os.path.isfile(json_path))
             with open(json_path, "r", encoding="utf-8") as handle:
                 report = json.load(handle)
-            self.assertEqual(report["summary"]["would_delete"], 1)
+            # Removed episode events are deferred because they must never
+            # delete an entire Sonarr series.
+            self.assertEqual(report["summary"]["would_delete"], 0)
 
     def test_sqs_queue_dry_run_real_delete_no_mutations(self):
         rec_session = RecordingSession(_default_arr_handlers())
