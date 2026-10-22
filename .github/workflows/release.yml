@@ -136,6 +136,24 @@ jobs:
         uses: aws-actions/amazon-ecr-login@v2
         with:
           registry-type: public
+      - name: Mirror ECR Public base images to GHCR
+        id: base-images
+        if: ${{ matrix.dockerfile != 'apps/job/Dockerfile' }}
+        env:
+          OWNER: ${{ github.repository_owner }}
+        run: |
+          set -euo pipefail
+          mirror="ghcr.io/${OWNER}/base-mirror"
+          case "${{ matrix.dockerfile }}" in
+            apps/webhook/Dockerfile)
+              ref="$(bash scripts/mirror_base_image.sh public.ecr.aws/awsguru/aws-lambda-adapter:0.9.0@sha256:1c31bf4102ca63ef2082534d7139c0bc5fbd36ea6648e4756e9b475ef3ed829c "${mirror}/aws-lambda-adapter")"
+              echo "build-args=LAMBDA_ADAPTER_IMAGE=${ref}" >> "${GITHUB_OUTPUT}"
+              ;;
+            apps/lambda/Dockerfile)
+              ref="$(bash scripts/mirror_base_image.sh public.ecr.aws/lambda/python:3.11@sha256:af7d68f0baca0969f5232b1adce5288b5132c711e4c9f6f899c8108d17012989 "${mirror}/lambda-python")"
+              echo "build-args=LAMBDA_BASE_IMAGE=${ref}" >> "${GITHUB_OUTPUT}"
+              ;;
+          esac
       - name: Build and push
         id: build
         uses: docker/build-push-action@v7
@@ -144,6 +162,7 @@ jobs:
           file: ${{ matrix.dockerfile }}
           platforms: linux/amd64,linux/arm64
           push: true
+          build-args: ${{ steps.base-images.outputs.build-args }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
