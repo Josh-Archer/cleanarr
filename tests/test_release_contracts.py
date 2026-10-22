@@ -25,6 +25,34 @@ class TestCIReleaseWorkflowContracts(unittest.TestCase):
         self.assertIn("- image: cleanarr-lambda", self.ci_workflow)
         self.assertIn("file: apps/lambda/Dockerfile", self.ci_workflow)
 
+    def test_base_images_from_ecr_public_are_pinned_by_digest(self):
+        for path in (("apps", "webhook", "Dockerfile"), ("apps", "lambda", "Dockerfile")):
+            refs = re.findall(r"public\.ecr\.aws/\S+", _read(*path))
+            self.assertTrue(refs, path)
+            for ref in refs:
+                self.assertRegex(ref, r"@sha256:[0-9a-f]{64}$", ref)
+
+    def test_workflows_authenticate_to_ecr_public_before_build(self):
+        for workflow, build in (
+            (self.ci_workflow, "docker/build-push-action"),
+            (self.release_workflow, "docker/build-push-action"),
+        ):
+            login = workflow.index("registry-type: public")
+            self.assertLess(login, workflow.index(build))
+
+    def test_ecr_public_base_images_are_mirrored_with_retry_before_build(self):
+        script = _read("scripts", "mirror_base_image.sh")
+        self.assertIn("retry", script)
+        self.assertIn("wait=$((wait * 2))", script)
+        for workflow in (self.ci_workflow, self.release_workflow):
+            self.assertLess(
+                workflow.index("scripts/mirror_base_image.sh"),
+                workflow.index("docker/build-push-action"),
+            )
+            self.assertIn("steps.base-images.outputs.build-args", workflow)
+        self.assertIn("ARG LAMBDA_ADAPTER_IMAGE=", _read("apps", "webhook", "Dockerfile"))
+        self.assertIn("ARG LAMBDA_BASE_IMAGE=", _read("apps", "lambda", "Dockerfile"))
+
     def test_release_gates_are_enforced(self):
         self.assertRegex(self.release_workflow, r'test "\$\{ARCH_REVIEW_TAG\}" = "\$\{RELEASE_TAG\}"')
         self.assertRegex(self.release_workflow, r'test "\$\{SEC_REVIEW_TAG\}" = "\$\{RELEASE_TAG\}"')

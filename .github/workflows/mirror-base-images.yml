@@ -1,0 +1,57 @@
+name: Mirror base images
+
+# One-time / on-demand copy of ECR Public base images into a repo-linked GHCR
+# package so docker-build never pulls from public.ecr.aws (429
+# "toomanyrequests: Data limit exceeded" on shared runners). Uses only
+# GITHUB_TOKEN. Copies are by digest, so the mirror is byte-identical.
+# Note: the package may be created private; in-repo builds using
+# GITHUB_TOKEN can still pull it. Visibility is intentionally not changed here.
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - ".github/workflows/mirror-base-images.yml"
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  mirror:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - source: public.ecr.aws/awsguru/aws-lambda-adapter:0.9.0@sha256:1c31bf4102ca63ef2082534d7139c0bc5fbd36ea6648e4756e9b475ef3ed829c
+            dest: aws-lambda-adapter
+            tag: "0.9.0"
+    steps:
+      - uses: imjasonh/setup-crane@feee3b6bb0d4c68370f256a4502498c9227e5c6b # v0.7
+      - name: Log in to GHCR with GITHUB_TOKEN
+        run: echo "${{ github.token }}" | crane auth login ghcr.io -u "${{ github.actor }}" --password-stdin
+      - name: Copy by digest (retry with backoff on 429)
+        env:
+          SRC: ${{ matrix.source }}
+          DEST_REPO: ghcr.io/${{ github.repository_owner }}/cleanarr-base-mirror/${{ matrix.dest }}
+          TAG: ${{ matrix.tag }}
+        run: |
+          set -euo pipefail
+          DEST_REPO="$(printf '%s' "${DEST_REPO}" | tr '[:upper:]' '[:lower:]')"
+          digest="${SRC##*@}"
+          if crane digest "${DEST_REPO}@${digest}" >/dev/null 2>&1; then
+            echo "already mirrored: ${DEST_REPO}@${digest}"
+          else
+            attempt=1; wait=15
+            until crane copy "${SRC}" "${DEST_REPO}:${TAG}"; do
+              if [ "${attempt}" -ge 10 ]; then echo "giving up after ${attempt} attempts" >&2; exit 1; fi
+              echo "attempt ${attempt} failed (likely 429); retrying in ${wait}s" >&2
+              sleep "$((wait + RANDOM % 10))"
+              attempt=$((attempt + 1)); wait=$(( wait * 2 > 300 ? 300 : wait * 2 ))
+            done
+          fi
+          got="$(crane digest "${DEST_REPO}:${TAG}")"
+          test "${got}" = "${digest}" || { echo "digest mismatch: ${got} != ${digest}" >&2; exit 1; }
+          echo "mirrored ${DEST_REPO}:${TAG}@${got}" | tee -a "${GITHUB_STEP_SUMMARY}"

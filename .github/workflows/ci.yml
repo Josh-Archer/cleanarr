@@ -50,6 +50,10 @@ jobs:
   docker-build:
     needs: runner
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
     strategy:
       fail-fast: false
       matrix:
@@ -62,6 +66,31 @@ jobs:
             file: apps/lambda/Dockerfile
     steps:
       - uses: actions/checkout@v6
+      - name: Detect ECR Public credentials
+        id: ecr-public-config
+        env:
+          AWS_OIDC_ROLE_ARN: ${{ secrets.AWS_OIDC_ROLE_ARN }}
+        run: |
+          if [ -n "${AWS_OIDC_ROLE_ARN}" ]; then
+            echo "enabled=true" >> "${GITHUB_OUTPUT}"
+          else
+            echo "enabled=false" >> "${GITHUB_OUTPUT}"
+          fi
+      # Authenticated ECR Public pulls get 10/sec vs 1/sec anonymous (see
+      # https://docs.aws.amazon.com/AmazonECR/latest/public/public-service-quotas.html).
+      # ECR Public auth is only served from us-east-1. Skipped when secrets
+      # are unavailable (e.g. fork PRs); base images are digest-pinned anyway.
+      - name: Configure AWS credentials for ECR Public
+        if: ${{ steps.ecr-public-config.outputs.enabled == 'true' }}
+        uses: aws-actions/configure-aws-credentials@v6
+        with:
+          role-to-assume: ${{ secrets.AWS_OIDC_ROLE_ARN }}
+          aws-region: us-east-1
+      - name: Log in to ECR Public
+        if: ${{ steps.ecr-public-config.outputs.enabled == 'true' }}
+        uses: aws-actions/amazon-ecr-login@v2
+        with:
+          registry-type: public
       - uses: docker/setup-qemu-action@v4
       - uses: docker/setup-buildx-action@v4
         with:
@@ -71,12 +100,37 @@ jobs:
           # mirror.gcr.io is the same Docker Hub mirror the Dockerfiles
           # already pull base images from successfully.
           driver-opts: image=mirror.gcr.io/moby/buildkit:buildx-stable-1
+      - uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+      - name: Mirror ECR Public base images to GHCR
+        id: base-images
+        if: ${{ matrix.file != 'apps/job/Dockerfile' }}
+        env:
+          OWNER: ${{ github.repository_owner }}
+        run: |
+          set -euo pipefail
+          mirror="ghcr.io/${OWNER}/base-mirror"
+          case "${{ matrix.file }}" in
+            apps/webhook/Dockerfile)
+              # Pre-mirrored by mirror-base-images.yml (source: public.ecr.aws/awsguru/aws-lambda-adapter:0.9.0@sha256:1c31bf4102ca63ef2082534d7139c0bc5fbd36ea6648e4756e9b475ef3ed829c)
+              ref="ghcr.io/josh-archer/cleanarr-base-mirror/aws-lambda-adapter:0.9.0@sha256:1c31bf4102ca63ef2082534d7139c0bc5fbd36ea6648e4756e9b475ef3ed829c"
+              echo "build-args=LAMBDA_ADAPTER_IMAGE=${ref}" >> "${GITHUB_OUTPUT}"
+              ;;
+            apps/lambda/Dockerfile)
+              ref="$(bash scripts/mirror_base_image.sh public.ecr.aws/lambda/python:3.11@sha256:af7d68f0baca0969f5232b1adce5288b5132c711e4c9f6f899c8108d17012989 "${mirror}/lambda-python")"
+              echo "build-args=LAMBDA_BASE_IMAGE=${ref}" >> "${GITHUB_OUTPUT}"
+              ;;
+          esac
       - name: Build image
         uses: docker/build-push-action@v7
         with:
           context: .
           file: ${{ matrix.file }}
           push: false
+          build-args: ${{ steps.base-images.outputs.build-args }}
           tags: ${{ matrix.image }}:ci
           cache-from: type=gha
           cache-to: type=gha,mode=max
