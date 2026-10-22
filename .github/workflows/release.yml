@@ -146,7 +146,8 @@ jobs:
           mirror="ghcr.io/${OWNER}/base-mirror"
           case "${{ matrix.dockerfile }}" in
             apps/webhook/Dockerfile)
-              ref="$(bash scripts/mirror_base_image.sh public.ecr.aws/awsguru/aws-lambda-adapter:0.9.0@sha256:1c31bf4102ca63ef2082534d7139c0bc5fbd36ea6648e4756e9b475ef3ed829c "${mirror}/aws-lambda-adapter")"
+              # Pre-mirrored by mirror-base-images.yml (source: public.ecr.aws/awsguru/aws-lambda-adapter:0.9.0@sha256:1c31bf4102ca63ef2082534d7139c0bc5fbd36ea6648e4756e9b475ef3ed829c)
+              ref="ghcr.io/josh-archer/cleanarr-base-mirror/aws-lambda-adapter:0.9.0@sha256:1c31bf4102ca63ef2082534d7139c0bc5fbd36ea6648e4756e9b475ef3ed829c"
               echo "build-args=LAMBDA_ADAPTER_IMAGE=${ref}" >> "${GITHUB_OUTPUT}"
               ;;
             apps/lambda/Dockerfile)

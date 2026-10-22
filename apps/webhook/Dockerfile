@@ -1,4 +1,6 @@
-ARG LAMBDA_ADAPTER_IMAGE=public.ecr.aws/awsguru/aws-lambda-adapter:0.9.0@sha256:1c31bf4102ca63ef2082534d7139c0bc5fbd36ea6648e4756e9b475ef3ed829c
+# Source (upstream): public.ecr.aws/awsguru/aws-lambda-adapter:0.9.0@sha256:1c31bf4102ca63ef2082534d7139c0bc5fbd36ea6648e4756e9b475ef3ed829c
+# Mirrored by digest via .github/workflows/mirror-base-images.yml to avoid ECR Public 429s.
+ARG LAMBDA_ADAPTER_IMAGE=ghcr.io/josh-archer/cleanarr-base-mirror/aws-lambda-adapter:0.9.0@sha256:1c31bf4102ca63ef2082534d7139c0bc5fbd36ea6648e4756e9b475ef3ed829c
 
 FROM ${LAMBDA_ADAPTER_IMAGE} AS lambda-adapter
 
