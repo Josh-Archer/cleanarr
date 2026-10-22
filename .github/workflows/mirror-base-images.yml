@@ -10,7 +10,7 @@ name: Mirror base images
 on:
   workflow_dispatch:
   push:
-    branches: [grok/cleanarr-67-ecr-429]
+    branches: [main]
     paths:
       - ".github/workflows/mirror-base-images.yml"
 
@@ -29,7 +29,7 @@ jobs:
             dest: aws-lambda-adapter
             tag: "0.9.0"
     steps:
-      - uses: imjasonh/setup-crane@v0.7
+      - uses: imjasonh/setup-crane@feee3b6bb0d4c68370f256a4502498c9227e5c6b # v0.7
       - name: Log in to GHCR with GITHUB_TOKEN
         run: echo "${{ github.token }}" | crane auth login ghcr.io -u "${{ github.actor }}" --password-stdin
       - name: Copy by digest (retry with backoff on 429)
