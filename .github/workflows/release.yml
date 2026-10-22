@@ -120,6 +120,22 @@ jobs:
           else
             echo "enabled=false" >> "${GITHUB_OUTPUT}"
           fi
+      # Authenticated ECR Public pulls get 10/sec vs 1/sec anonymous; ECR
+      # Public auth is only served from us-east-1. Runs before the build so
+      # the base-image pulls are authenticated.
+      - name: Configure AWS credentials for ECR Public pulls
+        if: ${{ steps.aws-release-config.outputs.enabled == 'true' }}
+        uses: aws-actions/configure-aws-credentials@v6
+        with:
+          role-to-assume: ${{ secrets.AWS_OIDC_ROLE_ARN }}
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: us-east-1
+      - name: Log in to ECR Public
+        if: ${{ steps.aws-release-config.outputs.enabled == 'true' }}
+        uses: aws-actions/amazon-ecr-login@v2
+        with:
+          registry-type: public
       - name: Build and push
         id: build
         uses: docker/build-push-action@v7
