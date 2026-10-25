@@ -1337,6 +1337,7 @@ def jellyfin_webhook():
             "parentTitle": html.unescape(payload.get("SeriesName") or ""),
             "grandparentTitle": html.unescape(payload.get("SeriesName") or ""),
             "path": payload.get("Path") or payload.get("path") or payload.get("ItemPath") or payload.get("MediaPath") or "",
+            "item_id": payload.get("ItemId"),
         }
     }
 
@@ -1723,6 +1724,320 @@ def _watched_by_for_finished_item(mc, plex_item, ev: dict) -> dict:
     return normalized or watched_by
 
 
+def _jellyfin_item_id(ev: dict) -> str | None:
+    meta = ev.get("metadata") or {}
+    payload = ev.get("payload") if isinstance(ev.get("payload"), dict) else {}
+    item = payload.get("Item") if isinstance(payload.get("Item"), dict) else {}
+    for value in (meta.get("item_id"), payload.get("ItemId"), item.get("Id"), meta.get("ratingKey")):
+        if value:
+            return str(value)
+    return None
+
+
+def _jellyfin_watch_state(mc, ev: dict):
+    """Look up a Jellyfin/Emby item and every user's played flag via the API.
+
+    Returns ``(record, watched_by)`` or ``(None, {})`` when the item cannot be
+    resolved. ``watched_by`` keys are canonical household names.
+    """
+    from cleanarr import emby_client
+
+    platform = (ev.get("platform") or "jellyfin").lower()
+    config = (getattr(mc, "CONFIG", None) or {}).get(platform) or {}
+    baseurl = config.get("baseurl") or ""
+    apikey = config.get("apikey") or ""
+    item_id = _jellyfin_item_id(ev)
+    if not baseurl or not apikey or not item_id:
+        logger.warning(
+            f"{platform} watch lookup unavailable (baseurl={'set' if baseurl else 'missing'}, "
+            f"apikey={'set' if apikey else 'missing'}, item_id={'set' if item_id else 'missing'})"
+        )
+        return None, {}
+    session = getattr(mc, f"{platform}_session", None)
+    if session is None:
+        session = requests.Session()
+        cf_headers = getattr(mc, "cf_headers", None)
+        if cf_headers:
+            session.headers.update(cf_headers)
+    try:
+        item, raw_watched = emby_client.get_item_watch_state(
+            session, baseurl, apikey, item_id, allowed_usernames=config.get("users") or None,
+        )
+    except Exception:
+        logger.exception(f"Failed to read {platform} watch state for item {item_id}")
+        return None, {}
+    if not item:
+        return None, {}
+    watched_by = _normalize_watched_by(raw_watched, platform=platform) or raw_watched
+    return emby_client.item_record(item), dict(watched_by)
+
+
+def _process_jellyfin_finished(mc, ev: dict, _emit_result, _notify_episode_cleanup_success):
+    """Jellyfin/Emby as a first-class delete source (issue #70).
+
+    Reads each user's watched state from the server API, maps the item to
+    Sonarr/Radarr and runs the same policy and delete path as Plex.
+    """
+    meta = ev.get("metadata") or {}
+    platform = (ev.get("platform") or "jellyfin").lower()
+    record, watched_by = _jellyfin_watch_state(mc, ev)
+    if not record:
+        logger.warning(f"Could not locate {platform} item for finished event; skipping deletion")
+        _record_webhook_decision(
+            reason_code="unmatched",
+            media_type=_event_media_type(meta),
+            media_title=_event_media_title(meta),
+            reason="no_media_server_match",
+            details={"platform": platform, "guid": meta.get("guid")},
+        )
+        return
+
+    mtype = record.get("type") or (meta.get("type") or "").lower()
+    if mtype == "episode":
+        ep = {
+            "show_title": record.get("show_title") or meta.get("grandparentTitle") or meta.get("parentTitle"),
+            "season": record.get("season") if record.get("season") is not None else meta.get("parentIndex"),
+            "episode": record.get("episode") if record.get("episode") is not None else meta.get("index"),
+            "title": record.get("title") or meta.get("title"),
+            "file": record.get("file"),
+            "watched_by": watched_by,
+            "guid": record.get("guid") or meta.get("guid"),
+            "rating_key": None,
+            "is_watched_override": False,
+            "source": platform,
+        }
+        sonarr_match = mc.match_episode_to_sonarr(ep)
+        if not sonarr_match:
+            logger.info(f"No Sonarr match for {platform} episode; skipping deletion")
+            _record_webhook_decision(
+                reason_code="unmatched",
+                media_type="episode",
+                media_title=f"{ep['show_title']} S{ep['season']}E{ep['episode']}",
+                reason="no_sonarr_match",
+                details={"guid": ep.get("guid"), "platform": platform},
+            )
+            return
+        _apply_episode_delete_policy(mc, ev, ep, sonarr_match, _emit_result, _notify_episode_cleanup_success)
+    elif mtype == "movie":
+        mv = {
+            "title": record.get("title") or meta.get("title"),
+            "year": record.get("year") or meta.get("year"),
+            "file": record.get("file"),
+            "watched_by": watched_by,
+            "guid": record.get("guid") or meta.get("guid"),
+            "rating_key": None,
+            "source": platform,
+        }
+        radarr_match = mc.match_movie_to_radarr(mv)
+        if not radarr_match:
+            logger.info(f"No Radarr match for {platform} movie; skipping deletion")
+            _record_webhook_decision(
+                reason_code="unmatched",
+                media_type="movie",
+                media_title=f"{mv['title']} ({mv.get('year')})",
+                reason="no_radarr_match",
+                details={"guid": mv.get("guid"), "platform": platform},
+            )
+            return
+        _apply_movie_delete_policy(mc, ev, mv, radarr_match, _emit_result)
+    else:
+        _record_webhook_decision(
+            reason_code="unmatched",
+            media_type=mtype or "unknown",
+            media_title=_event_media_title(meta),
+            reason="unsupported_media_type",
+            details={"media_type": mtype, "platform": platform},
+        )
+
+
+
+def _apply_episode_delete_policy(mc, ev: dict, ep: dict, sonarr_match: dict, _emit_result, _notify_episode_cleanup_success):
+    """Shared episode policy + delete path for Plex and Jellyfin/Emby webhooks.
+
+    Applies safe/kids tags, the household policy (require_all_users by
+    default) and the Leaving Soon grace period before deleting through Sonarr.
+    """
+    sonarr_tags = mc.get_sonarr_tags()
+    if sonarr_tags is None:
+        logger.error("Failed to fetch Sonarr tags; aborting deletion check")
+        _record_webhook_decision(
+            reason_code="error",
+            media_type="episode",
+            media_title=f"{ep['show_title']} S{ep['season']}E{ep['episode']}",
+            reason="tags_unavailable",
+            details={"rating_key": ep.get("rating_key")},
+        )
+        return
+    protected_tag_ids = protected_ids_from_tags(sonarr_tags)
+    series_tags = sonarr_match['series'].get('tags', [])
+    episode_tags = sonarr_match['episode'].get('tags') or []
+    series_tag_ids = set(series_tags or [])
+    episode_tag_ids = set(episode_tags)
+    if protected_tag_ids & (series_tag_ids | episode_tag_ids):
+        logger.info(f"Skipping deletion for {ep['show_title']} S{ep['season']}E{ep['episode']} due to 'safe' or 'kids' tag")
+        matched_protected = [
+            label for label in ("safe", "kids")
+            if ids_include_any_label(sonarr_tags, series_tag_ids | episode_tag_ids, (label,))
+        ]
+        _record_webhook_decision(
+            reason_code="protected",
+            media_type="episode",
+            media_title=f"{ep['show_title']} S{ep['season']}E{ep['episode']}",
+            reason="protected_series_or_episode_tags",
+            details={
+                "rating_key": ep.get("rating_key"),
+                "protected_labels": matched_protected or ["protected"],
+                "watched_by": ep.get("watched_by"),
+                "user": (ev.get("account") or {}).get("title"),
+            },
+        )
+        return
+
+    # Get user tags for the series and check if all tagged users have watched
+    user_tags = mc.get_user_tags(sonarr_tags, series_tags)
+    logger.info(f"Episode details: {ep}")
+    logger.info(f"User tags: {user_tags}")
+    logger.info(f"Watched by: {ep['watched_by']}")
+    should_delete = mc.should_delete_media(ep, user_tags, ep['watched_by'])
+    logger.info(f"Should delete: {should_delete}")
+
+    if should_delete:
+        if not mc.leaving_soon_allows_delete(mc.leaving_soon_key(ep), f"{ep['show_title']} S{ep['season']}E{ep['episode']}", ep.get('rating_key')):
+            _record_webhook_decision(reason_code="skip", media_type="episode", media_title=f"{ep['show_title']} S{ep['season']}E{ep['episode']}", reason="leaving_soon_grace_period", details={"rating_key": ep.get("rating_key")})
+            return
+        logger.info(f"Webhook-triggered deletion: deleting {ep['show_title']} S{ep['season']}E{ep['episode']}")
+        if mc.delete_sonarr_episode_file(sonarr_match.get('file_id')):
+            if mc.unmonitor_sonarr_episode(sonarr_match['episode']['id']):
+                _notify_episode_cleanup_success(ep)
+            if ep['file']:
+                mc.remove_torrent_by_file_path(ep['file'])
+            if ep.get('rating_key'):
+                mc.remove_from_plex_watchlist(ep.get('rating_key'))
+            _emit_result(
+                True,
+                "episode",
+                f"{ep['show_title']} S{ep['season']}E{ep['episode']}",
+                {
+                    "rating_key": ep.get("rating_key"),
+                    "file_id": sonarr_match.get('file_id'),
+                    "watched_by": ep.get("watched_by"),
+                    "user_tags": user_tags,
+                },
+            )
+        else:
+            _emit_result(
+                False,
+                "episode",
+                f"{ep['show_title']} S{ep['season']}E{ep['episode']}",
+                {
+                    "rating_key": ep.get("rating_key"),
+                    "file_id": sonarr_match.get('file_id'),
+                    "watched_by": ep.get("watched_by"),
+                    "user_tags": user_tags,
+                },
+            )
+    else:
+        _record_webhook_decision(
+            reason_code="skip",
+            media_type="episode",
+            media_title=f"{ep['show_title']} S{ep['season']}E{ep['episode']}",
+            reason="tagged_users_not_all_watched",
+            details={
+                "user_tags": user_tags,
+                "watched_by": ep.get("watched_by"),
+                "rating_key": ep.get("rating_key"),
+                "user": (ev.get("account") or {}).get("title"),
+            },
+        )
+
+
+def _apply_movie_delete_policy(mc, ev: dict, mv: dict, radarr_match: dict, _emit_result):
+    """Shared movie policy + delete path for Plex and Jellyfin/Emby webhooks."""
+    radarr_tags = mc.get_radarr_tags()
+    if radarr_tags is None:
+        logger.error("Failed to fetch Radarr tags; aborting deletion check")
+        _record_webhook_decision(
+            reason_code="error",
+            media_type="movie",
+            media_title=f"{mv['title']} ({mv.get('year')})",
+            reason="tags_unavailable",
+            details={"rating_key": mv.get('rating_key')},
+        )
+        return
+    movie_tags = radarr_match['movie'].get('tags', [])
+    if ids_include_any_label(radarr_tags, movie_tags, ("safe", "kids")):
+        logger.info(f"Skipping deletion for movie {mv['title']} due to 'safe' or 'kids' tag")
+        matched_protected = [
+            label for label in ("safe", "kids")
+            if ids_include_any_label(radarr_tags, movie_tags, (label,))
+        ]
+        _record_webhook_decision(
+            reason_code="protected",
+            media_type="movie",
+            media_title=f"{mv['title']} ({mv.get('year')})",
+            reason="protected_series_or_movie_tags",
+            details={
+                "rating_key": mv.get('rating_key'),
+                "movie_tags": movie_tags,
+                "protected_labels": matched_protected or ["protected"],
+                "watched_by": mv.get("watched_by"),
+                "user": (ev.get("account") or {}).get("title"),
+            },
+        )
+        return
+    user_tags = mc.get_user_tags(radarr_tags, movie_tags)
+    # Filter out force-delete tags since we're removing that logic
+    user_tags = [tag for tag in user_tags if tag.lower() != 'force-delete']
+    if mc.should_delete_media(mv, user_tags, mv['watched_by']):
+        if not mc.leaving_soon_allows_delete(mc.leaving_soon_key(mv), f"{mv['title']} ({mv['year']})", mv.get('rating_key')):
+            _record_webhook_decision(reason_code="skip", media_type="movie", media_title=f"{mv['title']} ({mv['year']})", reason="leaving_soon_grace_period", details={"rating_key": mv.get("rating_key")})
+            return
+        logger.info(f"Webhook-triggered deletion: deleting movie {mv['title']}")
+        if mc.delete_radarr_movie_file(radarr_match.get('file_id')):
+            mc.unmonitor_radarr_movie(radarr_match['movie']['id'])
+            if mv['file']:
+                mc.remove_torrent_by_file_path(mv['file'])
+            if mv.get('rating_key'):
+                mc.remove_from_plex_watchlist(mv.get('rating_key'))
+            _emit_result(
+                True,
+                "movie",
+                f"{mv['title']} ({mv.get('year')})",
+                {
+                    "rating_key": mv.get('rating_key'),
+                    "file_id": radarr_match.get('file_id'),
+                    "watched_by": mv.get("watched_by"),
+                    "user_tags": user_tags,
+                },
+            )
+        else:
+            _emit_result(
+                False,
+                "movie",
+                f"{mv['title']} ({mv.get('year')})",
+                {
+                    "rating_key": mv.get('rating_key'),
+                    "file_id": radarr_match.get('file_id'),
+                    "watched_by": mv.get("watched_by"),
+                    "user_tags": user_tags,
+                },
+            )
+    else:
+        _record_webhook_decision(
+            reason_code="skip",
+            media_type="movie",
+            media_title=f"{mv['title']} ({mv.get('year')})",
+            reason="tagged_users_not_all_watched",
+            details={
+                "user_tags": user_tags,
+                "watched_by": mv.get("watched_by"),
+                "rating_key": mv.get('rating_key'),
+                "user": (ev.get("account") or {}).get("title"),
+            },
+        )
+
+
+
 def _background_process_finished(ev: dict):
     """Process a single finished/watch-complete event and run deletion logic similar to cleanarr.
 
@@ -1786,6 +2101,10 @@ def _background_process_finished(ev: dict):
                     reason="delete_failed",
                     details=details,
                 )
+
+        if (ev.get("platform") or "").lower() in ("jellyfin", "emby"):
+            _process_jellyfin_finished(mc, ev, _emit_result, _notify_episode_cleanup_success)
+            return
 
         # Try to fetch the Plex item by rating key if available
         plex_item = None
@@ -1856,171 +2175,20 @@ def _background_process_finished(ev: dict):
                 logger.debug('TV section fallback failed', exc_info=True)
 
         if not plex_item:
-            logger.warning(f"Could not locate Plex item for event metadata: {meta}")
-            # Fallback: try to match using metadata from webhook event
-            logger.info("Attempting fallback matching using webhook metadata")
-            if mtype == 'episode' or (meta.get('type') or '').lower() == 'episode':
-                show_title = meta.get('parentTitle') or meta.get('grandparentTitle') or meta.get('title')
-                if show_title:
-                    ep = {
-                        'show_title': show_title,
-                        'season': meta.get('parentIndex'),
-                        'episode': meta.get('index'),
-                        'title': meta.get('title'),
-                        'file': None,  # Can't get file location without Plex item
-                        'watched_by': [],  # Can't get watch status without Plex item
-                        'guid': meta.get('guid'),
-                        'rating_key': meta.get('ratingKey'),
-                    }
-                    sonarr_match = mc.match_episode_to_sonarr(ep)
-                    if sonarr_match:
-                        # Check tags
-                        sonarr_tags = mc.get_sonarr_tags()
-                        if sonarr_tags is None:
-                            logger.error("Failed to fetch Sonarr tags; aborting deletion check")
-                            _record_webhook_decision(
-                                reason_code="error",
-                                media_type="episode",
-                                media_title=f"{ep['show_title']} S{ep['season']}E{ep['episode']}",
-                                reason="tags_unavailable",
-                                details={"type": "fallback", "rating_key": ep.get("rating_key")},
-                            )
-                            return
-                        protected_tag_ids = protected_ids_from_tags(sonarr_tags)
-                        series_tag_ids = set(sonarr_match['series'].get('tags') or [])
-                        episode_tag_ids = set(sonarr_match['episode'].get('tags') or [])
-                        if protected_tag_ids & (series_tag_ids | episode_tag_ids):
-                            logger.info(f"Skipping deletion for {ep['show_title']} S{ep['season']}E{ep['episode']} due to 'safe' or 'kids' tag")
-                            matched_protected = [
-                                label for label in ("safe", "kids")
-                                if ids_include_any_label(sonarr_tags, series_tag_ids | episode_tag_ids, (label,))
-                            ]
-                            _record_webhook_decision(
-                                reason_code="protected",
-                                media_type="episode",
-                                media_title=f"{ep['show_title']} S{ep['season']}E{ep['episode']}",
-                                reason="protected_series_or_episode_tags",
-                                details={
-                                    "rating_key": ep.get("rating_key"),
-                                    "protected_labels": matched_protected or ["protected"],
-                                    "user": (ev.get("account") or {}).get("title"),
-                                },
-                            )
-                            return
-                        # For finished events without Plex item, assume it should be deleted if watched
-                        logger.info(f"Webhook-triggered deletion (fallback): deleting {ep['show_title']} S{ep['season']}E{ep['episode']}")
-                        if not mc.leaving_soon_allows_delete(mc.leaving_soon_key(ep), f"{ep['show_title']} S{ep['season']}E{ep['episode']}", ep.get('rating_key')):
-                            _record_webhook_decision(reason_code="skip", media_type="episode", media_title=f"{ep['show_title']} S{ep['season']}E{ep['episode']}", reason="leaving_soon_grace_period", details={"rating_key": ep.get("rating_key")})
-                            return
-                        if mc.delete_sonarr_episode_file(sonarr_match.get('file_id')):
-                            if mc.unmonitor_sonarr_episode(sonarr_match['episode']['id']):
-                                _notify_episode_cleanup_success(ep)
-                            if ep.get('rating_key'):
-                                mc.remove_from_plex_watchlist(ep.get('rating_key'))
-                            _emit_result(
-                                True,
-                                "episode",
-                                f"{ep['show_title']} S{ep['season']}E{ep['episode']}",
-                                {"fallback": True, "series": ep['show_title'], "user": ev.get('account', {}).get('title')},
-                            )
-                        else:
-                            _emit_result(
-                                False,
-                                "episode",
-                                f"{ep['show_title']} S{ep['season']}E{ep['episode']}",
-                                {"fallback": True, "series": ep['show_title'], "sonarr_file_id": sonarr_match.get('file_id')},
-                            )
-                        return
-                    else:
-                        logger.info("No Sonarr match for episode in fallback; skipping deletion")
-                        _record_webhook_decision(
-                            reason_code="unmatched",
-                            media_type="episode",
-                            media_title=f"{show_title}",
-                            reason="no_sonarr_match",
-                            details={"guid": meta.get('guid'), "rating_key": rating_key},
-                        )
-                        return
-            elif mtype == 'movie' or (meta.get('type') or '').lower() == 'movie':
-                title = meta.get('title')
-                year = meta.get('year')
-                if title:
-                    mv = {
-                        'title': title,
-                        'year': year,
-                        'file': None,  # Can't get file location without Plex item
-                        'watched_by': [],  # Can't get watch status without Plex item
-                        'guid': meta.get('guid'),
-                        'rating_key': meta.get('ratingKey'),
-                    }
-                    radarr_match = mc.match_movie_to_radarr(mv)
-                    if radarr_match:
-                        # Check tags
-                        radarr_tags = mc.get_radarr_tags()
-                        if radarr_tags is None:
-                            logger.error("Failed to fetch Radarr tags; aborting deletion check")
-                            _record_webhook_decision(
-                                reason_code="error",
-                                media_type="movie",
-                                media_title=mv['title'],
-                                reason="tags_unavailable",
-                                details={"type": "fallback", "rating_key": mv.get('rating_key')},
-                            )
-                            return
-                        movie_tags = radarr_match['movie'].get('tags', [])
-                        if ids_include_any_label(radarr_tags, movie_tags, ("safe", "kids")):
-                            logger.info(f"Skipping deletion for movie {mv['title']} due to 'safe' or 'kids' tag")
-                            matched_protected = [
-                                label for label in ("safe", "kids")
-                                if ids_include_any_label(radarr_tags, movie_tags, (label,))
-                            ]
-                            _record_webhook_decision(
-                                reason_code="protected",
-                                media_type="movie",
-                                media_title=f"{mv['title']} ({mv.get('year')})",
-                                reason="protected_series_or_movie_tags",
-                                details={
-                                    "year": mv.get('year'),
-                                    "tags": movie_tags,
-                                    "protected_labels": matched_protected or ["protected"],
-                                    "user": (ev.get("account") or {}).get("title"),
-                                },
-                            )
-                            return
-                        # For finished events without Plex item, assume it should be deleted if watched
-                        logger.info(f"Webhook-triggered deletion (fallback): deleting movie {mv['title']}")
-                        if not mc.leaving_soon_allows_delete(mc.leaving_soon_key(mv), f"{mv['title']} ({mv.get('year')})", mv.get('rating_key')):
-                            _record_webhook_decision(reason_code="skip", media_type="movie", media_title=mv['title'], reason="leaving_soon_grace_period", details={"rating_key": mv.get("rating_key")})
-                            return
-                        if mc.delete_radarr_movie_file(radarr_match.get('file_id')):
-                            mc.unmonitor_radarr_movie(radarr_match['movie']['id'])
-                            # Since we don't have a Plex item, we can't reliably get the ratingKey if it's not in metadata
-                            if mv.get('rating_key'):
-                                mc.remove_from_plex_watchlist(mv.get('rating_key'))
-                            _emit_result(
-                                True,
-                                "movie",
-                                f"{mv['title']} ({mv.get('year')})",
-                                {"fallback": True, "movie": mv['title'], "year": mv.get('year')},
-                            )
-                        else:
-                            _emit_result(
-                                False,
-                                "movie",
-                                f"{mv['title']} ({mv.get('year')})",
-                                {"fallback": True, "movie": mv['title'], "year": mv.get('year'), "radarr_file_id": radarr_match.get('file_id')},
-                            )
-                        return
-                    else:
-                        logger.info("No Radarr match for movie in fallback; skipping deletion")
-                        _record_webhook_decision(
-                            reason_code="unmatched",
-                            media_type="movie",
-                            media_title=mv['title'],
-                            reason="no_radarr_match",
-                            details={"guid": meta.get('guid'), "rating_key": rating_key},
-                        )
-                        return
+            # Issue #70: an item Plex cannot match has no per-user watch state.
+            # It must never count as watched, so log it and skip; never delete
+            # through a watched_by=[] fallback.
+            logger.warning(
+                "Could not locate Plex item for finished event; skipping deletion "
+                f"(title={meta.get('title')!r}, type={mtype!r})"
+            )
+            _record_webhook_decision(
+                reason_code="unmatched",
+                media_type=mtype or "unknown",
+                media_title=_event_media_title(meta),
+                reason="no_media_server_match",
+                details={"guid": meta.get('guid'), "rating_key": rating_key, "platform": ev.get("platform") or "plex"},
+            )
             return
 
         if mtype == 'episode' or plex_item.type == 'episode':
@@ -2052,98 +2220,7 @@ def _background_process_finished(ev: dict):
                 )
                 return
 
-            sonarr_tags = mc.get_sonarr_tags()
-            if sonarr_tags is None:
-                logger.error("Failed to fetch Sonarr tags; aborting deletion check")
-                _record_webhook_decision(
-                    reason_code="error",
-                    media_type="episode",
-                    media_title=f"{ep['show_title']} S{ep['season']}E{ep['episode']}",
-                    reason="tags_unavailable",
-                    details={"rating_key": ep.get("rating_key")},
-                )
-                return
-            protected_tag_ids = protected_ids_from_tags(sonarr_tags)
-            series_tags = sonarr_match['series'].get('tags', [])
-            episode_tags = sonarr_match['episode'].get('tags') or []
-            series_tag_ids = set(series_tags or [])
-            episode_tag_ids = set(episode_tags)
-            if protected_tag_ids & (series_tag_ids | episode_tag_ids):
-                logger.info(f"Skipping deletion for {ep['show_title']} S{ep['season']}E{ep['episode']} due to 'safe' or 'kids' tag")
-                matched_protected = [
-                    label for label in ("safe", "kids")
-                    if ids_include_any_label(sonarr_tags, series_tag_ids | episode_tag_ids, (label,))
-                ]
-                _record_webhook_decision(
-                    reason_code="protected",
-                    media_type="episode",
-                    media_title=f"{ep['show_title']} S{ep['season']}E{ep['episode']}",
-                    reason="protected_series_or_episode_tags",
-                    details={
-                        "rating_key": ep.get("rating_key"),
-                        "protected_labels": matched_protected or ["protected"],
-                        "watched_by": ep.get("watched_by"),
-                        "user": (ev.get("account") or {}).get("title"),
-                    },
-                )
-                return
-
-            # Get user tags for the series and check if all tagged users have watched
-            user_tags = mc.get_user_tags(sonarr_tags, series_tags)
-            logger.info(f"Episode details: {ep}")
-            logger.info(f"User tags: {user_tags}")
-            logger.info(f"Watched by: {ep['watched_by']}")
-            should_delete = mc.should_delete_media(ep, user_tags, ep['watched_by'])
-            logger.info(f"Should delete: {should_delete}")
-            
-            if should_delete:
-                if not mc.leaving_soon_allows_delete(mc.leaving_soon_key(ep), f"{ep['show_title']} S{ep['season']}E{ep['episode']}", ep.get('rating_key')):
-                    _record_webhook_decision(reason_code="skip", media_type="episode", media_title=f"{ep['show_title']} S{ep['season']}E{ep['episode']}", reason="leaving_soon_grace_period", details={"rating_key": ep.get("rating_key")})
-                    return
-                logger.info(f"Webhook-triggered deletion: deleting {ep['show_title']} S{ep['season']}E{ep['episode']}")
-                if mc.delete_sonarr_episode_file(sonarr_match.get('file_id')):
-                    if mc.unmonitor_sonarr_episode(sonarr_match['episode']['id']):
-                        _notify_episode_cleanup_success(ep)
-                    if ep['file']:
-                        mc.remove_torrent_by_file_path(ep['file'])
-                    if ep.get('rating_key'):
-                        mc.remove_from_plex_watchlist(ep.get('rating_key'))
-                    _emit_result(
-                        True,
-                        "episode",
-                        f"{ep['show_title']} S{ep['season']}E{ep['episode']}",
-                        {
-                            "rating_key": ep.get("rating_key"),
-                            "file_id": sonarr_match.get('file_id'),
-                            "watched_by": ep.get("watched_by"),
-                            "user_tags": user_tags,
-                        },
-                    )
-                else:
-                    _emit_result(
-                        False,
-                        "episode",
-                        f"{ep['show_title']} S{ep['season']}E{ep['episode']}",
-                        {
-                            "rating_key": ep.get("rating_key"),
-                            "file_id": sonarr_match.get('file_id'),
-                            "watched_by": ep.get("watched_by"),
-                            "user_tags": user_tags,
-                        },
-                    )
-            else:
-                _record_webhook_decision(
-                    reason_code="skip",
-                    media_type="episode",
-                    media_title=f"{ep['show_title']} S{ep['season']}E{ep['episode']}",
-                    reason="tagged_users_not_all_watched",
-                    details={
-                        "user_tags": user_tags,
-                        "watched_by": ep.get("watched_by"),
-                        "rating_key": ep.get("rating_key"),
-                        "user": (ev.get("account") or {}).get("title"),
-                    },
-                )
+            _apply_episode_delete_policy(mc, ev, ep, sonarr_match, _emit_result, _notify_episode_cleanup_success)
 
         elif mtype == 'movie' or plex_item.type == 'movie':
             logger.info("Giving Plex a moment to update watch status...")
@@ -2172,88 +2249,7 @@ def _background_process_finished(ev: dict):
                     details={"guid": mv.get('guid'), "rating_key": mv.get('rating_key')},
                 )
                 return
-            radarr_tags = mc.get_radarr_tags()
-            if radarr_tags is None:
-                logger.error("Failed to fetch Radarr tags; aborting deletion check")
-                _record_webhook_decision(
-                    reason_code="error",
-                    media_type="movie",
-                    media_title=f"{mv['title']} ({mv.get('year')})",
-                    reason="tags_unavailable",
-                    details={"rating_key": mv.get('rating_key')},
-                )
-                return
-            movie_tags = radarr_match['movie'].get('tags', [])
-            if ids_include_any_label(radarr_tags, movie_tags, ("safe", "kids")):
-                logger.info(f"Skipping deletion for movie {mv['title']} due to 'safe' or 'kids' tag")
-                matched_protected = [
-                    label for label in ("safe", "kids")
-                    if ids_include_any_label(radarr_tags, movie_tags, (label,))
-                ]
-                _record_webhook_decision(
-                    reason_code="protected",
-                    media_type="movie",
-                    media_title=f"{mv['title']} ({mv.get('year')})",
-                    reason="protected_series_or_movie_tags",
-                    details={
-                        "rating_key": mv.get('rating_key'),
-                        "movie_tags": movie_tags,
-                        "protected_labels": matched_protected or ["protected"],
-                        "watched_by": mv.get("watched_by"),
-                        "user": (ev.get("account") or {}).get("title"),
-                    },
-                )
-                return
-            user_tags = mc.get_user_tags(radarr_tags, movie_tags)
-            # Filter out force-delete tags since we're removing that logic
-            user_tags = [tag for tag in user_tags if tag.lower() != 'force-delete']
-            if mc.should_delete_media(mv, user_tags, mv['watched_by']):
-                if not mc.leaving_soon_allows_delete(mc.leaving_soon_key(mv), f"{mv['title']} ({mv['year']})", mv.get('rating_key')):
-                    _record_webhook_decision(reason_code="skip", media_type="movie", media_title=f"{mv['title']} ({mv['year']})", reason="leaving_soon_grace_period", details={"rating_key": mv.get("rating_key")})
-                    return
-                logger.info(f"Webhook-triggered deletion: deleting movie {mv['title']}")
-                if mc.delete_radarr_movie_file(radarr_match.get('file_id')):
-                    mc.unmonitor_radarr_movie(radarr_match['movie']['id'])
-                    if mv['file']:
-                        mc.remove_torrent_by_file_path(mv['file'])
-                    if mv.get('rating_key'):
-                        mc.remove_from_plex_watchlist(mv.get('rating_key'))
-                    _emit_result(
-                        True,
-                        "movie",
-                        f"{mv['title']} ({mv.get('year')})",
-                        {
-                            "rating_key": mv.get('rating_key'),
-                            "file_id": radarr_match.get('file_id'),
-                            "watched_by": mv.get("watched_by"),
-                            "user_tags": user_tags,
-                        },
-                    )
-                else:
-                    _emit_result(
-                        False,
-                        "movie",
-                        f"{mv['title']} ({mv.get('year')})",
-                        {
-                            "rating_key": mv.get('rating_key'),
-                            "file_id": radarr_match.get('file_id'),
-                            "watched_by": mv.get("watched_by"),
-                            "user_tags": user_tags,
-                        },
-                    )
-            else:
-                _record_webhook_decision(
-                    reason_code="skip",
-                    media_type="movie",
-                    media_title=f"{mv['title']} ({mv.get('year')})",
-                    reason="tagged_users_not_all_watched",
-                    details={
-                        "user_tags": user_tags,
-                        "watched_by": mv.get("watched_by"),
-                        "rating_key": mv.get('rating_key'),
-                        "user": (ev.get("account") or {}).get("title"),
-                    },
-                )
+            _apply_movie_delete_policy(mc, ev, mv, radarr_match, _emit_result)
 
         else:
             logger.info(f"Unhandled media type for deletion: {mtype}")

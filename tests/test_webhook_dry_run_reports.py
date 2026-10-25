@@ -16,6 +16,21 @@ from cleanarr import cleanup, webhook_app
 lambda_main = importlib.import_module("apps.lambda.main")
 
 
+def _mock_plex_episode():
+    """A Plex episode the webhook can match (issue #70: unmatched items never delete)."""
+    item = MagicMock()
+    item.type = "episode"
+    item.title = "Winter Is Coming"
+    item.grandparentTitle = "Game of Thrones"
+    item.parentIndex = 1
+    item.seasonNumber = 1
+    item.index = 1
+    item.ratingKey = 123
+    item.locations = ["/media/got/s01e01.mkv"]
+    item.guid = "plex://episode/123"
+    return item
+
+
 class _FakeSqsClient:
     def __init__(self, messages):
         self._messages = list(messages)
@@ -219,7 +234,16 @@ class TestWebhookAndSqsDryRunReports(unittest.TestCase):
             ):
                 mock_mc = MagicMock()
                 mock_mc.CONFIG = {"dry_run": True}
-                mock_mc.plex.fetchItem.side_effect = Exception("not found")
+                kids_movie = MagicMock()
+                kids_movie.type = "movie"
+                kids_movie.title = "Kids Movie"
+                kids_movie.year = 2022
+                kids_movie.ratingKey = 102
+                kids_movie.locations = ["/media/movies/kids.mkv"]
+                kids_movie.guid = "plex://movie/102"
+                mock_mc.plex.fetchItem.side_effect = (
+                    lambda key: kids_movie if int(key) == 102 else _mock_plex_episode()
+                )
                 mock_mc.plex.search.side_effect = Exception("not found")
                 # For episode: would delete
                 mock_mc.delete_sonarr_episode_file.return_value = True
@@ -311,7 +335,7 @@ class TestWebhookAndSqsDryRunReports(unittest.TestCase):
             ):
                 mock_mc = MagicMock()
                 mock_mc.CONFIG = {"dry_run": True}
-                mock_mc.plex.fetchItem.side_effect = Exception("not found")
+                mock_mc.plex.fetchItem.return_value = _mock_plex_episode()
                 mock_mc.plex.search.side_effect = Exception("not found")
                 mock_mc.match_movie_to_radarr.return_value = {
                     "movie": {"id": 50, "tags": []},
@@ -371,7 +395,7 @@ class TestWebhookAndSqsDryRunReports(unittest.TestCase):
             ):
                 mock_mc = MagicMock()
                 mock_mc.CONFIG = {"dry_run": True}
-                mock_mc.plex.fetchItem.side_effect = Exception("not found")
+                mock_mc.plex.fetchItem.return_value = _mock_plex_episode()
                 mock_mc.plex.search.side_effect = Exception("not found")
                 mock_mc.match_episode_to_sonarr.return_value = {
                     "series": {"id": 10, "tags": []},
@@ -551,7 +575,8 @@ class TestRealDeleteMethodsDryRunHttpLayer(unittest.TestCase):
 
     def test_webhook_dry_run_real_delete_methods_no_mutations(self):
         rec_session = RecordingSession(_default_arr_handlers())
-        mc = _create_real_media_cleanup(rec_session, dry_run=True)
+        mc = _create_real_media_cleanup(rec_session, dry_run=True, plex_item=_mock_plex_episode())
+        mc.plex_source.watch_status = MagicMock(return_value={"alice": True})
 
         payload = {
             "event": "media.scrobble",
@@ -745,7 +770,8 @@ class TestRealDeleteMethodsDryRunHttpLayer(unittest.TestCase):
 
     def test_sqs_queue_dry_run_real_delete_no_mutations(self):
         rec_session = RecordingSession(_default_arr_handlers())
-        mc = _create_real_media_cleanup(rec_session, dry_run=True)
+        mc = _create_real_media_cleanup(rec_session, dry_run=True, plex_item=_mock_plex_episode())
+        mc.plex_source.watch_status = MagicMock(return_value={"alice": True})
 
         messages = [
             {
@@ -821,7 +847,8 @@ class TestRealDeleteMethodsDryRunHttpLayer(unittest.TestCase):
 
     def test_sqs_lambda_records_dry_run_real_delete_no_mutations(self):
         rec_session = RecordingSession(_default_arr_handlers())
-        mc = _create_real_media_cleanup(rec_session, dry_run=True)
+        mc = _create_real_media_cleanup(rec_session, dry_run=True, plex_item=_mock_plex_episode())
+        mc.plex_source.watch_status = MagicMock(return_value={"alice": True})
 
         records = [
             {
