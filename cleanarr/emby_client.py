@@ -265,6 +265,65 @@ def load_watched_state(
     )
 
 
+def get_item_watch_state(
+    session: requests.Session,
+    baseurl: str,
+    apikey: str,
+    item_id: str,
+    allowed_usernames: Iterable[str] | None = None,
+) -> tuple[dict | None, dict[str, bool]]:
+    """Read one library item and every user's ``UserData.Played`` for it.
+
+    Returns ``(item, watched_by)``. ``item`` is the first user-visible copy of
+    the item (path, provider IDs, series/season/episode numbers) or ``None``
+    when no user can see it. ``watched_by`` maps each non-disabled username to
+    their played flag; users who cannot see the item count as not watched.
+    """
+    if not item_id:
+        return None, {}
+    users = list_users(session, baseurl, apikey, allowed_usernames=allowed_usernames)
+    item: dict | None = None
+    watched_by: dict[str, bool] = {}
+    params = {
+        "Ids": str(item_id),
+        "Recursive": "true",
+        "Fields": "Path,ProviderIds,MediaSources,UserData,SeriesName,"
+        "ParentIndexNumber,IndexNumber,ProductionYear",
+        "EnableTotalRecordCount": "false",
+    }
+    for user in users:
+        data = emby_get(session, baseurl, apikey, f"Users/{user['id']}/Items", params=params)
+        rows = (data or {}).get("Items") if isinstance(data, dict) else None
+        row = next(
+            (r for r in (rows or []) if isinstance(r, dict) and str(r.get("Id")) == str(item_id)),
+            None,
+        )
+        if row is None:
+            watched_by[user["name"]] = False
+            continue
+        if item is None:
+            item = row
+        watched_by[user["name"]] = bool((row.get("UserData") or {}).get("Played"))
+    return item, watched_by
+
+
+def item_record(item: dict) -> dict:
+    """Map an Emby/Jellyfin item to the fields cleanup matching uses."""
+    primary, guids = _provider_guids(item.get("ProviderIds"))
+    return {
+        "type": str(item.get("Type") or "").lower(),
+        "title": item.get("Name"),
+        "show_title": item.get("SeriesName"),
+        "season": item.get("ParentIndexNumber"),
+        "episode": item.get("IndexNumber"),
+        "year": item.get("ProductionYear"),
+        "file": _item_path(item),
+        "guid": primary,
+        "guids": guids,
+        "item_id": item.get("Id"),
+    }
+
+
 # --- Webhook event mapping -------------------------------------------------
 
 _EMBY_FINISHED_EVENTS = {
