@@ -11,6 +11,9 @@ on:
       - "README.md"
       - "docs/**"
 
+permissions:
+  contents: read
+
 jobs:
   runner:
     permissions:
@@ -22,8 +25,8 @@ jobs:
     needs: runner
     runs-on: ${{ needs.runner.outputs.runner-label }}
     steps:
-      - uses: actions/checkout@v6
-      - uses: actions/setup-python@v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
         with:
           python-version: "3.11"
       - name: Install dependencies
@@ -65,7 +68,7 @@ jobs:
           - image: cleanarr-lambda
             file: apps/lambda/Dockerfile
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
       - name: Detect ECR Public credentials
         id: ecr-public-config
         env:
@@ -82,17 +85,17 @@ jobs:
       # are unavailable (e.g. fork PRs); base images are digest-pinned anyway.
       - name: Configure AWS credentials for ECR Public
         if: ${{ steps.ecr-public-config.outputs.enabled == 'true' }}
-        uses: aws-actions/configure-aws-credentials@v6
+        uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6
         with:
           role-to-assume: ${{ secrets.AWS_OIDC_ROLE_ARN }}
           aws-region: us-east-1
       - name: Log in to ECR Public
         if: ${{ steps.ecr-public-config.outputs.enabled == 'true' }}
-        uses: aws-actions/amazon-ecr-login@v2
+        uses: aws-actions/amazon-ecr-login@03f1aad4c6c7ffd436567f42f9384779290529bd # v2
         with:
           registry-type: public
-      - uses: docker/setup-qemu-action@v4
-      - uses: docker/setup-buildx-action@v4
+      - uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1 # v4
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4
         with:
           # NOTE: do not point this at public.ecr.aws — its anonymous
           # quotas throttle shared GitHub runners ("toomanyrequests: Data
@@ -100,7 +103,7 @@ jobs:
           # mirror.gcr.io is the same Docker Hub mirror the Dockerfiles
           # already pull base images from successfully.
           driver-opts: image=mirror.gcr.io/moby/buildkit:buildx-stable-1
-      - uses: docker/login-action@v4
+      - uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
@@ -125,7 +128,7 @@ jobs:
               ;;
           esac
       - name: Build image
-        uses: docker/build-push-action@v7
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7
         with:
           context: .
           file: ${{ matrix.file }}

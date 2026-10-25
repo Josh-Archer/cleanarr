@@ -44,10 +44,10 @@ jobs:
             dockerfile: apps/lambda/Dockerfile
             ecr_repository: cleanarr-job
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           ref: ${{ env.RELEASE_TAG }}
-      - uses: actions/setup-python@v6
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
         with:
           python-version: "3.11"
       - name: Validate review gates
@@ -82,8 +82,8 @@ jobs:
         run: python scripts/check_public_safety.py
       - name: Run unit tests
         run: python -m unittest discover -s tests
-      - uses: docker/setup-qemu-action@v4
-      - uses: docker/setup-buildx-action@v4
+      - uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1 # v4
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4
         with:
           # NOTE: do not point this at public.ecr.aws — its anonymous
           # quotas throttle shared GitHub runners ("toomanyrequests: Data
@@ -91,13 +91,13 @@ jobs:
           # mirror.gcr.io is the same Docker Hub mirror the Dockerfiles
           # already pull base images from successfully.
           driver-opts: image=mirror.gcr.io/moby/buildkit:buildx-stable-1
-      - uses: docker/login-action@v4
+      - uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ github.token }}
       - id: meta
-        uses: docker/metadata-action@v6
+        uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6
         with:
           images: ghcr.io/${{ github.repository_owner }}/${{ matrix.image_name }}
           tags: |
@@ -125,7 +125,7 @@ jobs:
       # the base-image pulls are authenticated.
       - name: Configure AWS credentials for ECR Public pulls
         if: ${{ steps.aws-release-config.outputs.enabled == 'true' }}
-        uses: aws-actions/configure-aws-credentials@v6
+        uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6
         with:
           role-to-assume: ${{ secrets.AWS_OIDC_ROLE_ARN }}
           aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
@@ -133,7 +133,7 @@ jobs:
           aws-region: us-east-1
       - name: Log in to ECR Public
         if: ${{ steps.aws-release-config.outputs.enabled == 'true' }}
-        uses: aws-actions/amazon-ecr-login@v2
+        uses: aws-actions/amazon-ecr-login@03f1aad4c6c7ffd436567f42f9384779290529bd # v2
         with:
           registry-type: public
       - name: Mirror ECR Public base images to GHCR
@@ -157,7 +157,7 @@ jobs:
           esac
       - name: Build and push
         id: build
-        uses: docker/build-push-action@v7
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7
         with:
           context: .
           file: ${{ matrix.dockerfile }}
@@ -173,7 +173,7 @@ jobs:
         run: mkdir -p .release-metadata
       - name: Configure AWS credentials
         if: ${{ matrix.ecr_repository != '' && steps.aws-release-config.outputs.enabled == 'true' }}
-        uses: aws-actions/configure-aws-credentials@v6
+        uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6
         with:
           role-to-assume: ${{ secrets.AWS_OIDC_ROLE_ARN }}
           aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
@@ -182,7 +182,7 @@ jobs:
       - name: Login to Amazon ECR
         if: ${{ matrix.ecr_repository != '' && steps.aws-release-config.outputs.enabled == 'true' }}
         id: login-ecr
-        uses: aws-actions/amazon-ecr-login@v2
+        uses: aws-actions/amazon-ecr-login@03f1aad4c6c7ffd436567f42f9384779290529bd # v2
       - name: Promote release image to Amazon ECR
         if: ${{ matrix.ecr_repository != '' && steps.aws-release-config.outputs.enabled == 'true' }}
         id: promote
@@ -256,7 +256,7 @@ jobs:
           output_path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
           PY
       - name: Upload release metadata artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: release-metadata-${{ matrix.image_name }}
           path: .release-metadata/${{ matrix.image_name }}.json
@@ -312,7 +312,7 @@ jobs:
     if: always()
     steps:
       - name: Download release metadata artifacts
-        uses: actions/download-artifact@v5
+        uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5
         with:
           pattern: release-metadata-*
           path: release-metadata
@@ -352,7 +352,7 @@ jobs:
           PY
           cat summary.md >> "$GITHUB_STEP_SUMMARY"
       - name: Upload combined release metadata
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: release-metadata
           path: release-metadata/release-metadata.json
