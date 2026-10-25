@@ -150,13 +150,22 @@ class TestJellyfinDeleteSource(unittest.TestCase):
         mc.match_episode_to_sonarr.assert_not_called()
         mc.delete_sonarr_episode_file.assert_not_called()
 
+    def test_jellyfin_deletions_flag_requires_exact_lowercase_true(self):
+        """Only the exact string 'true' enables Jellyfin deletes (cleanarr#70)."""
+        for off in ("1", "yes", "TRUE", "True", "", " true", "false"):
+            with self.subTest(value=off):
+                with patch.dict(os.environ, {"CLEANARR_JELLYFIN_DELETIONS": off}):
+                    self.assertFalse(webhook_app._jellyfin_deletions_enabled())
+        with patch.dict(os.environ, {"CLEANARR_JELLYFIN_DELETIONS": "true"}):
+            self.assertTrue(webhook_app._jellyfin_deletions_enabled())
+
     def test_jellyfin_deletions_default_off_is_dry_run(self):
         """CLEANARR_JELLYFIN_DELETIONS unset -> policy runs, nothing mutated."""
         mc = _make_mc()
         env = {k: v for k, v in os.environ.items() if k != "CLEANARR_JELLYFIN_DELETIONS"}
         with patch.dict(os.environ, env, clear=True):
             self.assertFalse(webhook_app._jellyfin_deletions_enabled())
-        for off in ("", "false", "0", "no"):
+        for off in ("", "false", "0", "no", "1", "yes", "TRUE"):
             with self.subTest(value=off):
                 mc = _make_mc()
                 emitted = self._run(mc, {"alice": True, "bob": True}, jf_deletions=off)

@@ -1776,9 +1776,10 @@ def _jellyfin_deletions_enabled() -> bool:
     """Jellyfin/Emby-sourced deletes are opt-in (default off, dry-run only).
 
     Independent of PLEX_WEBHOOK_ENABLE_DELETIONS so enabling Plex deletes never
-    turns on Jellyfin deletes.
+    turns on Jellyfin deletes. Only the exact lowercase string "true" enables
+    them; "1", "yes", "TRUE", "" and anything else stay disabled.
     """
-    return os.environ.get("CLEANARR_JELLYFIN_DELETIONS", "false").strip().lower() in ("1", "true", "yes")
+    return os.environ.get("CLEANARR_JELLYFIN_DELETIONS", "false") == "true"
 
 
 class _JellyfinDryRunCleanup:
