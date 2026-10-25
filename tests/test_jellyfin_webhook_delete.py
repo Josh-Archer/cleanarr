@@ -94,14 +94,15 @@ class TestJellyfinDeleteSource(unittest.TestCase):
     def setUp(self):
         webhook_app.reset_dry_run_report()
 
-    def _run(self, mc, played_by):
+    def _run(self, mc, played_by, jf_deletions="true"):
         emitted = []
         with patch.object(emby_client, "emby_get", side_effect=_fake_emby_get(played_by)), \
                 patch.dict(cleanup.CONFIG, {
                     "household_policy": "require_all_users",
                     "jellyfin": {"baseurl": "http://jf.test", "apikey": "k", "users": []},
                 }), \
-                patch.dict(os.environ, {"CLEANARR_HOUSEHOLD_USERS": ""}):
+                patch.dict(os.environ, {"CLEANARR_HOUSEHOLD_USERS": "",
+                                        "CLEANARR_JELLYFIN_DELETIONS": jf_deletions}):
             webhook_app._process_jellyfin_finished(
                 mc, _ev(), lambda *a, **k: emitted.append(a), lambda ep: None
             )
@@ -147,6 +148,27 @@ class TestJellyfinDeleteSource(unittest.TestCase):
         mc = _make_mc()
         self._run(mc, {"alice": None, "bob": None})
         mc.match_episode_to_sonarr.assert_not_called()
+        mc.delete_sonarr_episode_file.assert_not_called()
+
+    def test_jellyfin_deletions_default_off_is_dry_run(self):
+        """CLEANARR_JELLYFIN_DELETIONS unset -> policy runs, nothing mutated."""
+        mc = _make_mc()
+        env = {k: v for k, v in os.environ.items() if k != "CLEANARR_JELLYFIN_DELETIONS"}
+        with patch.dict(os.environ, env, clear=True):
+            self.assertFalse(webhook_app._jellyfin_deletions_enabled())
+        for off in ("", "false", "0", "no"):
+            with self.subTest(value=off):
+                mc = _make_mc()
+                emitted = self._run(mc, {"alice": True, "bob": True}, jf_deletions=off)
+                mc.delete_sonarr_episode_file.assert_not_called()
+                mc.unmonitor_sonarr_episode.assert_not_called()
+                mc.leaving_soon_allows_delete.assert_not_called()
+                self.assertEqual(emitted, [])
+
+    def test_plex_deletions_flag_does_not_enable_jellyfin(self):
+        mc = _make_mc()
+        with patch.object(webhook_app, "ENABLE_WEBHOOK_DELETIONS", True):
+            self._run(mc, {"alice": True, "bob": True}, jf_deletions="")
         mc.delete_sonarr_episode_file.assert_not_called()
 
     def test_background_unmatched_plex_item_never_deletes(self):

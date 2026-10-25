@@ -1772,6 +1772,48 @@ def _jellyfin_watch_state(mc, ev: dict):
     return emby_client.item_record(item), dict(watched_by)
 
 
+def _jellyfin_deletions_enabled() -> bool:
+    """Jellyfin/Emby-sourced deletes are opt-in (default off, dry-run only).
+
+    Independent of PLEX_WEBHOOK_ENABLE_DELETIONS so enabling Plex deletes never
+    turns on Jellyfin deletes.
+    """
+    return os.environ.get("CLEANARR_JELLYFIN_DELETIONS", "false").strip().lower() in ("1", "true", "yes")
+
+
+class _JellyfinDryRunCleanup:
+    """Wraps MediaCleanup so the full policy runs but nothing is mutated."""
+
+    _MUTATORS = (
+        "delete_sonarr_episode_file",
+        "unmonitor_sonarr_episode",
+        "delete_radarr_movie_file",
+        "unmonitor_radarr_movie",
+        "remove_torrent_by_file_path",
+        "remove_from_plex_watchlist",
+    )
+
+    def __init__(self, mc, platform: str):
+        self._mc = mc
+        self._platform = platform
+        self.CONFIG = {**(getattr(mc, "CONFIG", None) or {}), "dry_run": True}
+
+    def leaving_soon_allows_delete(self, key, title, rating_key=None):
+        logger.info(f"[{self._platform} dry-run] would check leaving-soon grace for {title}; not mutating")
+        return True
+
+    def __getattr__(self, name):
+        if name in type(self)._MUTATORS:
+            def _noop(*args, **kwargs):
+                logger.info(
+                    f"[{self._platform} dry-run] CLEANARR_JELLYFIN_DELETIONS is off; "
+                    f"would call {name}{args}"
+                )
+                return True
+            return _noop
+        return getattr(self._mc, name)
+
+
 def _process_jellyfin_finished(mc, ev: dict, _emit_result, _notify_episode_cleanup_success):
     """Jellyfin/Emby as a first-class delete source (issue #70).
 
@@ -1791,6 +1833,19 @@ def _process_jellyfin_finished(mc, ev: dict, _emit_result, _notify_episode_clean
             details={"platform": platform, "guid": meta.get("guid")},
         )
         return
+
+    if not _jellyfin_deletions_enabled():
+        mc = _JellyfinDryRunCleanup(mc, platform)
+        _notify_episode_cleanup_success = lambda ep: None  # noqa: E731
+
+        def _emit_result(success, media_type, media_title, detail=None):
+            _record_webhook_decision(
+                reason_code="dry-run" if success else "error",
+                media_type=media_type,
+                media_title=media_title,
+                reason="jellyfin_deletions_disabled",
+                details={**dict(detail or {}), "platform": platform},
+            )
 
     mtype = record.get("type") or (meta.get("type") or "").lower()
     if mtype == "episode":
