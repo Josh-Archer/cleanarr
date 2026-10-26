@@ -168,6 +168,20 @@ def _item_identity(item: dict) -> str:
     return f"title:{name}:{year}"
 
 
+def _with_unwatched_users(records, items_by_user) -> list[dict]:
+    """Record every loaded user, not only watchers (cleanarr#80).
+
+    The policy falls back to "all users in watched_by" as the household, so a
+    map that only lists watchers lets one watcher satisfy require_all_users.
+    """
+    out = []
+    for record in records:
+        for username in items_by_user:
+            record["watched_by"].setdefault(username, False)
+        out.append(record)
+    return out
+
+
 def build_watched_movies(
     items_by_user: dict[str, list[dict]],
 ) -> list[dict]:
@@ -202,7 +216,7 @@ def build_watched_movies(
                 record["guids"] = guids
             record["watched_by"][username] = True
             record["watch_evidence"][username] = "emby_isplayed"
-    return list(by_key.values())
+    return _with_unwatched_users(by_key.values(), items_by_user)
 
 
 def build_watched_episodes(
@@ -237,7 +251,7 @@ def build_watched_episodes(
                 record["file"] = _item_path(item)
             record["watched_by"][username] = True
             record["watch_evidence"][username] = "emby_isplayed"
-    return list(by_key.values())
+    return _with_unwatched_users(by_key.values(), items_by_user)
 
 
 def load_watched_state(

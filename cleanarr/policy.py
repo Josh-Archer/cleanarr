@@ -131,17 +131,14 @@ def normalize_multi_user_delete_policy(value, *, default="require_all_users"):
 
 
 def user_names_match(left: str, right: str) -> bool:
-    """Flexible username match used for tags vs media-server account names."""
+    """Exact, case/whitespace-normalized username match (tags vs account names).
+
+    Substring/regex matching let ``ann`` match ``joanna`` and approve deletes
+    for users who never watched (cleanarr#79).
+    """
     left = (left or "").strip().lower()
     right = (right or "").strip().lower()
-    if not left or not right:
-        return False
-    if left == right:
-        return True
-    try:
-        return bool(re.search(left, right) or re.search(right, left))
-    except re.error:
-        return False
+    return bool(left) and left == right
 
 
 def user_in_collection(username: str, collection) -> bool:

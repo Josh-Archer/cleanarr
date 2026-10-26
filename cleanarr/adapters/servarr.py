@@ -8,10 +8,21 @@ from __future__ import annotations
 
 import json
 import time
-from urllib.parse import urljoin
 
 import requests
 from loguru import logger
+
+
+def join_url(baseurl, endpoint):
+    """Append ``endpoint`` to ``baseurl`` keeping any subpath (cleanarr#81).
+
+    ``urljoin`` drops the last baseurl segment when it lacks a trailing slash
+    (``http://h/sonarr`` + ``api/v3/x`` -> ``http://h/api/v3/x``).
+    """
+    endpoint = str(endpoint or "")
+    if endpoint.startswith(("http://", "https://")):
+        return endpoint
+    return f"{str(baseurl or '').rstrip('/')}/{endpoint.lstrip('/')}"
 
 
 class ServarrClient:
@@ -51,7 +62,7 @@ class ServarrClient:
             return None
 
         baseurl = (self.config or {}).get("baseurl") or ""
-        url = urljoin(baseurl, endpoint)
+        url = join_url(baseurl, endpoint)
         session = self.session
         session.headers.update({"X-Api-Key": apikey})
         return self._request(session, url, endpoint, method=method, data=data)
