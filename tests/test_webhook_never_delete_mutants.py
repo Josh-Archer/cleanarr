@@ -92,7 +92,7 @@ class TestMissingJellyfinConfigNeverDeletes(unittest.TestCase):
                 "UserData": {"Played": True}}
 
     def _fake_get(self, session, baseurl, apikey, path, params=None):
-        if path == "Users":
+        if path in ("Users", "Users/"):
             return [{"Id": "u-alice", "Name": "alice"}]
         return {"Items": [self._item()]}
 
