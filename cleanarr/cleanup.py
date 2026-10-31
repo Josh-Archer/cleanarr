@@ -1259,12 +1259,41 @@ class MediaCleanup:
                 return True
         return False
 
+    @staticmethod
+    def _match_series_by_path(series_list, file_path):
+        """Match a Sonarr series whose folder name is a directory in file_path.
+
+        Mount prefixes differ between Plex/Jellyfin and Sonarr, so compare the
+        series folder basename against the file's parent directory components.
+        """
+        if not file_path:
+            return None
+        parts = [p for p in re.split(r"[\\/]+", str(file_path))[:-1] if p]
+        if not parts:
+            return None
+        lowered = [p.lower() for p in parts]
+        best = None
+        best_idx = -1
+        for s in series_list:
+            folder = re.split(r"[\\/]+", str(s.get("path") or "").rstrip("/\\"))[-1].lower()
+            if not folder:
+                continue
+            for idx, part in enumerate(lowered):
+                if part == folder and idx > best_idx:
+                    best, best_idx = s, idx
+        return best
+
     def match_episode_to_sonarr(self, episode):
         """Match a Plex episode to Sonarr."""
         logger.info(f"Matching episode to Sonarr: {episode['show_title']} S{episode['season']}E{episode['episode']}")
         series_list = self.get_sonarr_series()
-        # Exact match first
-        series = next((s for s in series_list if s["title"].lower() == episode["show_title"].lower()), None)
+        # Prefer stable identity: the Sonarr series folder appearing in the file path
+        series = self._match_series_by_path(series_list, episode.get("file"))
+        if series:
+            logger.info(f"Matched by series path: Sonarr='{series.get('title')}' for '{episode['show_title']}'")
+        # Exact title match next
+        if not series:
+            series = next((s for s in series_list if (s.get("title") or "").lower() == episode["show_title"].lower()), None)
         if not series:
             # Log candidate titles for debugging
             try:

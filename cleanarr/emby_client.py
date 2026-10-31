@@ -30,7 +30,10 @@ def auth_headers(apikey: str) -> dict[str, str]:
     token = (apikey or "").strip()
     if not token:
         return {}
+    # Jellyfin 10.11+/12.x rejects the legacy X-Emby-Token header (401);
+    # the MediaBrowser Authorization scheme works on Jellyfin and Emby.
     return {
+        "Authorization": f'MediaBrowser Token="{token}"',
         "X-Emby-Token": token,
         "Accept": "application/json",
     }
