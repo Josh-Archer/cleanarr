@@ -199,7 +199,7 @@ class TestEmbyHttpFixtures(unittest.TestCase):
         empty = {"Items": []}
 
         def get_side_effect(url, headers=None, params=None, timeout=None):
-            if url.endswith("/Users") or url.endswith("Users"):
+            if url.endswith("/Users/"):
                 return _json_response(users)
             if "u-alice" in url and params and params.get("IncludeItemTypes") == "Movie":
                 return _json_response(alice_movies)
@@ -222,7 +222,7 @@ class TestEmbyHttpFixtures(unittest.TestCase):
         # Disabled user should never be queried when filtered by name list,
         # and never appear even without a filter.
         called_urls = [call.args[0] for call in session.get.call_args_list]
-        self.assertTrue(any("Users" in url for url in called_urls))
+        self.assertIn("http://emby:8096/Users/", called_urls)
         self.assertFalse(any("u-skip" in url for url in called_urls))
 
 
@@ -488,3 +488,51 @@ class TestEmbyProxyParse(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestEmbyGetNonJson(unittest.TestCase):
+    def _resp(self, content, ctype, url="https://jf.example/Users/", history=None):
+        r = MagicMock()
+        r.content = content
+        r.headers = {"Content-Type": ctype}
+        r.url = url
+        r.history = history or []
+        r.raise_for_status.return_value = None
+        r.json.side_effect = ValueError("Expecting value")
+        return r
+
+    def test_list_users_requests_trailing_slash(self):
+        session = MagicMock()
+        ok = MagicMock()
+        ok.content = b"[]"
+        ok.headers = {"Content-Type": "application/json"}
+        ok.history = []
+        ok.json.return_value = [{"Id": "u1", "Name": "a"}]
+        session.get.return_value = ok
+        emby_client.list_users(session, "https://jf.example", "k")
+        self.assertEqual(session.get.call_args.args[0], "https://jf.example/Users/")
+
+    def test_html_response_raises_clear_error_naming_path(self):
+        session = MagicMock()
+        session.get.return_value = self._resp(b"<!DOCTYPE html><html>login</html>", "text/html")
+        with self.assertRaises(emby_client.EmbyNonJsonResponseError) as ctx:
+            emby_client.emby_get(session, "https://jf.example", "k", "Users")
+        self.assertIn("'Users'", str(ctx.exception))
+
+    def test_login_redirect_raises(self):
+        session = MagicMock()
+        session.get.return_value = self._resp(
+            b"{}", "application/json",
+            url="https://team.cloudflareaccess.com/cdn-cgi/access/login?x=secret",
+            history=[MagicMock()],
+        )
+        with self.assertRaises(emby_client.EmbyNonJsonResponseError) as ctx:
+            emby_client.emby_get(session, "https://jf.example", "k", "Items")
+        self.assertIn("'Items'", str(ctx.exception))
+        self.assertNotIn("secret", str(ctx.exception))
+
+    def test_non_json_text_raises(self):
+        session = MagicMock()
+        session.get.return_value = self._resp(b"not json", "text/plain")
+        with self.assertRaises(emby_client.EmbyNonJsonResponseError):
+            emby_client.emby_get(session, "https://jf.example", "k", "System/Info")

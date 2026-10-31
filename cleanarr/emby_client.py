@@ -39,6 +39,36 @@ def auth_headers(apikey: str) -> dict[str, str]:
     }
 
 
+class EmbyNonJsonResponseError(RuntimeError):
+    """Raised when an API path returns HTML/non-JSON (e.g. a proxy login page)."""
+
+
+_LOGIN_MARKERS = ("cdn-cgi/access", "/login", "cloudflareaccess.com")
+
+
+def _ensure_json_response(response: Any, path: str) -> None:
+    final_url = str(getattr(response, "url", "") or "")
+    history = getattr(response, "history", None) or []
+    redirected = isinstance(history, (list, tuple)) and len(history) > 0
+    headers = getattr(response, "headers", None)
+    content_type = ""
+    if isinstance(headers, dict) or hasattr(headers, "get"):
+        try:
+            content_type = str(headers.get("Content-Type", "") or "").lower()
+        except Exception:  # pragma: no cover - defensive
+            content_type = ""
+    body = response.content if isinstance(response.content, (bytes, bytearray)) else b""
+    head = bytes(body[:512]).lstrip().lower()
+    looks_html = "text/html" in content_type or head.startswith((b"<!doctype html", b"<html"))
+    login_redirect = redirected and any(m in final_url.lower() for m in _LOGIN_MARKERS)
+    if looks_html or login_redirect:
+        where = f" (redirected to {final_url.split('?')[0]})" if redirected and final_url else ""
+        raise EmbyNonJsonResponseError(
+            f"Emby/Jellyfin GET {path!r} returned an HTML/login page instead of JSON{where}; "
+            "check that the reverse proxy (e.g. Cloudflare Access) allows this API path"
+        )
+
+
 def emby_get(
     session: requests.Session,
     baseurl: str,
@@ -61,7 +91,14 @@ def emby_get(
     response.raise_for_status()
     if not response.content:
         return None
-    return response.json()
+    _ensure_json_response(response, path)
+    try:
+        return response.json()
+    except ValueError as exc:
+        raise EmbyNonJsonResponseError(
+            f"Emby/Jellyfin GET {path!r} returned a non-JSON response "
+            "(possibly an auth/login page from a proxy such as Cloudflare Access)"
+        ) from exc
 
 
 def list_users(
@@ -71,7 +108,7 @@ def list_users(
     allowed_usernames: Iterable[str] | None = None,
 ) -> list[dict]:
     """Return Emby users, optionally filtered by username (case-insensitive)."""
-    data = emby_get(session, baseurl, apikey, "Users")
+    data = emby_get(session, baseurl, apikey, "Users/")
     if not isinstance(data, list):
         return []
     allowed = {

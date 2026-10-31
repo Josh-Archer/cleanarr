@@ -32,7 +32,7 @@ def _fake_emby_get(played_by):
     users = [{"Id": f"u-{n}", "Name": n} for n in played_by]
 
     def _get(session, baseurl, apikey, path, params=None):
-        if path == "Users":
+        if path in ("Users", "Users/"):
             return users
         uid = path.split("/")[1]
         name = uid[2:]
