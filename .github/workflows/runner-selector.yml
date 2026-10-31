@@ -23,13 +23,10 @@ jobs:
           USE_SELF_HOSTED: ${{ vars.USE_SELF_HOSTED }}
           SELF_HOSTED_RUNNER_LABEL: ${{ vars.SELF_HOSTED_RUNNER_LABEL }}
           EVENT_NAME: ${{ github.event_name }}
-          IS_FORK: ${{ github.event.pull_request.head.repo.fork }}
         run: |
           set -euo pipefail
 
-          # Fork pull requests never get self-hosted runners (the broker refuses
-          # them too); everything else uses the shared UECB pool.
-          if [ "${EVENT_NAME}" = "pull_request" ] && [ "${IS_FORK}" = "true" ]; then
+          if [ "${EVENT_NAME}" = "pull_request" ]; then
             echo "runner-label=ubuntu-latest" >> "$GITHUB_OUTPUT"
           elif [ "${USE_SELF_HOSTED}" = "true" ] && [ -n "${SELF_HOSTED_RUNNER_LABEL}" ]; then
             echo "runner-label=${SELF_HOSTED_RUNNER_LABEL}" >> "$GITHUB_OUTPUT"
