@@ -443,7 +443,7 @@ Plex / Emby / Jellyfin watch state / webhook events
 | `CLEANARR_EMBY_APIKEY` | When source is emby | Emby API key (`X-Emby-Token`) |
 | `CLEANARR_EMBY_USERS` | No | Optional comma-separated Emby usernames for job watched state |
 | `CLEANARR_JELLYFIN_BASEURL` | When source is jellyfin | Jellyfin Server base URL |
-| `CLEANARR_JELLYFIN_APIKEY` | When source is jellyfin | Jellyfin API key (`X-Emby-Token`) |
+| `CLEANARR_JELLYFIN_APIKEY` | When source is jellyfin | Jellyfin API key (`Authorization: MediaBrowser Token=...`, plus legacy `X-Emby-Token`) |
 | `CLEANARR_JELLYFIN_USERS` | No | Optional comma-separated Jellyfin usernames for job watched state |
 | `CLEANARR_SONARR_BASEURL` | Yes | Sonarr API base URL |
 | `CLEANARR_SONARR_APIKEY` | Yes | Sonarr API key |

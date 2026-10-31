@@ -265,7 +265,7 @@ Required when `CLEANARR_MEDIA_SOURCE=jellyfin`:
 
 | --- | --- | --- |
 | `CLEANARR_JELLYFIN_BASEURL` | `JELLYFIN_URL` | Jellyfin Server base URL (default `http://jellyfin:8096`) |
-| `CLEANARR_JELLYFIN_APIKEY` | `CLEANARR_JELLYFIN_TOKEN`, `JELLYFIN_APIKEY`, `JELLYFIN_TOKEN` | Jellyfin API key (`X-Emby-Token`) |
+| `CLEANARR_JELLYFIN_APIKEY` | `CLEANARR_JELLYFIN_TOKEN`, `JELLYFIN_APIKEY`, `JELLYFIN_TOKEN` | Jellyfin API key (`Authorization: MediaBrowser Token=...`, plus legacy `X-Emby-Token`) |
 | `CLEANARR_JELLYFIN_USERS` | — | Optional comma-separated usernames. Empty = all non-disabled users. |
 
 
