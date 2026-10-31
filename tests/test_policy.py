@@ -344,3 +344,19 @@ class TestAdapters(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestDecideTaggedUserDelete(unittest.TestCase):
+    def test_tagged_watcher_allows(self):
+        from cleanarr.policy import decide_tagged_user_delete
+        self.assertTrue(decide_tagged_user_delete(["josh"], {"josh": True, "gawly": False}).allowed)
+
+    def test_untagged_never_allows(self):
+        from cleanarr.policy import decide_tagged_user_delete
+        d = decide_tagged_user_delete([], {"josh": True})
+        self.assertFalse(d.allowed)
+        self.assertEqual(d.reason, "no_user_tags")
+
+    def test_protected_labels_are_not_users(self):
+        from cleanarr.policy import decide_tagged_user_delete
+        self.assertFalse(decide_tagged_user_delete(["safe", "kids"], {"safe": True, "kids": True}).allowed)

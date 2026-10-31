@@ -1768,8 +1768,63 @@ def _jellyfin_watch_state(mc, ev: dict):
         return None, {}
     if not item:
         return None, {}
-    watched_by = _normalize_watched_by(raw_watched, platform=platform) or raw_watched
+    watched_by = _map_watched_by_to_plex_users(raw_watched, platform=platform)
+    logger.info(f"{platform} watch state mapped to Plex users: {watched_by}")
     return emby_client.item_record(item), dict(watched_by)
+
+
+def _jellyfin_plex_user_map(platform: str = "jellyfin") -> dict:
+    """Configured media-server -> Plex user map (lowercased keys and values).
+
+    Sources, later entries win:
+    - ``CLEANARR_USER_ALIASES_JSON`` entries with both ``plex`` and ``<platform>``
+      keys, e.g. ``{"josh": {"plex": "Josh", "jellyfin": "josh"}}``
+    - ``CLEANARR_JELLYFIN_PLEX_USER_MAP_JSON``, e.g. ``{"josh": "Josh"}``
+    """
+    mapping: dict = {}
+    raw = os.environ.get("CLEANARR_USER_ALIASES_JSON", "")
+    if raw:
+        try:
+            aliases = json.loads(raw)
+            for _, platforms in (aliases or {}).items():
+                if isinstance(platforms, dict):
+                    src = str(platforms.get(platform) or "").strip().lower()
+                    dst = str(platforms.get("plex") or "").strip().lower()
+                    if src and dst:
+                        mapping[src] = dst
+        except Exception:
+            logger.warning("Failed to parse CLEANARR_USER_ALIASES_JSON; expected object JSON")
+    raw = os.environ.get("CLEANARR_JELLYFIN_PLEX_USER_MAP_JSON", "")
+    if raw:
+        try:
+            extra = json.loads(raw)
+            if isinstance(extra, dict):
+                for src, dst in extra.items():
+                    src = str(src or "").strip().lower()
+                    dst = str(dst or "").strip().lower()
+                    if src and dst:
+                        mapping[src] = dst
+        except Exception:
+            logger.warning("Failed to parse CLEANARR_JELLYFIN_PLEX_USER_MAP_JSON; expected object JSON")
+    return mapping
+
+
+def _map_watched_by_to_plex_users(raw_watched_by: dict, platform: str = "jellyfin") -> dict:
+    """Re-key a Jellyfin/Emby watch map by Plex user name.
+
+    A configured map wins; otherwise the user matches the Plex user of the
+    same name (case-insensitive, exact). Users that match no Plex tag simply
+    never satisfy the tag rules, so hidden/unmapped accounts cannot block.
+    """
+    mapping = _jellyfin_plex_user_map(platform)
+    mapped: dict = {}
+    for user, watched in (raw_watched_by or {}).items():
+        name = str(user or "").strip().lower()
+        if not name:
+            continue
+        plex_user = mapping.get(name, name)
+        mapped[plex_user] = bool(mapped.get(plex_user)) or bool(watched)
+    return mapped
 
 
 def _jellyfin_deletions_enabled() -> bool:
@@ -1861,6 +1916,7 @@ def _process_jellyfin_finished(mc, ev: dict, _emit_result, _notify_episode_clean
             "rating_key": None,
             "is_watched_override": False,
             "source": platform,
+            "tag_rules_only": True,
         }
         sonarr_match = mc.match_episode_to_sonarr(ep)
         if not sonarr_match:
@@ -1883,6 +1939,7 @@ def _process_jellyfin_finished(mc, ev: dict, _emit_result, _notify_episode_clean
             "guid": record.get("guid") or meta.get("guid"),
             "rating_key": None,
             "source": platform,
+            "tag_rules_only": True,
         }
         radarr_match = mc.match_movie_to_radarr(mv)
         if not radarr_match:

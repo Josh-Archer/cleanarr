@@ -42,6 +42,7 @@ from cleanarr.adapters.transmission import (
 from cleanarr.policy import (
     collect_watch_ahead_candidates,
     decide_exact_item_delete,
+    decide_tagged_user_delete,
     household_policy_allows_delete as _policy_allows_delete,
     ids_include_any_label,
     is_protected_tag_label as _is_protected_tag_label,
@@ -1463,13 +1464,21 @@ class MediaCleanup:
             return False
 
         policy = CONFIG.get("multi_user_delete_policy", "require_all_users")
-        decision = decide_exact_item_delete(
-            user_tags,
-            watched_by,
-            policy=policy,
-            primary_user=CONFIG.get("primary_user") or "",
-            household_users=CONFIG.get("household_users") or set(),
-        )
+        if media_item.get("tag_rules_only"):
+            decision = decide_tagged_user_delete(
+                user_tags,
+                watched_by,
+                policy=policy,
+                primary_user=CONFIG.get("primary_user") or "",
+            )
+        else:
+            decision = decide_exact_item_delete(
+                user_tags,
+                watched_by,
+                policy=policy,
+                primary_user=CONFIG.get("primary_user") or "",
+                household_users=CONFIG.get("household_users") or set(),
+            )
         household = list(decision.household)
         detail = decision.detail
         if decision.allowed:

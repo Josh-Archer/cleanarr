@@ -312,6 +312,56 @@ def decide_exact_item_delete(
     )
 
 
+def decide_tagged_user_delete(
+    user_tags,
+    watched_by,
+    *,
+    policy="require_all_users",
+    primary_user="",
+) -> DeleteDecision:
+    """Jellyfin/Emby finished-event decision using Plex-user tag rules.
+
+    ``watched_by`` must already be keyed by Plex user names (see the webhook
+    Jellyfin-to-Plex user mapping). The household is only the Sonarr/Radarr
+    user tags: untagged items never delete, and untagged or unmapped media
+    server accounts (hidden users) can neither block nor approve a delete.
+    ``safe`` / ``kids`` protection is applied by callers before this and is
+    absolute; protected labels never count as users here either.
+    """
+    normalized_policy = normalize_multi_user_delete_policy(policy)
+    tags = sorted({
+        normalize_tag_label(str(tag))
+        for tag in (user_tags or ())
+        if normalize_tag_label(str(tag)) and not is_protected_tag_label(str(tag))
+    })
+    watched_users = watched_users_from_map(watched_by)
+    if not tags:
+        return DeleteDecision(
+            allowed=False,
+            reason="no_user_tags",
+            detail="untagged item; tag rules require a Plex user tag",
+            policy=normalized_policy,
+            household=(),
+            watched_users=tuple(watched_users),
+            user_tags=(),
+        )
+    allowed, detail = household_policy_allows_delete(
+        tags,
+        watched_users,
+        policy=normalized_policy,
+        primary_user=primary_user,
+    )
+    return DeleteDecision(
+        allowed=allowed,
+        reason="household_policy_allows" if allowed else "household_policy_not_satisfied",
+        detail=detail,
+        policy=normalized_policy,
+        household=tuple(tags),
+        watched_users=tuple(watched_users),
+        user_tags=tuple(tags),
+    )
+
+
 def collect_watch_ahead_candidates(user_watched, episode_keys):
     """Find episodes a user has skipped while watching at least two ahead.
 

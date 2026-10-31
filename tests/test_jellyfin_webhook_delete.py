@@ -61,7 +61,7 @@ def _ev():
     }
 
 
-def _make_mc(series_tags=None, tag_list=None):
+def _make_mc(series_tags=None, tag_list=None, user_tags=("alice", "bob")):
     with patch.dict(cleanup.CONFIG, {
         "dry_run": True,
         "media_source": "plex",
@@ -80,7 +80,7 @@ def _make_mc(series_tags=None, tag_list=None):
         "file_id": 100,
     })
     mc.get_sonarr_tags = MagicMock(return_value=tag_list or [])
-    mc.get_user_tags = MagicMock(return_value=[])
+    mc.get_user_tags = MagicMock(return_value=list(user_tags))
     mc.delete_sonarr_episode_file = MagicMock(return_value=True)
     mc.unmonitor_sonarr_episode = MagicMock(return_value=True)
     mc.remove_torrent_by_file_path = MagicMock()
@@ -216,3 +216,62 @@ class TestJellyfinDeleteSource(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestJellyfinPlexUserTagRules(unittest.TestCase):
+    """cleanarr: Jellyfin finished events use Plex-user tag rules (home#4046)."""
+
+    def setUp(self):
+        webhook_app.reset_dry_run_report()
+
+    def _run(self, mc, played_by, env=None):
+        emitted = []
+        environ = {"CLEANARR_HOUSEHOLD_USERS": "", "CLEANARR_JELLYFIN_DELETIONS": "true",
+                   "CLEANARR_USER_ALIASES_JSON": "", "CLEANARR_JELLYFIN_PLEX_USER_MAP_JSON": ""}
+        environ.update(env or {})
+        with patch.object(emby_client, "emby_get", side_effect=_fake_emby_get(played_by)), \
+                patch.dict(cleanup.CONFIG, {
+                    "multi_user_delete_policy": "require_all_users",
+                    "household_users": set(),
+                    "jellyfin": {"baseurl": "http://jf.test", "apikey": "k", "users": []},
+                }), patch.dict(os.environ, environ):
+            webhook_app._process_jellyfin_finished(
+                mc, _ev(), lambda *a, **k: emitted.append(a), lambda ep: None
+            )
+        return emitted
+
+    def test_mapped_tagged_user_deletes_by_name(self):
+        mc = _make_mc(user_tags=["josh"])
+        self._run(mc, {"Josh": True, "gawly": False})
+        mc.delete_sonarr_episode_file.assert_called_once_with(100)
+
+    def test_mapped_tagged_user_deletes_via_configured_map(self):
+        mc = _make_mc(user_tags=["josh"])
+        self._run(mc, {"jarcher": True, "gawly": False},
+                  env={"CLEANARR_JELLYFIN_PLEX_USER_MAP_JSON": '{"jarcher": "Josh"}'})
+        mc.delete_sonarr_episode_file.assert_called_once_with(100)
+
+    def test_safe_or_kids_never_deletes_even_when_tagged_user_watched(self):
+        for label in ("safe", "kids", "1 - safe"):
+            with self.subTest(label=label):
+                mc = _make_mc(series_tags=[7, 8],
+                              tag_list=[{"id": 7, "label": label}, {"id": 8, "label": "josh"}],
+                              user_tags=["josh"])
+                self._run(mc, {"josh": True})
+                mc.delete_sonarr_episode_file.assert_not_called()
+                mc.unmonitor_sonarr_episode.assert_not_called()
+
+    def test_unmapped_hidden_user_does_not_block(self):
+        mc = _make_mc(user_tags=["josh"])
+        self._run(mc, {"josh": True, "gawly": False, "hidden": None})
+        mc.delete_sonarr_episode_file.assert_called_once_with(100)
+
+    def test_untagged_item_is_not_deleted(self):
+        mc = _make_mc(user_tags=[])
+        self._run(mc, {"josh": True, "gawly": True})
+        mc.delete_sonarr_episode_file.assert_not_called()
+
+    def test_tagged_user_not_watched_is_kept(self):
+        mc = _make_mc(user_tags=["josh"])
+        self._run(mc, {"josh": False, "gawly": True})
+        mc.delete_sonarr_episode_file.assert_not_called()
