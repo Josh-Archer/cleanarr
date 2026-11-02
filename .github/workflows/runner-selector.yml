@@ -13,7 +13,7 @@ permissions:
 
 jobs:
   select-runner:
-    runs-on: ubuntu-latest
+    runs-on: ${{ github.event.pull_request.head.repo.fork && 'ubuntu-latest' || 'uecb-shared' }}
     outputs:
       runner-label: ${{ steps.set-runner.outputs.runner-label }}
     steps:
