@@ -63,6 +63,8 @@ def _load_sensitive_values() -> set:
         os.environ.get("PLEX_TOKEN"),
         os.environ.get("CLEANARR_SONARR_APIKEY"),
         os.environ.get("CLEANARR_RADARR_APIKEY"),
+        os.environ.get("CLEANARR_SEERR_APIKEY"),
+        os.environ.get("CLEANARR_OVERSEERR_APIKEY"),
         os.environ.get("CLEANARR_WEBHOOK_SECRET"),
         os.environ.get("WEBHOOK_SECRET"),
         os.environ.get("CLEANARR_NTFY_TOKEN"),

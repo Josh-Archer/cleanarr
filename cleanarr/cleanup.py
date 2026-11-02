@@ -23,6 +23,7 @@ import re
 import threading
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
+from typing import Any, Dict, List, Optional, Tuple
 import requests
 from plexapi.server import PlexServer
 from transmission_rpc import Client as TransmissionClient
@@ -31,6 +32,7 @@ from transmission_rpc import Client as TransmissionClient
 from . import emby_client
 from cleanarr.adapters.jellyfin import JellyfinMediaSource
 from cleanarr.adapters.plex import PlexMediaSource
+from cleanarr.adapters.seerr import SeerrClient
 from cleanarr.adapters.servarr import ServarrClient
 from cleanarr.adapters.transmission import (
     TransmissionClientAdapter,
@@ -40,18 +42,22 @@ from cleanarr.adapters.transmission import (
     transmission_labels,
 )
 from cleanarr.policy import (
+    PROTECTED_TAG_LABELS,
     collect_watch_ahead_candidates,
     decide_exact_item_delete,
     decide_tagged_user_delete,
     household_policy_allows_delete as _policy_allows_delete,
     ids_include_any_label,
     is_protected_tag_label as _is_protected_tag_label,
+    is_seerr_request_eligible,
     normalize_multi_user_delete_policy as _normalize_multi_user_delete_policy,
     normalize_tag_label as _normalize_tag_label,
     protected_ids_from_tags,
     protected_labels_for_ids as _policy_protected_labels_for_ids,
     repeated_io_error_disposition,
     resolve_household_members as _policy_resolve_household_members,
+    seerr_request_matches_episode,
+    seerr_request_matches_movie,
     torrent_cleanup_decision,
     user_tags_from_ids,
 )
@@ -258,6 +264,48 @@ CONFIG = {
     ),
     "primary_user": (_get_env("CLEANARR_PRIMARY_USER", default="") or "").strip().lower(),
     "household_users": _env_csv_set("CLEANARR_HOUSEHOLD_USERS", default=""),
+    # Tag exclusion: skip items carrying these Sonarr/Radarr tags (e.g. keep).
+    "exclusion_tags": _env_csv_set(
+        "CLEANARR_EXCLUSION_TAGS",
+        "CLEANARR_TAG_EXCLUSIONS",
+        default="keep",
+    ),
+    # Seerr request protection (Overseerr / Jellyseerr)
+    "seerr": {
+        "enabled": _env_flag(
+            "CLEANARR_SEERR_ENABLE",
+            "CLEANARR_SEERR_ENABLED",
+            "CLEANARR_OVERSEERR_ENABLE",
+            "CLEANARR_OVERSEERR_ENABLED",
+            default="false",
+        ),
+        "baseurl": _get_env(
+            "CLEANARR_SEERR_BASEURL",
+            "CLEANARR_OVERSEERR_BASEURL",
+            "CLEANARR_SEERR_URL",
+            "CLEANARR_OVERSEERR_URL",
+            default="http://overseerr:5055/api/v1",
+        ),
+        "apikey": _get_env(
+            "CLEANARR_SEERR_APIKEY",
+            "CLEANARR_OVERSEERR_APIKEY",
+            "CLEANARR_SEERR_TOKEN",
+            "CLEANARR_OVERSEERR_TOKEN",
+        ),
+        "window_days": int(
+            _get_env(
+                "CLEANARR_SEERR_WINDOW_DAYS",
+                "CLEANARR_SEERR_REQUEST_WINDOW_DAYS",
+                "CLEANARR_OVERSEERR_WINDOW_DAYS",
+                default="30",
+            )
+        ),
+        "protected_users": _env_csv_set(
+            "CLEANARR_SEERR_PROTECTED_USERS",
+            "CLEANARR_OVERSEERR_PROTECTED_USERS",
+            default="",
+        ),
+    },
 }
 
 IO_ERROR_PATTERNS = (
@@ -329,6 +377,7 @@ class MediaCleanup:
             "movie_deletions": [],
             "music_deletions": [],
             "protected_skips": [],
+            "seerr_skips": [],
             "errors": [],
             "leaving_soon_entering": [],
             "deleted_after_grace": [],
@@ -488,6 +537,13 @@ class MediaCleanup:
             session_factory=requests.Session,
             missing_key_env="CLEANARR_LIDARR_APIKEY",
         )
+        self.exclusion_tags = set(CONFIG.get("exclusion_tags") or ())
+        self.seerr_client = SeerrClient(
+            CONFIG.get("seerr") or {},
+            session_factory=requests.Session,
+        )
+        self._seerr_cache = None
+        self._seerr_error = None
 
     @property
     def transmission_io(self):
@@ -743,8 +799,98 @@ class MediaCleanup:
         return payload
 
     def _protected_labels_for_ids(self, tags, tag_ids):
-        """Return protected tag labels (safe/kids) present in the given id set."""
-        return _policy_protected_labels_for_ids(tags, tag_ids)
+        """Return protected tag labels (safe/kids/exclusion) present in the given id set."""
+        return _policy_protected_labels_for_ids(tags, tag_ids, extra_tags=self.exclusion_tags)
+
+    def get_seerr_requests(self) -> Optional[List[Dict[str, Any]]]:
+        """Fetch all requests from Seerr, caching for the run."""
+        seerr_cfg = CONFIG.get("seerr") or {}
+        if not seerr_cfg.get("enabled"):
+            return []
+        if self._seerr_cache is not None:
+            return self._seerr_cache
+        if self._seerr_error is not None:
+            return None
+
+        try:
+            logger.debug("Fetching requests from Seerr")
+            requests_list = self.seerr_client.get_all_requests()
+            self._seerr_cache = requests_list
+            logger.info(f"Loaded {len(requests_list)} requests from Seerr")
+            return requests_list
+        except Exception as exc:
+            self._seerr_error = str(exc)
+            logger.error(f"Failed to fetch Seerr requests: {exc}")
+            self._mark_partial_failure()
+            self._record_summary("errors", f"Seerr unreachable: {exc}")
+            return None
+
+    def check_seerr_protection(
+        self,
+        media_type: str,
+        arr_item: Dict[str, Any],
+        episode_item: Optional[Dict[str, Any]] = None,
+    ) -> Tuple[bool, Optional[str], Optional[Dict[str, Any]]]:
+        """Check if an item is protected by a Seerr request.
+
+        Fails safe if Seerr is enabled but unreachable.
+        Returns (is_protected: bool, reason: Optional[str], details: Optional[dict]).
+        """
+        seerr_cfg = CONFIG.get("seerr") or {}
+        if not seerr_cfg.get("enabled"):
+            return False, None, None
+
+        seerr_requests = self.get_seerr_requests()
+        if seerr_requests is None:
+            # Unreachable -> Fail safe!
+            return (
+                True,
+                f"seerr_unreachable: {self._seerr_error}",
+                {
+                    "error": self._seerr_error,
+                    "skip_category": "error",
+                },
+            )
+
+        window_days = seerr_cfg.get("window_days", 30)
+        protected_users = seerr_cfg.get("protected_users") or set()
+
+        for req in seerr_requests:
+            is_eligible, reason_detail = is_seerr_request_eligible(
+                req,
+                window_days=window_days,
+                protected_users=protected_users,
+            )
+            if not is_eligible:
+                continue
+
+            matches = False
+            if media_type == "movie":
+                matches = seerr_request_matches_movie(req, arr_item)
+            elif media_type in {"episode", "series"}:
+                matches = seerr_request_matches_episode(req, arr_item, episode_item)
+
+            if matches:
+                requested_by = req.get("requestedBy") or {}
+                requester = (
+                    requested_by.get("username")
+                    or requested_by.get("plexUsername")
+                    or requested_by.get("email")
+                    or "unknown"
+                )
+                created_at = req.get("createdAt") or ""
+                reason_str = f"seerr_request: {reason_detail}"
+                details = {
+                    "seerr_request_id": req.get("id"),
+                    "requested_by": requester,
+                    "requested_at": created_at,
+                    "protection_detail": reason_detail,
+                    "skip_category": "protected",
+                    "user": requester,
+                }
+                return True, reason_str, details
+
+        return False, None, None
 
     def _summarize_entries(self, category, label):
         entries = self.run_summary.get(category, [])
@@ -821,6 +967,7 @@ class MediaCleanup:
             self._summarize_entries("tv_deletions", "TV deletions"),
             self._summarize_entries("movie_deletions", "Movie deletions"),
             self._summarize_entries("protected_skips", "Protected skips"),
+            self._summarize_entries("seerr_skips", "Seerr skips"),
             self._summarize_entries("errors", "Errors"),
         ]
         if int(CONFIG.get("grace_days", 0) or 0) > 0:
@@ -1440,8 +1587,8 @@ class MediaCleanup:
         return None
 
     def get_user_tags(self, tags, tag_ids):
-        """Get usernames from tag IDs, excluding 'safe' and 'kids'."""
-        return user_tags_from_ids(tags, tag_ids)
+        """Get usernames from tag IDs, excluding 'safe', 'kids', and exclusion tags."""
+        return user_tags_from_ids(tags, tag_ids, extra_tags=self.exclusion_tags)
 
     def should_delete_media(self, media_item, user_tags, watched_by):
         """Determine if media should be deleted based on watch status and household policy.
@@ -1499,6 +1646,7 @@ class MediaCleanup:
                 watched_by,
                 policy=policy,
                 primary_user=CONFIG.get("primary_user") or "",
+                extra_protected_tags=self.exclusion_tags,
             )
         else:
             decision = decide_exact_item_delete(
@@ -2210,7 +2358,7 @@ class MediaCleanup:
         # For each show/season, get all episodes (including unwatched)
         # We'll use Sonarr API to get all episodes for each series
         sonarr_series_list = self.get_sonarr_series()
-        protected_tag_ids = protected_ids_from_tags(sonarr_tags)
+        protected_tag_ids = protected_ids_from_tags(sonarr_tags, extra_tags=self.exclusion_tags)
 
         for series in sonarr_series_list:
             show_title = series["title"]
@@ -2272,24 +2420,30 @@ class MediaCleanup:
                         sonarr_tags,
                         series_tag_ids | episode_tag_ids,
                     )
+                    matched_exclusions = [l for l in protected_labels if l in self.exclusion_tags]
+                    if matched_exclusions:
+                        tag_reason = f"tag_exclusion: {', '.join(sorted(matched_exclusions))}"
+                    else:
+                        tag_reason = "protected_series_or_episode_tags"
                     logger.info(
                         f"[Watched Ahead] Skipping deletion for {episode_label} "
-                        f"due to 'safe' or 'kids' tag (users ahead={users_ahead})"
+                        f"due to tag ({protected_labels}) (users ahead={users_ahead})"
                     )
                     self._record_summary(
                         "protected_skips",
-                        f"{episode_label} [watched-ahead by {users_ahead}]",
+                        f"{episode_label} [watched-ahead by {users_ahead}, {tag_reason}]",
                     )
                     self._record_decision(
                         reason_code="protected",
                         media_type="episode",
                         media_title=episode_label,
-                        reason="protected_series_or_episode_tags",
+                        reason=tag_reason,
                         details={
                             "series": show_title,
                             "users_ahead": users_ahead,
                             "later_by_user": later_by_user,
                             "protected_labels": protected_labels,
+                            "exclusion_tags": matched_exclusions,
                         },
                     )
                     continue
@@ -2341,6 +2495,33 @@ class MediaCleanup:
                     grace_key, episode_label, eligible_item.get("rating_key")
                 ):
                     continue
+
+                is_seerr_prot, seerr_reason, seerr_details = self.check_seerr_protection(
+                    "episode", series, ep_obj
+                )
+                if is_seerr_prot:
+                    logger.info(
+                        f"[Watched Ahead] Skipping deletion for {episode_label} due to Seerr: {seerr_reason}"
+                    )
+                    reason_code = "error" if "seerr_unreachable" in (seerr_reason or "") else "protected"
+                    self._record_summary(
+                        "seerr_skips",
+                        f"{episode_label} [watched-ahead: {seerr_reason}]",
+                    )
+                    self._record_decision(
+                        reason_code=reason_code,
+                        media_type="episode",
+                        media_title=episode_label,
+                        reason=seerr_reason,
+                        details={
+                            "series": show_title,
+                            "users_ahead": users_ahead,
+                            "later_by_user": later_by_user,
+                            **(seerr_details or {}),
+                        },
+                    )
+                    continue
+
                 self._delete_episode_and_cleanup(
                     episode_label,
                     f"watched-ahead users={users_ahead} later={later_by_user} policy={policy}",
@@ -2385,20 +2566,26 @@ class MediaCleanup:
                     sonarr_tags,
                     series_tag_ids | episode_tag_ids,
                 )
+                matched_exclusions = [l for l in protected_labels if l in self.exclusion_tags]
+                if matched_exclusions:
+                    tag_reason = f"tag_exclusion: {', '.join(sorted(matched_exclusions))}"
+                else:
+                    tag_reason = "protected_series_or_episode_tags"
                 logger.info(
                     f"Skipping deletion for {episode_label} "
-                    "due to 'safe' or 'kids' tag"
+                    f"due to tag ({protected_labels})"
                 )
-                self._record_summary("protected_skips", f"{episode_label} [protected tag]")
+                self._record_summary("protected_skips", f"{episode_label} [{tag_reason}]")
                 self._record_decision(
                     reason_code="protected",
                     media_type="episode",
                     media_title=episode_label,
-                    reason="protected_series_or_episode_tags",
+                    reason=tag_reason,
                     details={
                         "series_tags": list(series_tag_ids),
                         "episode_tags": list(episode_tag_ids),
                         "protected_labels": protected_labels,
+                        "exclusion_tags": matched_exclusions,
                         "watched_by": episode.get("watched_by"),
                     },
                 )
@@ -2462,6 +2649,27 @@ class MediaCleanup:
             if not self.leaving_soon_allows_delete(
                 grace_key, episode_label, episode.get("rating_key")
             ):
+                continue
+
+            is_seerr_prot, seerr_reason, seerr_details = self.check_seerr_protection(
+                "episode", sonarr_match["series"], sonarr_match["episode"]
+            )
+            if is_seerr_prot:
+                logger.info(
+                    f"Skipping deletion for {episode_label} due to Seerr: {seerr_reason}"
+                )
+                reason_code = "error" if "seerr_unreachable" in (seerr_reason or "") else "protected"
+                self._record_summary("seerr_skips", f"{episode_label} [{seerr_reason}]")
+                self._record_decision(
+                    reason_code=reason_code,
+                    media_type="episode",
+                    media_title=episode_label,
+                    reason=seerr_reason,
+                    details={
+                        "watched_by": episode.get("watched_by"),
+                        **(seerr_details or {}),
+                    },
+                )
                 continue
 
             self._delete_episode_and_cleanup(
@@ -2529,19 +2737,27 @@ class MediaCleanup:
                     )
                 continue
             movie_tags = radarr_match["movie"].get("tags", [])
-            if ids_include_any_label(radarr_tags, movie_tags, ("safe", "kids")):
+            all_protected_labels = tuple(PROTECTED_TAG_LABELS | self.exclusion_tags)
+            if ids_include_any_label(radarr_tags, movie_tags, all_protected_labels):
                 protected_labels = self._protected_labels_for_ids(radarr_tags, movie_tags)
+                matched_exclusions = [l for l in protected_labels if l in self.exclusion_tags]
+                if matched_exclusions:
+                    tag_reason = f"tag_exclusion: {', '.join(sorted(matched_exclusions))}"
+                else:
+                    tag_reason = "protected_series_or_movie_tags"
                 logger.info(
-                    f"Skipping deletion for {movie['title']} ({movie['year']}) due to 'safe' or 'kids' tag"
+                    f"Skipping deletion for {movie['title']} ({movie['year']}) due to tag ({protected_labels})"
                 )
+                self._record_summary("protected_skips", f"{movie['title']} ({movie['year']}) [{tag_reason}]")
                 self._record_decision(
                     reason_code="protected",
                     media_type="movie",
                     media_title=f"{movie['title']} ({movie['year']})",
-                    reason="protected_series_or_movie_tags",
+                    reason=tag_reason,
                     details={
                         "movie_tags": movie_tags,
                         "protected_labels": protected_labels,
+                        "exclusion_tags": matched_exclusions,
                         "watched_by": movie.get("watched_by"),
                     },
                 )
@@ -2571,6 +2787,32 @@ class MediaCleanup:
                     grace_key, f"{movie['title']} ({movie['year']})", movie.get("rating_key")
                 ):
                     continue
+
+                is_seerr_prot, seerr_reason, seerr_details = self.check_seerr_protection(
+                    "movie", radarr_match["movie"]
+                )
+                if is_seerr_prot:
+                    logger.info(
+                        f"Skipping deletion for {movie['title']} ({movie['year']}) due to Seerr: {seerr_reason}"
+                    )
+                    reason_code = "error" if "seerr_unreachable" in (seerr_reason or "") else "protected"
+                    self._record_summary(
+                        "seerr_skips",
+                        f"{movie['title']} ({movie['year']}) [{seerr_reason}]",
+                    )
+                    self._record_decision(
+                        reason_code=reason_code,
+                        media_type="movie",
+                        media_title=f"{movie['title']} ({movie['year']})",
+                        reason=seerr_reason,
+                        details={
+                            "radarr_id": radarr_match["movie"].get("id"),
+                            "watched_by": movie.get("watched_by"),
+                            **(seerr_details or {}),
+                        },
+                    )
+                    continue
+
                 if self.delete_radarr_movie_file(radarr_match["file_id"]):
                     if int(CONFIG.get("grace_days", 0) or 0) > 0:
                         self.run_summary.setdefault("deleted_after_grace", []).append(
@@ -3077,7 +3319,7 @@ class MediaCleanup:
             )
             return
 
-        protected_tag_ids = protected_ids_from_tags(lidarr_tags)
+        protected_tag_ids = protected_ids_from_tags(lidarr_tags, extra_tags=self.exclusion_tags)
 
         played_tracks = self.get_played_tracks()
         for track in played_tracks:
@@ -3110,19 +3352,29 @@ class MediaCleanup:
             combined_tag_ids = artist_tag_ids | album_tag_ids | track_tag_ids
 
             if protected_tag_ids & combined_tag_ids:
-                logger.info(
-                    f"Skipping deletion for {track_label} due to 'safe' or 'kids' tag"
+                protected_labels = self._protected_labels_for_ids(
+                    lidarr_tags, combined_tag_ids
                 )
-                self._record_summary("protected_skips", f"{track_label} [protected tag]")
+                matched_exclusions = [l for l in protected_labels if l in self.exclusion_tags]
+                if matched_exclusions:
+                    tag_reason = f"tag_exclusion: {', '.join(sorted(matched_exclusions))}"
+                else:
+                    tag_reason = "protected_artist_album_or_track_tags"
+                logger.info(
+                    f"Skipping deletion for {track_label} due to tag ({protected_labels})"
+                )
+                self._record_summary("protected_skips", f"{track_label} [{tag_reason}]")
                 self._record_decision(
                     reason_code="protected",
                     media_type="track",
                     media_title=track_label,
-                    reason="protected_artist_album_or_track_tags",
+                    reason=tag_reason,
                     details={
                         "artist_tags": list(artist_tag_ids),
                         "album_tags": list(album_tag_ids),
                         "track_tags": list(track_tag_ids),
+                        "protected_labels": protected_labels,
+                        "exclusion_tags": matched_exclusions,
                     },
                 )
                 continue

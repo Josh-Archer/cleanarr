@@ -9,6 +9,8 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
+from datetime import datetime, timezone
+from typing import Iterable
 
 from loguru import logger
 
@@ -40,8 +42,14 @@ def normalize_tag_label(label: str) -> str:
     return label
 
 
-def is_protected_tag_label(label: str) -> bool:
-    return normalize_tag_label(label) in PROTECTED_TAG_LABELS
+def is_protected_tag_label(label: str, extra_tags: Iterable[str] | None = None) -> bool:
+    normalized = normalize_tag_label(label)
+    if normalized in PROTECTED_TAG_LABELS:
+        return True
+    if extra_tags:
+        normalized_extra = {normalize_tag_label(t) for t in extra_tags}
+        return normalized in normalized_extra
+    return False
 
 
 def find_tag_by_label(tags, label):
@@ -57,21 +65,21 @@ def find_tag_by_label(tags, label):
     return None
 
 
-def protected_ids_from_tags(tags) -> set:
-    """Ids of safe/kids tags. ``tags`` is an Arr tag list."""
+def protected_ids_from_tags(tags, extra_tags: Iterable[str] | None = None) -> set:
+    """Ids of safe/kids/exclusion tags. ``tags`` is an Arr tag list."""
     return {
         tag["id"]
         for tag in tags or []
-        if is_protected_tag_label(tag.get("label"))
+        if is_protected_tag_label(tag.get("label"), extra_tags=extra_tags)
     }
 
 
-def protected_labels_for_ids(tags, tag_ids) -> list:
-    """Protected tag labels (safe/kids) present in the given id set."""
+def protected_labels_for_ids(tags, tag_ids, extra_tags: Iterable[str] | None = None) -> list:
+    """Protected tag labels (safe/kids/exclusion) present in the given id set."""
     labels = []
     id_set = set(tag_ids or [])
     for tag in tags or []:
-        if tag.get("id") in id_set and is_protected_tag_label(tag.get("label")):
+        if tag.get("id") in id_set and is_protected_tag_label(tag.get("label"), extra_tags=extra_tags):
             labels.append(normalize_tag_label(tag.get("label")))
     return labels
 
@@ -90,11 +98,11 @@ def ids_include_any_label(tags, item_tag_ids, labels) -> bool:
     return False
 
 
-def user_tags_from_ids(tags, tag_ids) -> list:
-    """Usernames from tag ids, excluding safe/kids protection tags."""
+def user_tags_from_ids(tags, tag_ids, extra_tags: Iterable[str] | None = None) -> list:
+    """Usernames from tag ids, excluding safe/kids and exclusion protection tags."""
     user_tags = []
-    for tag in tags:
-        if tag["id"] in tag_ids and not is_protected_tag_label(tag.get("label")):
+    for tag in tags or []:
+        if tag.get("id") in tag_ids and not is_protected_tag_label(tag.get("label"), extra_tags=extra_tags):
             cleaned_tag = normalize_tag_label(tag.get("label"))
             if cleaned_tag:
                 user_tags.append(cleaned_tag)
@@ -318,6 +326,7 @@ def decide_tagged_user_delete(
     *,
     policy="require_all_users",
     primary_user="",
+    extra_protected_tags: Iterable[str] | None = None,
 ) -> DeleteDecision:
     """Jellyfin/Emby finished-event decision using Plex-user tag rules.
 
@@ -332,7 +341,8 @@ def decide_tagged_user_delete(
     tags = sorted({
         normalize_tag_label(str(tag))
         for tag in (user_tags or ())
-        if normalize_tag_label(str(tag)) and not is_protected_tag_label(str(tag))
+        if normalize_tag_label(str(tag))
+        and not is_protected_tag_label(str(tag), extra_tags=extra_protected_tags)
     })
     watched_users = watched_users_from_map(watched_by)
     if not tags:
@@ -440,3 +450,196 @@ def repeated_io_error_disposition(*, count, threshold, active, dry_run) -> str:
     if dry_run:
         return "dry_run"
     return "remove"
+
+
+def is_seerr_request_eligible(
+    request: dict,
+    *,
+    window_days: int = 30,
+    protected_users: Iterable[str] | None = None,
+    now: datetime | None = None,
+) -> tuple[bool, str]:
+    """Check if a Seerr request protects media.
+
+    Returns (is_eligible: bool, reason_detail: str).
+    """
+    if not isinstance(request, dict):
+        return False, "invalid_request"
+
+    # Status: 1 = Pending Approval, 2 = Approved, 3 = Declined
+    status = request.get("status")
+    if status is None:
+        return False, "missing_status"
+    if status == 3 or str(status).strip().lower() in {"declined", "3"}:
+        return False, "declined"
+    if str(status).strip().lower() not in {"1", "2", "pending", "approved"}:
+        return False, f"invalid_status:{status}"
+
+    requested_by = request.get("requestedBy") or {}
+    requester_candidates = [
+        requested_by.get("username"),
+        requested_by.get("displayName"),
+        requested_by.get("plexUsername"),
+        requested_by.get("email"),
+    ]
+    requester_display = (
+        requested_by.get("username")
+        or requested_by.get("displayName")
+        or requested_by.get("plexUsername")
+        or requested_by.get("email")
+        or "unknown"
+    )
+
+    # 1. Protected user check
+    protected_set = {
+        str(u).strip().lower()
+        for u in (protected_users or ())
+        if str(u).strip()
+    }
+    for candidate in requester_candidates:
+        if candidate and str(candidate).strip().lower() in protected_set:
+            return True, f"protected_user:{candidate}"
+
+    # 2. Window days check
+    if window_days is None or int(window_days) <= 0:
+        return True, f"unlimited_window_by_{requester_display}"
+
+    created_at_raw = request.get("createdAt")
+    if not created_at_raw:
+        return True, f"within_window:active_by_{requester_display}"
+
+    try:
+        raw_str = str(created_at_raw).strip()
+        if raw_str.endswith("Z"):
+            raw_str = raw_str[:-1] + "+00:00"
+        created_dt = datetime.fromisoformat(raw_str)
+        if created_dt.tzinfo is None:
+            created_dt = created_dt.replace(tzinfo=timezone.utc)
+        current_time = now or datetime.now(timezone.utc)
+        age_seconds = (current_time - created_dt).total_seconds()
+        # Allow minor clock skew up to 1 hour
+        if -3600 <= age_seconds <= float(window_days) * 86400.0:
+            age_days = max(0, int(age_seconds / 86400.0))
+            return True, f"within_window:{age_days}d_by_{requester_display}"
+    except Exception:
+        pass
+
+    return False, "outside_window_or_unprotected"
+
+
+def seerr_request_matches_movie(request: dict, radarr_movie: dict) -> bool:
+    """Check if a Seerr request matches a Radarr movie."""
+    if not isinstance(request, dict) or not isinstance(radarr_movie, dict):
+        return False
+    media = request.get("media") or {}
+    media_type = str(media.get("mediaType") or request.get("type") or "").strip().lower()
+    if media_type and media_type not in {"movie", "1"}:
+        return False
+
+    req_tmdb = media.get("tmdbId")
+    movie_tmdb = radarr_movie.get("tmdbId")
+    if req_tmdb and movie_tmdb and str(req_tmdb).strip() == str(movie_tmdb).strip():
+        return True
+
+    req_imdb = str(media.get("imdbId") or "").strip().lower()
+    movie_imdb = str(radarr_movie.get("imdbId") or "").strip().lower()
+    if req_imdb and movie_imdb:
+        if req_imdb == movie_imdb or req_imdb.lstrip("t") == movie_imdb.lstrip("t"):
+            return True
+
+    req_tvdb = media.get("tvdbId")
+    movie_tvdb = radarr_movie.get("tvdbId")
+    if req_tvdb and movie_tvdb and str(req_tvdb).strip() == str(movie_tvdb).strip():
+        return True
+
+    req_title = media.get("title") or (request.get("movie") or {}).get("title") or request.get("title")
+    movie_title = radarr_movie.get("title")
+    if req_title and movie_title:
+        norm_req = re.sub(r"[^a-z0-9]", "", str(req_title).strip().lower())
+        norm_movie = re.sub(r"[^a-z0-9]", "", str(movie_title).strip().lower())
+        if norm_req and norm_req == norm_movie:
+            req_year = media.get("year") or request.get("year")
+            if not req_year:
+                rel_date = (
+                    (request.get("movie") or {}).get("releaseDate")
+                    or (request.get("media") or {}).get("releaseDate")
+                )
+                if rel_date and len(str(rel_date)) >= 4:
+                    req_year = str(rel_date)[:4]
+            movie_year = radarr_movie.get("year")
+            if req_year and movie_year:
+                if str(req_year).strip() == str(movie_year).strip():
+                    return True
+            elif not req_year or not movie_year:
+                return True
+
+    return False
+
+
+def seerr_request_matches_episode(
+    request: dict,
+    sonarr_series: dict,
+    sonarr_episode: dict | None = None,
+) -> bool:
+    """Check if a Seerr request matches a Sonarr series/episode."""
+    if not isinstance(request, dict) or not isinstance(sonarr_series, dict):
+        return False
+    media = request.get("media") or {}
+    media_type = str(media.get("mediaType") or "").strip().lower()
+    if media_type and media_type not in {"tv", "series"}:
+        return False
+
+    matched_series = False
+    req_tvdb = media.get("tvdbId")
+    series_tvdb = sonarr_series.get("tvdbId")
+    if req_tvdb and series_tvdb and str(req_tvdb).strip() == str(series_tvdb).strip():
+        matched_series = True
+
+    if not matched_series:
+        req_tmdb = media.get("tmdbId")
+        series_tmdb = sonarr_series.get("tmdbId")
+        if req_tmdb and series_tmdb and str(req_tmdb).strip() == str(series_tmdb).strip():
+            matched_series = True
+
+    if not matched_series:
+        req_imdb = media.get("imdbId")
+        series_imdb = sonarr_series.get("imdbId")
+        if req_imdb and series_imdb and str(req_imdb).strip().lower() == str(series_imdb).strip().lower():
+            matched_series = True
+
+    if not matched_series:
+        req_title = media.get("title") or request.get("title")
+        series_title = sonarr_series.get("title")
+        if req_title and series_title:
+            norm_req = re.sub(r"[^a-z0-9]", "", str(req_title).strip().lower())
+            norm_series = re.sub(r"[^a-z0-9]", "", str(series_title).strip().lower())
+            if norm_req and norm_req == norm_series:
+                matched_series = True
+
+    if not matched_series:
+        return False
+
+    # Season matching
+    if sonarr_episode is not None:
+        seasons = request.get("seasons")
+        if seasons:
+            requested_seasons = set()
+            for s in seasons:
+                if isinstance(s, dict):
+                    num = s.get("seasonNumber")
+                else:
+                    num = s
+                if num is not None:
+                    try:
+                        requested_seasons.add(int(num))
+                    except (ValueError, TypeError):
+                        pass
+            ep_season = sonarr_episode.get("seasonNumber")
+            if ep_season is not None and requested_seasons:
+                try:
+                    if int(ep_season) not in requested_seasons:
+                        return False
+                except (ValueError, TypeError):
+                    pass
+
+    return True
