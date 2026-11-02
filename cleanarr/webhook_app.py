@@ -13,9 +13,11 @@ from urllib.parse import urlparse
 from flask import Flask, request, jsonify
 import contextvars
 from cleanarr.policy import (
+    PROTECTED_TAG_LABELS,
     decide_exact_item_delete,
     ids_include_any_label,
     protected_ids_from_tags,
+    protected_labels_for_ids,
 )
 from cleanarr.reporting import (
     DEFAULT_DRY_RUN_REPORT_DIR,
@@ -1773,6 +1775,24 @@ def _jellyfin_watch_state(mc, ev: dict):
     return emby_client.item_record(item), dict(watched_by)
 
 
+def _is_seerr_enabled(mc) -> bool:
+    cfg = getattr(mc, "CONFIG", None)
+    if isinstance(cfg, dict):
+        seerr_cfg = cfg.get("seerr")
+        if isinstance(seerr_cfg, dict):
+            return bool(seerr_cfg.get("enabled", False))
+    from cleanarr.cleanup import CONFIG as _CLEANUP_CONFIG
+    return bool((_CLEANUP_CONFIG.get("seerr") or {}).get("enabled", False))
+
+
+def _get_mc_exclusion_tags(mc) -> set:
+    ex_tags = getattr(mc, "exclusion_tags", None)
+    if isinstance(ex_tags, (set, list, tuple)):
+        return set(ex_tags)
+    from cleanarr.cleanup import CONFIG as _CLEANUP_CONFIG
+    return set(_CLEANUP_CONFIG.get("exclusion_tags") or ())
+
+
 def _jellyfin_plex_user_map(platform: str = "jellyfin") -> dict:
     """Configured media-server -> Plex user map (lowercased keys and values).
 
@@ -1981,25 +2001,31 @@ def _apply_episode_delete_policy(mc, ev: dict, ep: dict, sonarr_match: dict, _em
             details={"rating_key": ep.get("rating_key")},
         )
         return
-    protected_tag_ids = protected_ids_from_tags(sonarr_tags)
+    exclusion_tags = _get_mc_exclusion_tags(mc)
+    protected_tag_ids = protected_ids_from_tags(sonarr_tags, extra_tags=exclusion_tags)
     series_tags = sonarr_match['series'].get('tags', [])
     episode_tags = sonarr_match['episode'].get('tags') or []
     series_tag_ids = set(series_tags or [])
     episode_tag_ids = set(episode_tags)
     if protected_tag_ids & (series_tag_ids | episode_tag_ids):
-        logger.info(f"Skipping deletion for {ep['show_title']} S{ep['season']}E{ep['episode']} due to 'safe' or 'kids' tag")
-        matched_protected = [
-            label for label in ("safe", "kids")
-            if ids_include_any_label(sonarr_tags, series_tag_ids | episode_tag_ids, (label,))
-        ]
+        protected_labels = protected_labels_for_ids(
+            sonarr_tags, series_tag_ids | episode_tag_ids, extra_tags=exclusion_tags
+        )
+        matched_exclusions = [l for l in protected_labels if l in exclusion_tags]
+        if matched_exclusions:
+            tag_reason = f"tag_exclusion: {', '.join(sorted(matched_exclusions))}"
+        else:
+            tag_reason = "protected_series_or_episode_tags"
+        logger.info(f"Skipping deletion for {ep['show_title']} S{ep['season']}E{ep['episode']} due to tag ({protected_labels})")
         _record_webhook_decision(
             reason_code="protected",
             media_type="episode",
             media_title=f"{ep['show_title']} S{ep['season']}E{ep['episode']}",
-            reason="protected_series_or_episode_tags",
+            reason=tag_reason,
             details={
                 "rating_key": ep.get("rating_key"),
-                "protected_labels": matched_protected or ["protected"],
+                "protected_labels": protected_labels or ["protected"],
+                "exclusion_tags": matched_exclusions,
                 "watched_by": ep.get("watched_by"),
                 "user": (ev.get("account") or {}).get("title"),
             },
@@ -2018,6 +2044,24 @@ def _apply_episode_delete_policy(mc, ev: dict, ep: dict, sonarr_match: dict, _em
         if not mc.leaving_soon_allows_delete(mc.leaving_soon_key(ep), f"{ep['show_title']} S{ep['season']}E{ep['episode']}", ep.get('rating_key')):
             _record_webhook_decision(reason_code="skip", media_type="episode", media_title=f"{ep['show_title']} S{ep['season']}E{ep['episode']}", reason="leaving_soon_grace_period", details={"rating_key": ep.get("rating_key")})
             return
+        if _is_seerr_enabled(mc) and hasattr(mc, "check_seerr_protection"):
+            is_seerr_prot, seerr_reason, seerr_details = mc.check_seerr_protection(
+                "episode", sonarr_match['series'], sonarr_match['episode']
+            )
+            if is_seerr_prot:
+                reason_code = "error" if "seerr_unreachable" in (seerr_reason or "") else "protected"
+                _record_webhook_decision(
+                    reason_code=reason_code,
+                    media_type="episode",
+                    media_title=f"{ep['show_title']} S{ep['season']}E{ep['episode']}",
+                    reason=seerr_reason,
+                    details={
+                        "rating_key": ep.get("rating_key"),
+                        "watched_by": ep.get("watched_by"),
+                        **(seerr_details or {}),
+                    },
+                )
+                return
         logger.info(f"Webhook-triggered deletion: deleting {ep['show_title']} S{ep['season']}E{ep['episode']}")
         if mc.delete_sonarr_episode_file(sonarr_match.get('file_id')):
             if mc.unmonitor_sonarr_episode(sonarr_match['episode']['id']):
@@ -2078,21 +2122,28 @@ def _apply_movie_delete_policy(mc, ev: dict, mv: dict, radarr_match: dict, _emit
         )
         return
     movie_tags = radarr_match['movie'].get('tags', [])
-    if ids_include_any_label(radarr_tags, movie_tags, ("safe", "kids")):
-        logger.info(f"Skipping deletion for movie {mv['title']} due to 'safe' or 'kids' tag")
-        matched_protected = [
-            label for label in ("safe", "kids")
-            if ids_include_any_label(radarr_tags, movie_tags, (label,))
-        ]
+    exclusion_tags = _get_mc_exclusion_tags(mc)
+    all_protected_labels = tuple(PROTECTED_TAG_LABELS | exclusion_tags)
+    if ids_include_any_label(radarr_tags, movie_tags, all_protected_labels):
+        protected_labels = protected_labels_for_ids(
+            radarr_tags, movie_tags, extra_tags=exclusion_tags
+        )
+        matched_exclusions = [l for l in protected_labels if l in exclusion_tags]
+        if matched_exclusions:
+            tag_reason = f"tag_exclusion: {', '.join(sorted(matched_exclusions))}"
+        else:
+            tag_reason = "protected_series_or_movie_tags"
+        logger.info(f"Skipping deletion for movie {mv['title']} due to tag ({protected_labels})")
         _record_webhook_decision(
             reason_code="protected",
             media_type="movie",
             media_title=f"{mv['title']} ({mv.get('year')})",
-            reason="protected_series_or_movie_tags",
+            reason=tag_reason,
             details={
                 "rating_key": mv.get('rating_key'),
                 "movie_tags": movie_tags,
-                "protected_labels": matched_protected or ["protected"],
+                "protected_labels": protected_labels or ["protected"],
+                "exclusion_tags": matched_exclusions,
                 "watched_by": mv.get("watched_by"),
                 "user": (ev.get("account") or {}).get("title"),
             },
@@ -2105,6 +2156,24 @@ def _apply_movie_delete_policy(mc, ev: dict, mv: dict, radarr_match: dict, _emit
         if not mc.leaving_soon_allows_delete(mc.leaving_soon_key(mv), f"{mv['title']} ({mv['year']})", mv.get('rating_key')):
             _record_webhook_decision(reason_code="skip", media_type="movie", media_title=f"{mv['title']} ({mv['year']})", reason="leaving_soon_grace_period", details={"rating_key": mv.get("rating_key")})
             return
+        if _is_seerr_enabled(mc) and hasattr(mc, "check_seerr_protection"):
+            is_seerr_prot, seerr_reason, seerr_details = mc.check_seerr_protection(
+                "movie", radarr_match['movie']
+            )
+            if is_seerr_prot:
+                reason_code = "error" if "seerr_unreachable" in (seerr_reason or "") else "protected"
+                _record_webhook_decision(
+                    reason_code=reason_code,
+                    media_type="movie",
+                    media_title=f"{mv['title']} ({mv.get('year')})",
+                    reason=seerr_reason,
+                    details={
+                        "rating_key": mv.get('rating_key'),
+                        "watched_by": mv.get("watched_by"),
+                        **(seerr_details or {}),
+                    },
+                )
+                return
         logger.info(f"Webhook-triggered deletion: deleting movie {mv['title']}")
         if mc.delete_radarr_movie_file(radarr_match.get('file_id')):
             mc.unmonitor_radarr_movie(radarr_match['movie']['id'])
@@ -2479,21 +2548,28 @@ def _background_process_removed(ev: dict):
                 )
                 return
             series_tags = sonarr_series.get('tags', [])
-            if ids_include_any_label(sonarr_tags, series_tags, ("safe", "kids")):
-                logger.info(f"Skipping deletion for removed series {title} due to 'safe' or 'kids' tag")
-                matched_protected = [
-                    label for label in ("safe", "kids")
-                    if ids_include_any_label(sonarr_tags, series_tags, (label,))
-                ]
+            exclusion_tags = _get_mc_exclusion_tags(mc)
+            all_protected_labels = tuple(PROTECTED_TAG_LABELS | exclusion_tags)
+            if ids_include_any_label(sonarr_tags, series_tags, all_protected_labels):
+                protected_labels = protected_labels_for_ids(
+                    sonarr_tags, series_tags, extra_tags=exclusion_tags
+                )
+                matched_exclusions = [l for l in protected_labels if l in exclusion_tags]
+                if matched_exclusions:
+                    tag_reason = f"tag_exclusion: {', '.join(sorted(matched_exclusions))}"
+                else:
+                    tag_reason = "protected_series_or_movie_tags"
+                logger.info(f"Skipping deletion for removed series {title} due to tag ({protected_labels})")
                 _record_webhook_decision(
                     reason_code="protected",
                     media_type="episode",
                     media_title=media_title,
-                    reason="protected_series_or_movie_tags",
+                    reason=tag_reason,
                     details={
                         "title": title,
                         "series_tags": series_tags,
-                        "protected_labels": matched_protected or ["protected"],
+                        "protected_labels": protected_labels or ["protected"],
+                        "exclusion_tags": matched_exclusions,
                         "user": (ev.get("account") or {}).get("title"),
                     },
                 )
@@ -2598,21 +2674,28 @@ def _background_process_removed(ev: dict):
                 )
                 return
             movie_tags = radarr_movie.get('tags', [])
-            if ids_include_any_label(radarr_tags, movie_tags, ("safe", "kids")):
-                logger.info(f"Skipping deletion for removed movie {title} due to 'safe' or 'kids' tag")
-                matched_protected = [
-                    label for label in ("safe", "kids")
-                    if ids_include_any_label(radarr_tags, movie_tags, (label,))
-                ]
+            exclusion_tags = _get_mc_exclusion_tags(mc)
+            all_protected_labels = tuple(PROTECTED_TAG_LABELS | exclusion_tags)
+            if ids_include_any_label(radarr_tags, movie_tags, all_protected_labels):
+                protected_labels = protected_labels_for_ids(
+                    radarr_tags, movie_tags, extra_tags=exclusion_tags
+                )
+                matched_exclusions = [l for l in protected_labels if l in exclusion_tags]
+                if matched_exclusions:
+                    tag_reason = f"tag_exclusion: {', '.join(sorted(matched_exclusions))}"
+                else:
+                    tag_reason = "protected_series_or_movie_tags"
+                logger.info(f"Skipping deletion for removed movie {title} due to tag ({protected_labels})")
                 _record_webhook_decision(
                     reason_code="protected",
                     media_type="movie",
                     media_title=media_title,
-                    reason="protected_series_or_movie_tags",
+                    reason=tag_reason,
                     details={
                         "title": title,
                         "movie_tags": movie_tags,
-                        "protected_labels": matched_protected or ["protected"],
+                        "protected_labels": protected_labels or ["protected"],
+                        "exclusion_tags": matched_exclusions,
                         "user": (ev.get("account") or {}).get("title"),
                     },
                 )

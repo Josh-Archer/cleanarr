@@ -201,6 +201,12 @@ The full configuration contract is documented in [docs/configuration.md](./docs/
 | `CLEANARR_MULTI_USER_DELETE_POLICY` | `require_all_users` | Household delete policy: `require_all_users` (safe default), `majority`, or `primary_user_only`. Prevents one watcher's progress from deleting media another household member still needs. |
 | `CLEANARR_HOUSEHOLD_USERS` | unset | Optional comma-separated usernames that form the household constituency for multi-user decisions. |
 | `CLEANARR_PRIMARY_USER` | unset | Required for `primary_user_only`; the single account whose watch state may authorize deletes. |
+| `CLEANARR_EXCLUSION_TAGS` | `keep` | Comma-separated Sonarr/Radarr exclusion tag names (default: `keep`). Media carrying any of these tags is protected and skipped from deletion, explained in dry-run reports (`tag_exclusion: <tag>`). |
+| `CLEANARR_SEERR_ENABLE` | `false` | Enables Seerr (Overseerr / Jellyseerr) request protection. Fails safe (aborts deletions that cannot be verified) if Seerr is unreachable. |
+| `CLEANARR_SEERR_BASEURL` | `http://overseerr:5055/api/v1` | Overseerr / Jellyseerr API base URL. |
+| `CLEANARR_SEERR_APIKEY` | unset | Overseerr / Jellyseerr API key (`X-Api-Key`). Redacted in logs and reports. |
+| `CLEANARR_SEERR_WINDOW_DAYS` | `30` | Request protection window in days. Media requested within this window is protected from deletion. |
+| `CLEANARR_SEERR_PROTECTED_USERS` | unset | Comma-separated Seerr usernames or display names whose requested media is protected indefinitely, even outside the window. |
 
 ### Transmission Flags
 
