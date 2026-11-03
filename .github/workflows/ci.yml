@@ -58,7 +58,7 @@ jobs:
 
   docker-build:
     needs: runner
-    runs-on: ubuntu-latest
+    runs-on: ${{ github.event.pull_request.head.repo.fork && 'ubuntu-latest' || 'uecb-shared' }}
     permissions:
       contents: read
       packages: write

@@ -308,7 +308,7 @@ jobs:
 
   summarize-release:
     needs: publish
-    runs-on: ubuntu-latest
+    runs-on: ${{ github.event.pull_request.head.repo.fork && 'ubuntu-latest' || 'uecb-shared' }}
     if: always()
     steps:
       - name: Download release metadata artifacts
