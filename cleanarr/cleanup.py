@@ -602,8 +602,26 @@ class MediaCleanup:
             logger.error(f"Failed to persist Leaving Soon state: {exc}")
             self._record_summary("errors", f"Leaving Soon state persist failed: {exc}")
 
-    @staticmethod
-    def leaving_soon_key(item):
+    def leaving_soon_key(self, item):
+        """State key for an eligible item, namespaced by its media server.
+
+        Jellyfin/Emby items are keyed ``jellyfin:<item id>`` / ``emby:<item
+        id>`` so their grace state (and Leaving Soon collection) stays
+        separate from Plex ``plex:<rating key>`` entries in the shared
+        state file, while the grace clock itself is computed identically.
+        """
+        source = str(item.get("source") or "").strip().lower()
+        if source in ("jellyfin", "emby"):
+            media_id = item.get("item_id") or item.get("rating_key")
+            if media_id:
+                namespace = (
+                    self.media_source
+                    if self.media_source in ("jellyfin", "emby")
+                    else source
+                )
+                return f"{namespace}:{media_id}"
+        elif item.get("item_id"):
+            return f"jellyfin:{item['item_id']}"
         rating_key = item.get("rating_key")
         if rating_key:
             return f"plex:{rating_key}"
@@ -663,22 +681,66 @@ class MediaCleanup:
             self.run_summary.setdefault("leaving_soon_entering", []).append(title)
             self._sync_leaving_soon_collection(state)
 
+    def _jellyfin_collection_source(self):
+        """Jellyfin/Emby source for collection sync, built lazily if needed.
+
+        Job instances already carry ``self.jellyfin``. Webhook instances run
+        with a Plex media source but still hold Jellyfin/Emby config, so
+        build the adapter (and its session) on demand when a Jellyfin/Emby
+        item enters the grace window.
+        """
+        if getattr(self, "jellyfin", None) is not None:
+            return self.jellyfin
+        for platform in ("jellyfin", "emby"):
+            config = CONFIG.get(platform) or {}
+            if not config.get("baseurl") or not config.get("apikey"):
+                continue
+            session = getattr(self, f"{platform}_session", None)
+            if session is None:
+                session = requests.Session()
+                if self.cf_headers:
+                    session.headers.update(self.cf_headers)
+                setattr(self, f"{platform}_session", session)
+            return JellyfinMediaSource(session, config)
+        return None
+
     def _sync_leaving_soon_collection(self, state):
         collection_name = CONFIG.get("leaving_soon_collection")
-        if self.media_source != "plex" or not self.plex_source or not collection_name:
+        if not collection_name:
             return
-        try:
-            self.plex_source.sync_leaving_soon_collection(
-                collection_name,
-                [key.removeprefix("plex:") for key in state if key.startswith("plex:")],
-                dry_run=bool(CONFIG.get("dry_run")),
-            )
-        except Exception as exc:
-            logger.error(f"Failed to sync Leaving Soon collection: {exc}")
-            self._record_summary("errors", f"Leaving Soon collection sync failed: {exc}")
+        if self.media_source == "plex" and self.plex_source:
+            try:
+                self.plex_source.sync_leaving_soon_collection(
+                    collection_name,
+                    [key.removeprefix("plex:") for key in state if key.startswith("plex:")],
+                    dry_run=bool(CONFIG.get("dry_run")),
+                )
+            except Exception as exc:
+                logger.error(f"Failed to sync Leaving Soon collection: {exc}")
+                self._record_summary("errors", f"Leaving Soon collection sync failed: {exc}")
+        jellyfin_ids = [
+            key.split(":", 1)[1]
+            for key in state
+            if key.startswith(("jellyfin:", "emby:"))
+        ]
+        if self.media_source in ("jellyfin", "emby") or jellyfin_ids:
+            jellyfin_source = self._jellyfin_collection_source()
+            if jellyfin_source is None:
+                return
+            try:
+                jellyfin_source.sync_leaving_soon_collection(
+                    collection_name,
+                    jellyfin_ids,
+                    dry_run=bool(CONFIG.get("dry_run")),
+                )
+            except Exception as exc:
+                logger.error(f"Failed to sync Jellyfin Leaving Soon collection: {exc}")
+                self._record_summary(
+                    "errors", f"Jellyfin Leaving Soon collection sync failed: {exc}"
+                )
 
     def _sync_leaving_soon(self):
-        """Drop entries that are no longer eligible and sync their Plex collection."""
+        """Drop entries that are no longer eligible and sync their collections."""
         if int(CONFIG.get("grace_days", 0) or 0) <= 0:
             return
         if self.run_outcome != OUTCOME_SUCCESS:

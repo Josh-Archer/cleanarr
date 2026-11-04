@@ -265,6 +265,205 @@ class TestLeavingSoonState(unittest.TestCase):
             self.assertEqual(json.load(state_file), {})
 
 
+class TestJellyfinLeavingSoonState(unittest.TestCase):
+    """Issue #75: Jellyfin mirrors the Plex Leaving Soon grace behavior."""
+
+    def setUp(self):
+        self.tempdir = tempfile.TemporaryDirectory()
+        self.state_path = os.path.join(self.tempdir.name, "leaving-soon.json")
+        self.config = patch.dict(cleanup.CONFIG, {
+            "media_source": "jellyfin",
+            "plex": {"baseurl": "http://plex", "token": "token"},
+            "jellyfin": {"baseurl": "http://jellyfin", "apikey": "key", "users": set()},
+            "emby": {"baseurl": "http://emby", "apikey": "key", "users": set()},
+            "sonarr": {"baseurl": "http://sonarr", "apikey": "key"},
+            "radarr": {"baseurl": "http://radarr", "apikey": "key"},
+            "transmission": {
+                "host": "transmission", "port": 9091,
+                "username": "user", "password": "pass",
+                "rpc_timeout_seconds": 90,
+            },
+            "grace_days": 2,
+            "leaving_soon_collection": "Leaving Soon",
+            "leaving_soon_state_file": self.state_path,
+            "dry_run": False,
+            "disable_torrent_cleanup": True,
+            "transmission_io_error_cleanup_enabled": False,
+        })
+        self.config.start()
+        self.plex_patch = patch("cleanarr.cleanup.PlexServer")
+        self.transmission_patch = patch("cleanarr.cleanup.TransmissionClient")
+        self.plex_patch.start()
+        self.transmission_patch.start()
+        self.addCleanup(self.tempdir.cleanup)
+        self.addCleanup(self.config.stop)
+        self.addCleanup(self.plex_patch.stop)
+        self.addCleanup(self.transmission_patch.stop)
+        self.cleaner = cleanup.MediaCleanup()
+        self.cleaner.jellyfin = MagicMock()
+
+    def test_leaving_soon_key_namespaces_by_source(self):
+        cleaner = self.cleaner
+        self.assertEqual(
+            cleaner.leaving_soon_key({"rating_key": "jf-1", "source": "emby"}),
+            "jellyfin:jf-1",
+        )
+        self.assertEqual(
+            cleaner.leaving_soon_key(
+                {"rating_key": None, "item_id": "jf-2", "source": "jellyfin"}
+            ),
+            "jellyfin:jf-2",
+        )
+        self.assertEqual(cleaner.leaving_soon_key({"rating_key": "9"}), "plex:9")
+        self.assertEqual(cleaner.leaving_soon_key({"guid": "tmdb://9"}), "guid:tmdb://9")
+        self.assertIsNone(cleaner.leaving_soon_key({}))
+
+    def test_new_pending_expired_and_removed_transitions(self):
+        key = "jellyfin:jf-1"
+        self.assertFalse(self.cleaner.leaving_soon_allows_delete(key, "Example", None))
+        # Entering the grace window mirrors the item into the Jellyfin collection.
+        self.cleaner.jellyfin.sync_leaving_soon_collection.assert_called_once_with(
+            "Leaving Soon", ["jf-1"], dry_run=False
+        )
+        with open(self.state_path, encoding="utf-8") as state_file:
+            state = json.load(state_file)
+        datetime.fromisoformat(state[key])
+
+        old = (datetime.now(timezone.utc) - timedelta(days=3)).isoformat()
+        state[key] = old
+        with open(self.state_path, "w", encoding="utf-8") as state_file:
+            json.dump(state, state_file)
+        self.assertTrue(self.cleaner.leaving_soon_allows_delete(key, "Example", None))
+
+        # No longer eligible: pruned from state and from the collection.
+        self.cleaner.jellyfin.reset_mock()
+        self.cleaner._leaving_soon_eligible.clear()
+        self.cleaner._sync_leaving_soon()
+        with open(self.state_path, encoding="utf-8") as state_file:
+            self.assertEqual(json.load(state_file), {})
+        self.cleaner.jellyfin.sync_leaving_soon_collection.assert_called_once_with(
+            "Leaving Soon", [], dry_run=False
+        )
+
+    def test_collection_sync_runs_during_dry_run(self):
+        cleanup.CONFIG["dry_run"] = True
+        self.assertFalse(
+            self.cleaner.leaving_soon_allows_delete("jellyfin:jf-1", "Example", None)
+        )
+        self.cleaner.jellyfin.sync_leaving_soon_collection.assert_called_once_with(
+            "Leaving Soon", ["jf-1"], dry_run=True
+        )
+        self.assertFalse(os.path.exists(self.state_path))
+
+    def test_zero_grace_preserves_immediate_delete_without_state(self):
+        cleanup.CONFIG["grace_days"] = 0
+        self.assertTrue(
+            self.cleaner.leaving_soon_allows_delete("jellyfin:jf-1", "Example", None)
+        )
+        self.assertFalse(os.path.exists(self.state_path))
+        self.cleaner.jellyfin.sync_leaving_soon_collection.assert_not_called()
+
+
+class _FakeJellyfinResponse:
+    def __init__(self, payload=None):
+        self.status_code = 200
+        self._payload = payload
+        self.content = b"" if payload is None else json.dumps(payload).encode("utf-8")
+        self.headers = {"Content-Type": "application/json"}
+        self.url = ""
+        self.history = []
+
+    def json(self):
+        if self._payload is None:
+            raise ValueError("no json body")
+        return self._payload
+
+    def raise_for_status(self):
+        return None
+
+
+class _FakeJellyfinSession:
+    """In-memory Jellyfin session recording every mutating request."""
+
+    def __init__(self, collections=None, items_by_collection=None):
+        self.collections = collections or []
+        self.items = items_by_collection or {}
+        self.mutations = []
+        self.headers = {}
+
+    def get(self, url, headers=None, params=None, timeout=None):
+        params = params or {}
+        if params.get("IncludeItemTypes") == "BoxSet":
+            return _FakeJellyfinResponse({"Items": list(self.collections)})
+        parent = params.get("ParentId")
+        return _FakeJellyfinResponse({"Items": list(self.items.get(parent, []))})
+
+    def request(self, method, url, headers=None, params=None, timeout=None):
+        self.mutations.append((method, url, params or {}))
+        if method == "POST" and url.rstrip("/").endswith("/Collections"):
+            return _FakeJellyfinResponse({"Id": "created-1"})
+        return _FakeJellyfinResponse(None)
+
+
+class TestJellyfinLeavingSoonCollectionSync(unittest.TestCase):
+    def _source(self, session):
+        from cleanarr.adapters.jellyfin import JellyfinMediaSource
+        return JellyfinMediaSource(session, {
+            "baseurl": "http://jellyfin:8096", "apikey": "key", "users": set(),
+        })
+
+    def test_creates_collection_with_pending_items(self):
+        session = _FakeJellyfinSession()
+        self._source(session).sync_leaving_soon_collection("Leaving Soon", ["b", "a"])
+        self.assertEqual(len(session.mutations), 1)
+        method, url, params = session.mutations[0]
+        self.assertEqual(method, "POST")
+        self.assertTrue(url.endswith("/Collections"))
+        self.assertEqual(params, {"Name": "Leaving Soon", "Ids": "a,b"})
+
+    def test_maintains_existing_collection(self):
+        session = _FakeJellyfinSession(
+            collections=[{"Id": "c1", "Name": "Leaving Soon"}],
+            items_by_collection={"c1": [{"Id": "a"}, {"Id": "b"}]},
+        )
+        self._source(session).sync_leaving_soon_collection("Leaving Soon", ["b", "c"])
+        deletes = [m for m in session.mutations if m[0] == "DELETE"]
+        posts = [m for m in session.mutations if m[0] == "POST"]
+        self.assertEqual(len(deletes), 1)
+        self.assertTrue(deletes[0][1].endswith("/Collections/c1/Items"))
+        self.assertEqual(deletes[0][2], {"Ids": "a"})
+        self.assertEqual(len(posts), 1)
+        self.assertTrue(posts[0][1].endswith("/Collections/c1/Items"))
+        self.assertEqual(posts[0][2], {"Ids": "c"})
+
+    def test_clears_collection_when_nothing_pending(self):
+        session = _FakeJellyfinSession(
+            collections=[{"Id": "c1", "Name": "Leaving Soon"}],
+            items_by_collection={"c1": [{"Id": "a"}]},
+        )
+        self._source(session).sync_leaving_soon_collection("Leaving Soon", [])
+        self.assertEqual(len(session.mutations), 1)
+        method, url, params = session.mutations[0]
+        self.assertEqual(method, "DELETE")
+        self.assertEqual(params, {"Ids": "a"})
+
+    def test_no_collection_and_nothing_pending_is_a_noop(self):
+        session = _FakeJellyfinSession()
+        self._source(session).sync_leaving_soon_collection("Leaving Soon", [])
+        self.assertEqual(session.mutations, [])
+
+    def test_dry_run_makes_no_jellyfin_mutations(self):
+        for collections in ([], [{"Id": "c1", "Name": "Leaving Soon"}]):
+            session = _FakeJellyfinSession(
+                collections=collections,
+                items_by_collection={"c1": [{"Id": "a"}]},
+            )
+            self._source(session).sync_leaving_soon_collection(
+                "Leaving Soon", ["b"], dry_run=True
+            )
+            self.assertEqual(session.mutations, [])
+
+
 class TestPlexLeavingSoonDryRun(unittest.TestCase):
     def test_dry_run_makes_no_plex_mutations(self):
         from cleanarr.adapters.plex import PlexMediaSource

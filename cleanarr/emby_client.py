@@ -101,6 +101,104 @@ def emby_get(
         ) from exc
 
 
+def _emby_send(
+    session: requests.Session,
+    baseurl: str,
+    apikey: str,
+    method: str,
+    path: str,
+    params: dict | None = None,
+    timeout: int = 30,
+) -> Any:
+    """Send a mutating Emby/Jellyfin request; returns parsed JSON or None."""
+    root = normalize_baseurl(baseurl)
+    if not root or not (apikey or "").strip():
+        return None
+    url = urljoin(root + "/", path.lstrip("/"))
+    response = session.request(
+        method,
+        url,
+        headers=auth_headers(apikey),
+        params=params or {},
+        timeout=timeout,
+    )
+    response.raise_for_status()
+    if not response.content:
+        return None
+    try:
+        return response.json()
+    except ValueError:
+        return None
+
+
+def emby_post(
+    session: requests.Session,
+    baseurl: str,
+    apikey: str,
+    path: str,
+    params: dict | None = None,
+    timeout: int = 30,
+) -> Any:
+    """POST an Emby/Jellyfin API path (create/update operations)."""
+    return _emby_send(session, baseurl, apikey, "POST", path, params=params, timeout=timeout)
+
+
+def emby_delete(
+    session: requests.Session,
+    baseurl: str,
+    apikey: str,
+    path: str,
+    params: dict | None = None,
+    timeout: int = 30,
+) -> Any:
+    """DELETE an Emby/Jellyfin API path (removal operations)."""
+    return _emby_send(session, baseurl, apikey, "DELETE", path, params=params, timeout=timeout)
+
+
+def list_collections(
+    session: requests.Session,
+    baseurl: str,
+    apikey: str,
+) -> list[dict]:
+    """Return the server's collections (BoxSet items)."""
+    data = emby_get(
+        session,
+        baseurl,
+        apikey,
+        "Items",
+        params={
+            "IncludeItemTypes": "BoxSet",
+            "Recursive": "true",
+            "EnableTotalRecordCount": "false",
+        },
+    )
+    if not isinstance(data, dict):
+        return []
+    return [item for item in (data.get("Items") or []) if isinstance(item, dict)]
+
+
+def get_collection_items(
+    session: requests.Session,
+    baseurl: str,
+    apikey: str,
+    collection_id: str,
+) -> list[dict]:
+    """Return the items currently in one collection (BoxSet)."""
+    data = emby_get(
+        session,
+        baseurl,
+        apikey,
+        "Items",
+        params={
+            "ParentId": str(collection_id),
+            "EnableTotalRecordCount": "false",
+        },
+    )
+    if not isinstance(data, dict):
+        return []
+    return [item for item in (data.get("Items") or []) if isinstance(item, dict)]
+
+
 def list_users(
     session: requests.Session,
     baseurl: str,

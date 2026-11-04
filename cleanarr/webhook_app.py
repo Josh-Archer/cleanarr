@@ -1934,6 +1934,7 @@ def _process_jellyfin_finished(mc, ev: dict, _emit_result, _notify_episode_clean
             "watched_by": watched_by,
             "guid": record.get("guid") or meta.get("guid"),
             "rating_key": None,
+            "item_id": record.get("item_id"),
             "is_watched_override": False,
             "source": platform,
             "tag_rules_only": True,
@@ -1958,6 +1959,7 @@ def _process_jellyfin_finished(mc, ev: dict, _emit_result, _notify_episode_clean
             "watched_by": watched_by,
             "guid": record.get("guid") or meta.get("guid"),
             "rating_key": None,
+            "item_id": record.get("item_id"),
             "source": platform,
             "tag_rules_only": True,
         }
