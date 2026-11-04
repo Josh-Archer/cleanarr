@@ -144,6 +144,15 @@ class TestJellyfinDeleteSource(unittest.TestCase):
         mc.leaving_soon_allows_delete.assert_called_once()
         mc.delete_sonarr_episode_file.assert_not_called()
 
+    def test_grace_key_is_jellyfin_namespaced(self):
+        """Issue #75: Jellyfin grace state keys carry the Jellyfin item id,
+        not a Plex rating key, so the Jellyfin collection sync can find them."""
+        mc = _make_mc()
+        self._run(mc, {"alice": True, "bob": True})
+        mc.leaving_soon_allows_delete.assert_called_once()
+        key = mc.leaving_soon_allows_delete.call_args[0][0]
+        self.assertEqual(key, f"jellyfin:{ITEM_ID}")
+
     def test_unresolvable_jellyfin_item_never_deletes(self):
         mc = _make_mc()
         self._run(mc, {"alice": None, "bob": None})
