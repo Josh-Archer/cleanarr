@@ -9,6 +9,11 @@ on:
         description: Existing semver tag to publish, for example v0.1.0
         required: true
         type: string
+      auto_release:
+        description: Set by auto-release.yml. The merged pull request was the review, so the manual review-gate variables are not required.
+        required: false
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -51,6 +56,9 @@ jobs:
         with:
           python-version: "3.11"
       - name: Validate review gates
+        # Tags pushed by hand still need the sign-off variables. Releases cut
+        # by auto-release.yml come from a reviewed, CI-green merge to main.
+        if: ${{ !inputs.auto_release }}
         shell: bash
         run: |
           set -euo pipefail
@@ -356,3 +364,32 @@ jobs:
         with:
           name: release-metadata
           path: release-metadata/release-metadata.json
+
+  github-release:
+    name: Create GitHub release
+    needs: publish
+    runs-on: ${{ github.event.pull_request.head.repo.fork && 'ubuntu-latest' || 'uecb-shared' }}
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      RELEASE_TAG: ${{ inputs.release_tag || github.ref_name }}
+    steps:
+      - name: Create the GitHub release
+        shell: bash
+        run: |
+          set -euo pipefail
+          if gh release view "${RELEASE_TAG}" --repo "${GITHUB_REPOSITORY}" >/dev/null 2>&1; then
+            echo "GitHub release ${RELEASE_TAG} already exists."
+            exit 0
+          fi
+          # Start the notes at the previous semver tag, not the last release.
+          previous="$(gh api "repos/${GITHUB_REPOSITORY}/tags" --paginate --jq '.[].name' \
+            | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | sort -V \
+            | grep -B1 -Fx "${RELEASE_TAG}" | head -n 1 || true)"
+          args=()
+          if [[ -n "${previous}" && "${previous}" != "${RELEASE_TAG}" ]]; then
+            args=(--notes-start-tag "${previous}")
+          fi
+          gh release create "${RELEASE_TAG}" --repo "${GITHUB_REPOSITORY}" \
+            --verify-tag --generate-notes --title "${RELEASE_TAG}" "${args[@]}"

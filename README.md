@@ -133,6 +133,8 @@ Release tags follow semver:
 
 The Python package version in `pyproject.toml` is the release source of truth.
 
+Every merge to `main` whose CI passes is released automatically by `.github/workflows/auto-release.yml`: it sets `pyproject.toml` to the next patch version (minor for a `type!:` / `BREAKING CHANGE` commit while the major version is 0), tags it and starts `release.yml`, which also creates the GitHub release. Merges that only touch docs, Markdown, `.github/` or `tests/` are not released (see `scripts/next-release-version.sh`). Tags pushed by hand still need the `ARCHITECTURE_REVIEW_TAG` and `SECURITY_REVIEW_TAG` repository variables; automatic releases skip that gate because the merged pull request was the review.
+
 For AWS Lambda consumers, the release workflow also promotes the matching semver release into ECR during the same run:
 
 - `<account>.dkr.ecr.<region>.amazonaws.com/cleanarr-webhook:vMAJOR.MINOR.PATCH`
