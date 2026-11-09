@@ -3,6 +3,9 @@
 No network, filesystem, or service-client access. Scheduled jobs and webhook
 processing both call these helpers so household protections stay reviewable
 in one place.
+
+Declarative rule evaluation lives in ``cleanarr.rules`` and calls these
+helpers. Rule evaluation is dry-run only and does not delete.
 """
 
 from __future__ import annotations
@@ -109,11 +112,17 @@ def user_tags_from_ids(tags, tag_ids, extra_tags: Iterable[str] | None = None) -
     return user_tags
 
 
-def normalize_multi_user_delete_policy(value, *, default="require_all_users"):
-    """Normalize policy name; unknown values fall back to the safe default."""
-    raw = (value or default or "require_all_users").strip().lower().replace("-", "_")
+def canonicalize_multi_user_delete_policy(value):
+    """Return the canonical policy name, or None when blank or unknown.
+
+    Does not log and does not substitute the safe default. Callers that want
+    the historical fallback should use ``normalize_multi_user_delete_policy``.
+    """
+    if value is None or str(value).strip() == "":
+        return None
+    raw = str(value).strip().lower().replace("-", "_")
     candidates = [
-        (value or "").strip().lower(),
+        str(value).strip().lower(),
         raw,
         raw.replace("_", "-"),
     ]
@@ -131,6 +140,16 @@ def normalize_multi_user_delete_policy(value, *, default="require_all_users"):
         aliased = _MULTI_USER_DELETE_POLICY_ALIASES.get(underscored)
         if aliased:
             return aliased
+    return None
+
+
+def normalize_multi_user_delete_policy(value, *, default="require_all_users"):
+    """Normalize policy name; unknown values fall back to the safe default."""
+    if value is None or str(value).strip() == "":
+        return canonicalize_multi_user_delete_policy(default) or "require_all_users"
+    canonical = canonicalize_multi_user_delete_policy(value)
+    if canonical:
+        return canonical
     logger.warning(
         f"Unknown CLEANARR_MULTI_USER_DELETE_POLICY '{value}'; "
         f"using safe default '{default}'"
