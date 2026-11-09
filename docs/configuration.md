@@ -40,6 +40,7 @@ Optional variables:
 - `CLEANARR_MULTI_USER_DELETE_POLICY` for household-safe deletion (see below)
 - `CLEANARR_HOUSEHOLD_USERS` optional comma-separated Plex/Jellyfin usernames that form the household
 - `CLEANARR_PRIMARY_USER` username used when policy is `primary_user_only`
+- `CLEANARR_RULES_JSON` / `CLEANARR_RULES_FILE` optional declarative ruleset for dry-run evaluation (see [Rule-based cleanup policies](rules.md)). Unset uses the built-in rules that express today's protections and household policy. These variables do not change live deletes.
 
 ## Household multi-user delete policy (issue #20)
 
@@ -71,6 +72,12 @@ Example: Alice watched S1E3, Bob has not. With the default policy and no user ta
 - Set `CLEANARR_HOUSEHOLD_USERS=alice,bob` when guest or unused Plex accounts would otherwise block cleanup forever.
 - Use Sonarr/Radarr per-user tags when only a subset of the household "owns" a title.
 - Prefer `primary_user_only` only for single-decision-maker setups, and always set `CLEANARR_PRIMARY_USER`.
+
+## Rule-based cleanup policies (issue #76)
+
+Operators can compose tags, household watch policy, age, ratings, and Seerr request source in a versioned JSON ruleset. `cleanarr.rules` evaluates that document by calling `cleanarr.policy` and returns a dry-run report grouped per rule. Evaluation does not delete and does not replace the scheduled job or webhook delete path. The schema, the built-in default rules, and the report shape are in [rules.md](rules.md).
+
+`default_ruleset()` expresses the current runtime behavior: keep `safe`, `kids`, and exclusion tags; optionally keep eligible Seerr requests; delete when the household watch policy passes; delete earlier episodes when watched-ahead viewers satisfy that same policy.
 
 The webhook, scheduled job runtime, and SQS webhook consumer runtime use the same cleanup configuration surface so downstream operators only need one secret/config contract.
 

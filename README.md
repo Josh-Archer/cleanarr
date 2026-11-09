@@ -21,6 +21,7 @@ At a high level it can:
 - map Plex items back to Sonarr and Radarr records
 - delete or unmonitor matching files when policy allows it
 - apply a household multi-user delete policy so one user's watched state cannot remove content another household member still needs
+- evaluate declarative cleanup rules (tags, watch policy, age, ratings, and Seerr requests) and produce a per-rule dry-run report ([docs/rules.md](docs/rules.md))
 - skip protected content with `safe` and `kids` tags
 - perform watched-ahead logic for TV episodes using real user history (same multi-user policy)
 - remove items from a Plex watchlist after cleanup
@@ -207,6 +208,7 @@ The full configuration contract is documented in [docs/configuration.md](./docs/
 | `CLEANARR_SEERR_APIKEY` | unset | Overseerr / Jellyseerr API key (`X-Api-Key`). Redacted in logs and reports. |
 | `CLEANARR_SEERR_WINDOW_DAYS` | `30` | Request protection window in days. Media requested within this window is protected from deletion. |
 | `CLEANARR_SEERR_PROTECTED_USERS` | unset | Comma-separated Seerr usernames or display names whose requested media is protected indefinitely, even outside the window. |
+| `CLEANARR_RULES_JSON` / `CLEANARR_RULES_FILE` | unset | Optional declarative cleanup rules for dry-run evaluation. Unset uses built-in rules that express today's protections and household policy. See [docs/rules.md](docs/rules.md). Evaluation does not delete. |
 
 ### Transmission Flags
 

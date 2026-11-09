@@ -4,6 +4,7 @@ The public runtime repository is intentionally split into three layers:
 
 - `cleanarr/`: shared library code used by both runtime harnesses
 - `cleanarr/policy.py`: pure household, tag, watch-ahead, and torrent decisions (no service I/O)
+- `cleanarr/rules.py`: declarative cleanup rules (issue #76). Dry-run evaluation calls `cleanarr/policy.py` and does not delete or perform service I/O. See `docs/rules.md`.
 - `cleanarr/adapters/`: Plex, Jellyfin/Emby, Servarr, and Transmission I/O
 - `apps/job/`: thin cron/job entrypoint around `MediaCleanup`
 - `apps/webhook/`: thin Flask entrypoint around the shared webhook app
@@ -23,6 +24,7 @@ Dry-run reporting:
 
 - Scheduled jobs, direct webhook runs, and SQS consumer runs emit per-user dry-run JSON/Markdown report artifacts (`cleanarr-dry-run-report.json` and `.md`) under `CLEANARR_DRY_RUN_REPORT_DIR` when `CLEANARR_DRY_RUN=true`.
 - Webhook and SQS consumer runs also persist individual decisions to `CLEANARR_DECISION_REPORT_FILE` (JSONL) when configured.
+- `evaluate_rules_dry_run()` can write a separate per-rule report (`cleanarr-rule-dry-run-report.json` and `.md`). That report does not change scheduled-job or webhook deletes. See `docs/rules.md`.
 
 Queue decoupling (issue #8):
 
