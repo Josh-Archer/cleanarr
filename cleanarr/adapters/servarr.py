@@ -7,6 +7,7 @@ historical MediaCleanup helpers. Callers own caching and delete policy.
 from __future__ import annotations
 
 import json
+import os
 import time
 
 import requests
@@ -23,6 +24,22 @@ def join_url(baseurl, endpoint):
     if endpoint.startswith(("http://", "https://")):
         return endpoint
     return f"{str(baseurl or '').rstrip('/')}/{endpoint.lstrip('/')}"
+
+_UNREACHABLE_STATUSES = {502, 503, 504}
+
+
+def _env_int(name, default):
+    try:
+        return max(1, int(os.environ.get(name, default)))
+    except (TypeError, ValueError):
+        return default
+
+
+def _env_float(name, default):
+    try:
+        return max(0.0, float(os.environ.get(name, default)))
+    except (TypeError, ValueError):
+        return default
 
 
 class ServarrClient:
@@ -42,6 +59,10 @@ class ServarrClient:
         self._session = session
         self._session_factory = session_factory
         self.missing_key_env = missing_key_env
+        # True when the most recent request failed only because the service was
+        # unreachable (connection refused/reset, timeout, or 502/503/504 after
+        # all retries). Callers use it to skip work instead of failing the job.
+        self.last_failure_unreachable = False
 
     @property
     def session(self):
@@ -71,9 +92,11 @@ class ServarrClient:
         """Arr request with light retrying for edge and upstream flakiness."""
         method = (method or "GET").upper()
         transient_statuses = {429, 500, 502, 503, 504}
-        max_attempts = 3
-        backoff_seconds = 1.5
+        # Reads are safe to retry longer; mutations keep the short budget.
+        max_attempts = _env_int("ARR_RETRY_ATTEMPTS", 5) if method == "GET" else 3
+        backoff_seconds = _env_float("ARR_RETRY_BACKOFF_SECONDS", 1.5)
         service_name = self.service_name
+        self.last_failure_unreachable = False
 
         for attempt in range(1, max_attempts + 1):
             try:
@@ -93,7 +116,7 @@ class ServarrClient:
                         f"{service_name} API transient response ({method} {endpoint}): "
                         f"{response.status_code}; retrying ({attempt}/{max_attempts})"
                     )
-                    time.sleep(backoff_seconds * attempt)
+                    time.sleep(min(backoff_seconds * (2 ** (attempt - 1)), 30))
                     continue
 
                 response.raise_for_status()
@@ -114,8 +137,10 @@ class ServarrClient:
                         f"{service_name} API transient HTTP error ({method} {endpoint}): "
                         f"{status_code}; retrying ({attempt}/{max_attempts})"
                     )
-                    time.sleep(backoff_seconds * attempt)
+                    time.sleep(min(backoff_seconds * (2 ** (attempt - 1)), 30))
                     continue
+                if status_code in _UNREACHABLE_STATUSES:
+                    self.last_failure_unreachable = True
                 logger.error(
                     f"{service_name} API HTTP error ({method} {endpoint}): "
                     f"{status_code} - {response_text}"
@@ -127,8 +152,12 @@ class ServarrClient:
                         f"{service_name} API request error ({method} {endpoint}): {exc}; "
                         f"retrying ({attempt}/{max_attempts})"
                     )
-                    time.sleep(backoff_seconds * attempt)
+                    time.sleep(min(backoff_seconds * (2 ** (attempt - 1)), 30))
                     continue
+                if isinstance(
+                    exc, (requests.exceptions.ConnectionError, requests.exceptions.Timeout)
+                ):
+                    self.last_failure_unreachable = True
                 logger.error(f"{service_name} API error ({method} {endpoint}): {exc}")
                 return None
             except Exception as exc:
