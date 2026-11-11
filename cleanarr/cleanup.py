@@ -567,6 +567,24 @@ class MediaCleanup:
         self.run_abort_reason = reason
         self.run_summary.setdefault("errors", []).append(f"aborted: {reason}")
 
+    def _skip_if_arr_unreachable(self, service_name, client, work):
+        """Skip ``work`` without failing the run when an Arr is only unreachable.
+
+        Called after retries are exhausted. Nothing is deleted or mutated, and
+        the skip is recorded under ``arr_unavailable_skips`` (not ``errors``) so
+        the run keeps a success outcome and exit code 0. Other failures (bad
+        API key, 4xx, malformed responses) still take the fail-closed error path.
+        """
+        if not getattr(client, "last_failure_unreachable", False):
+            return False
+        message = (
+            f"{service_name} unreachable after retries; skipped {work} "
+            "(no media deleted or modified). Will retry on the next run."
+        )
+        logger.warning(message)
+        self._record_summary("arr_unavailable_skips", message)
+        return True
+
     def _record_summary(self, category, message):
         self.run_summary.setdefault(category, []).append(message)
         # Errors indicate at least a partial failure for exit/reporting.
@@ -1031,6 +1049,7 @@ class MediaCleanup:
             self._summarize_entries("protected_skips", "Protected skips"),
             self._summarize_entries("seerr_skips", "Seerr skips"),
             self._summarize_entries("errors", "Errors"),
+            self._summarize_entries("arr_unavailable_skips", "Arr unavailable skips"),
         ]
         if int(CONFIG.get("grace_days", 0) or 0) > 0:
             lines.insert(
@@ -2394,6 +2413,8 @@ class MediaCleanup:
         logger.info("Processing watched episodes")
         watched_episodes = self.get_watched_episodes()
         sonarr_tags = self.get_sonarr_tags()
+        if sonarr_tags is None and self._skip_if_arr_unreachable("Sonarr", self.sonarr_client, "watched episode processing"):
+            return
         if sonarr_tags is None:
             logger.error("Failed to fetch Sonarr tags; aborting watched episode processing to prevent accidental deletions.")
             self._record_summary(
@@ -2750,6 +2771,8 @@ class MediaCleanup:
         logger.info("Processing watched movies")
         watched_movies = self.get_watched_movies()
         radarr_tags = self.get_radarr_tags()
+        if radarr_tags is None and self._skip_if_arr_unreachable("Radarr", self.radarr_client, "watched movie processing"):
+            return
         if radarr_tags is None:
             logger.error("Failed to fetch Radarr tags; aborting watched movie processing to prevent accidental deletions.")
             self._record_summary(
