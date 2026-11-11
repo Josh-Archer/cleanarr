@@ -156,5 +156,94 @@ class TestCleanupSkipsWhenArrUnreachable(unittest.TestCase):
         self.assertEqual(self.cleanup.run_summary.get("errors", []), [])
 
 
+class TestUnreachableSkipPreservesGraceState(unittest.TestCase):
+    """Issue #95: with CLEANARR_GRACE_DAYS>0, an unreachable skip must not prune grace state."""
+
+    def setUp(self):
+        self.state_file = os.path.join(
+            tempfile.mkdtemp(prefix="cleanarr-grace-"), "leaving-soon-state.json"
+        )
+        self.config_patcher = patch.dict(cleanarr.CONFIG, {
+            "plex": {"baseurl": "http://p", "token": "t"},
+            "sonarr": {"baseurl": "http://s", "apikey": "k"},
+            "radarr": {"baseurl": "http://r", "apikey": "k"},
+            "transmission": {"host": "t", "port": 9091, "username": "u", "password": "p", "rpc_timeout_seconds": 90},
+            "dry_run": False,
+            "grace_days": 7,
+            "leaving_soon_state_file": self.state_file,
+            "leaving_soon_collection": None,
+        })
+        self.config_patcher.start()
+        self.p1 = patch("cleanarr.cleanup.PlexServer")
+        self.p2 = patch("cleanarr.cleanup.TransmissionClient")
+        self.p1.start()
+        self.p2.start()
+        self.cleanup = cleanarr.MediaCleanup()
+
+    def tearDown(self):
+        self.p1.stop()
+        self.p2.stop()
+        self.config_patcher.stop()
+
+    def _down(self, client):
+        session = MagicMock()
+        session.get.side_effect = requests.exceptions.ConnectionError("Connection refused")
+        client._session = session
+        return session
+
+    def _seed_state(self, entry):
+        import json as _json
+
+        with open(self.state_file, "w", encoding="utf-8") as state_file:
+            _json.dump(entry, state_file)
+        return entry
+
+    def _read_state(self):
+        import json as _json
+
+        with open(self.state_file, encoding="utf-8") as state_file:
+            return _json.load(state_file)
+
+    def test_radarr_down_with_grace_days_keeps_grace_clock(self):
+        from datetime import datetime, timezone
+
+        seeded = self._seed_state(
+            {"plex:123": (datetime.now(timezone.utc)).isoformat()}
+        )
+        self._down(self.cleanup.radarr_client)
+        self.cleanup.get_watched_movies = MagicMock(
+            return_value=[{"title": "M", "year": 2020, "file": "/m.mkv", "watched_by": {"u": True}}]
+        )
+        self.cleanup.delete_radarr_movie = MagicMock()
+        self.cleanup.delete_radarr_movie_file = MagicMock()
+        with patch("cleanarr.adapters.servarr.time.sleep"):
+            self.cleanup.process_watched_movies()
+            self.cleanup._sync_leaving_soon()
+        self.cleanup.delete_radarr_movie.assert_not_called()
+        self.cleanup.delete_radarr_movie_file.assert_not_called()
+        self.assertEqual(self.cleanup.run_summary.get("errors", []), [])
+        self.assertEqual(len(self.cleanup.run_summary["arr_unavailable_skips"]), 1)
+        self.assertEqual(self._read_state(), seeded)
+        self.assertEqual(self.cleanup._build_result().exit_code(), 0)
+
+    def test_sonarr_down_with_grace_days_keeps_grace_clock(self):
+        from datetime import datetime, timezone
+
+        seeded = self._seed_state(
+            {"plex:456": (datetime.now(timezone.utc)).isoformat()}
+        )
+        self._down(self.cleanup.sonarr_client)
+        self.cleanup.get_watched_episodes = MagicMock(return_value=[])
+        self.cleanup.delete_sonarr_episode_file = MagicMock()
+        with patch("cleanarr.adapters.servarr.time.sleep"):
+            self.cleanup.process_watched_episodes()
+            self.cleanup._sync_leaving_soon()
+        self.cleanup.delete_sonarr_episode_file.assert_not_called()
+        self.assertEqual(self.cleanup.run_summary.get("errors", []), [])
+        self.assertEqual(len(self.cleanup.run_summary["arr_unavailable_skips"]), 1)
+        self.assertEqual(self._read_state(), seeded)
+        self.assertEqual(self.cleanup._build_result().exit_code(), 0)
+
+
 if __name__ == "__main__":
     unittest.main()

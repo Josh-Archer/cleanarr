@@ -766,6 +766,13 @@ class MediaCleanup:
             # is incomplete; pruning would reset grace clocks.
             logger.warning("Skipping Leaving Soon pruning: earlier steps did not complete successfully")
             return
+        if self.run_summary.get("arr_unavailable_skips"):
+            # An Arr dependency was unreachable, so watched-item processing was
+            # skipped and the eligible set is incomplete. The run still reports
+            # success (exit 0), but pruning here would reset grace clocks, so
+            # leave the state file untouched for the next run.
+            logger.warning("Skipping Leaving Soon pruning: an Arr dependency was unreachable; grace state preserved")
+            return
         if CONFIG.get("dry_run"):
             return
         with _LEAVING_SOON_LOCK:
