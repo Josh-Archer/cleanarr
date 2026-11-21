@@ -1,3 +1,4 @@
+import json
 import os
 import sys
 import unittest
@@ -59,6 +60,45 @@ class TestWebhookRouteSecretGate(unittest.TestCase):
             {"status": "error", "message": "Unauthorized"},
         )
         process_actions.assert_not_called()
+
+    def test_jellyfin_webhook_accepts_json_sent_as_text_plain(self):
+        # The Jellyfin webhook plugin labels its JSON template text/plain
+        # unless a Content-Type header is added to the destination.
+        with patch.object(
+            webhook_app, "JELLYFIN_WEBHOOK_SECRET", "current-secret"
+        ), patch.object(
+            webhook_app, "JELLYFIN_WEBHOOK_SECRET_PREVIOUS", None
+        ), patch.object(
+            webhook_app, "_start_background_threads"
+        ), patch.object(
+            webhook_app, "_queue_enqueuing_enabled", return_value=False
+        ), patch.object(
+            webhook_app,
+            "_process_webhook_event_actions",
+            return_value={"recorded": True},
+        ) as process_actions:
+            accepted = self.client.post(
+                "/jellyfin/webhook",
+                headers={"X-Webhook-Token": "current-secret"},
+                data=json.dumps(self._jellyfin_payload()),
+                content_type="text/plain; charset=utf-8",
+            )
+            rejected = [
+                self.client.post(
+                    "/jellyfin/webhook",
+                    headers={"X-Webhook-Token": "current-secret"},
+                    data=body,
+                    content_type="text/plain; charset=utf-8",
+                )
+                for body in ("", "not json", "[1, 2]")
+            ]
+
+        self.assertEqual(accepted.status_code, 200)
+        self.assertEqual(accepted.get_json().get("status"), "ok")
+        self.assertEqual(process_actions.call_count, 1)
+        for response in rejected:
+            self.assertEqual(response.status_code, 400)
+            self.assertEqual(response.get_json().get("message"), "Invalid JSON")
 
     def test_jellyfin_webhook_rejects_missing_token_when_enabled(self):
         with patch.object(

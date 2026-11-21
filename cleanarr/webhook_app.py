@@ -1077,6 +1077,26 @@ def _resolve_platform_user(platform: str, user_name: str) -> str:
     return user_name
 
 
+def _request_json_object():
+    """Parse the request body as JSON regardless of its Content-Type.
+
+    The Jellyfin webhook plugin posts its JSON template as ``text/plain``
+    unless a Content-Type header is configured on the destination, and
+    ``request.get_json`` ignores bodies that are not labelled as JSON.
+    Returns the parsed value, or None when the body is not valid JSON.
+    """
+    payload = request.get_json(silent=True)
+    if payload is not None:
+        return payload
+    raw = request.get_data(cache=True, as_text=False) or b""
+    if not raw.strip():
+        return None
+    try:
+        return json.loads(raw.decode("utf-8-sig"))
+    except (UnicodeDecodeError, ValueError):
+        return None
+
+
 @APP.route("/emby/webhook", methods=["POST"])
 
 @APP.route("/emby/webhook", methods=["POST"])
@@ -1114,8 +1134,12 @@ def emby_webhook():
     )
 
     _start_background_threads()
-    payload = request.get_json(silent=True)
+    payload = _request_json_object()
     if not isinstance(payload, dict):
+        logger.warning(
+            f"Rejected {request.path}: body is not a JSON object "
+            f"(content_type={request.content_type}, bytes={request.content_length})"
+        )
         return jsonify({"status": "error", "message": "Invalid JSON"}), 400
 
     from cleanarr.emby_client import map_emby_webhook_payload
@@ -1287,8 +1311,12 @@ def jellyfin_webhook():
     )
     
     _start_background_threads()
-    payload = request.get_json(silent=True)
+    payload = _request_json_object()
     if not isinstance(payload, dict):
+        logger.warning(
+            f"Rejected {request.path}: body is not a JSON object "
+            f"(content_type={request.content_type}, bytes={request.content_length})"
+        )
         return jsonify({"status": "error", "message": "Invalid JSON"}), 400
 
     event_name = payload.get("NotificationType") or ""
