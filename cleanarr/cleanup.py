@@ -34,6 +34,7 @@ from cleanarr.adapters.jellyfin import JellyfinMediaSource
 from cleanarr.adapters.plex import PlexMediaSource
 from cleanarr.adapters.seerr import SeerrClient
 from cleanarr.adapters.servarr import ServarrClient
+from cleanarr.disk import fetch_disk_facts
 from cleanarr.adapters.transmission import (
     TransmissionClientAdapter,
     get_torrent_category as _get_torrent_category,
@@ -398,6 +399,7 @@ class MediaCleanup:
             "radarr_movies": None,
             "sonarr_episodes_by_series_id": {},
             "radarr_managed_movie_roots": None,
+            "disk_facts": None,
             "lidarr_artists": None,
             "lidarr_albums_by_artist_id": {},
             "lidarr_tracks_by_album_id": {},
@@ -1386,6 +1388,19 @@ class MediaCleanup:
             self._arr_cache["radarr_movies"] = movies or []
             return self._arr_cache["radarr_movies"]
         return []
+
+    def get_disk_facts(self):
+        """Radarr/Sonarr free space for the ``disk`` rule condition, fetched once per run.
+
+        A source that cannot be read is cached as an error for the rest of the
+        run, so rules that use it report ``error`` and never ``would_delete``.
+        """
+        if self._arr_cache.get("disk_facts") is None:
+            self._arr_cache["disk_facts"] = fetch_disk_facts({
+                "radarr": self.radarr_client,
+                "sonarr": self.sonarr_client,
+            })
+        return self._arr_cache["disk_facts"]
 
     def get_sonarr_episodes_for_series(self, series_id):
         """Get Sonarr episodes for a series, cached per series ID."""
