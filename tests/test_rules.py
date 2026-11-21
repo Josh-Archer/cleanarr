@@ -722,7 +722,7 @@ class TestPerRuleDryRunReport(unittest.TestCase):
     def test_documented_condition_types_exist(self):
         self.assertEqual(
             CONDITION_TYPES,
-            frozenset({"tag", "watched", "age", "rating", "request", "watched_by"}),
+            frozenset({"tag", "watched", "age", "rating", "request", "watched_by", "disk"}),
         )
 
     def test_documented_rulesets_match_the_evaluator(self):

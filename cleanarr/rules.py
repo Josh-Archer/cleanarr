@@ -21,6 +21,7 @@ from typing import Any, Iterable, Mapping
 
 from loguru import logger
 
+from cleanarr.disk import item_root_folder, select_disk_entry
 from cleanarr.policy import (
     PROTECTED_TAG_LABELS,
     canonicalize_multi_user_delete_policy,
@@ -52,7 +53,7 @@ MAX_DESCRIPTION = 400
 MEDIA_TYPES = frozenset({"any", "movie", "episode", "series", "season", "track"})
 ACTIONS = frozenset({"keep", "delete"})
 MATCH_MODES = frozenset({"all", "any"})
-CONDITION_TYPES = frozenset({"tag", "watched", "age", "rating", "request", "watched_by"})
+CONDITION_TYPES = frozenset({"tag", "watched", "age", "rating", "request", "watched_by", "disk"})
 
 TAG_OPS = frozenset({"has_any", "has_all", "has_none"})
 WATCHED_SCOPES = frozenset({"exact", "watched_ahead", "tag_rules"})
@@ -63,6 +64,10 @@ RATING_OPS = frozenset({"lt", "lte", "gt", "gte", "eq"})
 REQUEST_SOURCES = frozenset({"seerr"})
 REQUEST_OPS = frozenset({"protected", "unprotected", "requested_by"})
 WATCHED_BY_OPS = frozenset({"any", "all", "none"})
+DISK_SOURCES = frozenset({"radarr", "sonarr", "any"})
+DISK_OPS = frozenset({"free_percent_below", "free_gb_below"})
+MAX_PATH_LENGTH = 400
+BYTES_PER_GB = 1024 ** 3
 
 _AGE_TIMESTAMP_KEYS = {
     "added": "added_at",
@@ -87,6 +92,10 @@ _RULE_KEYS = frozenset({
 
 class RuleSchemaError(ValueError):
     """A ruleset document does not match the version 1 schema."""
+
+
+class RuleEvaluationError(RuntimeError):
+    """A condition could not be evaluated. The item decision becomes ``error``."""
 
 
 def parse_ruleset(document: Any) -> dict:
@@ -405,6 +414,7 @@ def render_rule_dry_run_markdown(report: Mapping[str, Any]) -> str:
         f"- Items: **{summary.get('items', 0)}**",
         f"- Would delete: **{summary.get('would_delete', 0)}**",
         f"- Would keep: **{summary.get('would_keep', 0)}**",
+        f"- Would enter Leaving Soon: **{summary.get('would_leave_soon', 0)}**",
         f"- No match: **{summary.get('no_match', 0)}**",
         f"- Errors: **{summary.get('errors', 0)}**",
         "",
@@ -424,7 +434,10 @@ def render_rule_dry_run_markdown(report: Mapping[str, Any]) -> str:
             "- Evaluation is dry-run only. Nothing is deleted.",
             "- Rules run in ascending priority. The first match decides the item.",
             "- A later rule that also matches is shadowed and does not change the outcome.",
-            "- `no_match` does not delete. Missing age, rating, or watch evidence does not match.",
+            "- `no_match` does not delete. Missing age, rating, watch, or disk evidence does not match.",
+            "- `would_leave_soon` does not delete. Free space is inside a disk condition's "
+            "`leaving_soon_offset_percent` band but has not crossed the threshold.",
+            "- A disk source whose free space could not be read makes the item an `error`, never a delete.",
             "- Grace period and Leaving Soon are applied by the cleanup runtime after a delete decision, not by this report.",
             "",
         ]
@@ -519,6 +532,14 @@ def _parse_rule(rule: Any, path: str) -> dict:
         for index, condition in enumerate(conditions_raw)
     ]
 
+    if action != "delete":
+        for index, condition in enumerate(conditions):
+            if "leaving_soon_offset_percent" in condition:
+                raise RuleSchemaError(
+                    f"{path}.conditions[{index}].leaving_soon_offset_percent: "
+                    "only allowed on delete rules"
+                )
+
     parsed = {
         "id": rule_id,
         "name": name,
@@ -553,6 +574,8 @@ def _parse_condition(condition: Any, path: str) -> dict:
         return _parse_rating_condition(condition, path)
     if condition_type == "request":
         return _parse_request_condition(condition, path)
+    if condition_type == "disk":
+        return _parse_disk_condition(condition, path)
     return _parse_watched_by_condition(condition, path)
 
 
@@ -644,6 +667,42 @@ def _parse_watched_by_condition(condition: Mapping[str, Any], path: str) -> dict
     return {"type": "watched_by", "op": op, "users": users}
 
 
+def _parse_disk_condition(condition: Mapping[str, Any], path: str) -> dict:
+    _reject_unknown(
+        condition,
+        {"type", "source", "path", "op", "value", "leaving_soon_offset_percent"},
+        path,
+    )
+    source = condition.get("source", "any")
+    if source not in DISK_SOURCES:
+        raise RuleSchemaError(f"{path}.source: expected one of {sorted(DISK_SOURCES)}")
+    op = condition.get("op")
+    if op not in DISK_OPS:
+        raise RuleSchemaError(f"{path}.op: expected one of {sorted(DISK_OPS)}")
+    value = _require_number(condition.get("value"), f"{path}.value", minimum=0)
+    if op == "free_percent_below" and value > 100:
+        raise RuleSchemaError(f"{path}.value: must be <= 100")
+    parsed: dict[str, Any] = {"type": "disk", "source": source, "op": op, "value": value}
+    if "path" in condition:
+        disk_path = condition.get("path")
+        if not isinstance(disk_path, str) or not disk_path.strip():
+            raise RuleSchemaError(f"{path}.path: expected a non-empty string")
+        disk_path = disk_path.strip()
+        if len(disk_path) > MAX_PATH_LENGTH:
+            raise RuleSchemaError(f"{path}.path: longer than {MAX_PATH_LENGTH} characters")
+        parsed["path"] = disk_path
+    if "leaving_soon_offset_percent" in condition:
+        offset = _require_number(
+            condition.get("leaving_soon_offset_percent"),
+            f"{path}.leaving_soon_offset_percent",
+            minimum=0,
+        )
+        if offset > 100:
+            raise RuleSchemaError(f"{path}.leaving_soon_offset_percent: must be <= 100")
+        parsed["leaving_soon_offset_percent"] = offset
+    return parsed
+
+
 def _evaluate_fact(fact: Any, ruleset: Mapping[str, Any], now: datetime, index: int) -> dict:
     if not isinstance(fact, Mapping):
         return {
@@ -660,22 +719,31 @@ def _evaluate_fact(fact: Any, ruleset: Mapping[str, Any], now: datetime, index: 
     media_type = _fact_media_type(fact)
     rule_results = []
     decisive = None
+    # First delete rule that is only held back by a disk threshold the free
+    # space is approaching. It decides the item unless a delete rule fully
+    # matches before any keep rule does.
+    approaching = None
+    approaching_final = False
     saw_error = False
     for rule in ruleset["rules"]:
         result = _evaluate_rule(rule, fact, media_type, now)
+        result["decisive"] = False
+        result["would"] = None
         if result["status"] == "error":
             saw_error = True
-        if result["matched"] and decisive is None and result["status"] != "error":
-            result["decisive"] = True
-            decisive = rule
-            result["would"] = rule["action"]
         elif result["matched"]:
-            result["decisive"] = False
-            result["status"] = "shadowed"
             result["would"] = rule["action"]
-        else:
-            result["decisive"] = False
-            result["would"] = None
+            takes_over = approaching is None or (
+                rule["action"] == "delete" and not approaching_final
+            )
+            if decisive is None and takes_over:
+                result["decisive"] = True
+                decisive = rule
+            else:
+                result["status"] = "shadowed"
+                approaching_final = True
+        elif result["status"] == "leaving_soon" and decisive is None and approaching is None:
+            approaching = result
         rule_results.append(result)
 
     if saw_error:
@@ -684,6 +752,11 @@ def _evaluate_fact(fact: Any, ruleset: Mapping[str, Any], now: datetime, index: 
         reason = "rule_evaluation_error"
         for result in rule_results:
             result["decisive"] = False
+    elif decisive is None and approaching is not None:
+        approaching["decisive"] = True
+        decision = "would_leave_soon"
+        decisive_id = approaching["id"]
+        reason = approaching["reason"]
     elif decisive is None:
         decision = "no_match"
         decisive_id = None
@@ -743,7 +816,12 @@ def _evaluate_rule(rule: Mapping[str, Any], fact: Mapping[str, Any], media_type:
         base["reason"] = f"media_type {media_type} not in {rule['media_types']}"
         return base
     try:
-        matched, reason = _match_conditions(rule, fact, now)
+        matched, reason, leaving_soon = _match_conditions(rule, fact, now)
+    except RuleEvaluationError as exc:
+        logger.warning(f"Rule {rule['id']} could not be evaluated: {exc}")
+        base["status"] = "error"
+        base["reason"] = str(exc)
+        return base
     except Exception as exc:
         logger.warning(f"Rule {rule['id']} failed to evaluate: {exc}")
         base["status"] = "error"
@@ -751,25 +829,53 @@ def _evaluate_rule(rule: Mapping[str, Any], fact: Mapping[str, Any], media_type:
         return base
     base["matched"] = matched
     base["reason"] = reason
-    base["status"] = "matched" if matched else "not_matched"
+    if matched:
+        base["status"] = "matched"
+    elif leaving_soon:
+        base["status"] = "leaving_soon"
+    else:
+        base["status"] = "not_matched"
     return base
 
 
-def _match_conditions(rule: Mapping[str, Any], fact: Mapping[str, Any], now: datetime) -> tuple[bool, str]:
+def _match_conditions(
+    rule: Mapping[str, Any], fact: Mapping[str, Any], now: datetime
+) -> tuple[bool, str, bool]:
+    """Return ``(matched, reason, leaving_soon)`` for one rule.
+
+    ``leaving_soon`` is true for a delete rule that does not match yet, but
+    would if every disk condition inside its ``leaving_soon_offset_percent``
+    band had already crossed its threshold.
+    """
     parts = []
     for condition in rule["conditions"]:
         ok, detail = _eval_condition(condition, fact, now)
-        parts.append((ok, f"{condition['type']}: {detail}"))
+        near = False
+        if (
+            not ok
+            and rule["action"] == "delete"
+            and condition["type"] == "disk"
+            and condition.get("leaving_soon_offset_percent")
+        ):
+            near = _eval_disk_state(condition, fact)[0] == "near"
+        parts.append((ok, f"{condition['type']}: {detail}", near))
     if rule["match"] == "any":
-        matched = any(ok for ok, _detail in parts)
-        chosen = [detail for ok, detail in parts if ok] if matched else [detail for _ok, detail in parts]
-    else:
-        matched = all(ok for ok, _detail in parts)
+        matched = any(ok for ok, _detail, _near in parts)
+        leaving_soon = not matched and any(near for _ok, _detail, near in parts)
         if matched:
-            chosen = [detail for _ok, detail in parts]
+            chosen = [detail for ok, detail, _near in parts if ok]
+        elif leaving_soon:
+            chosen = [detail for _ok, detail, near in parts if near]
         else:
-            chosen = [detail for ok, detail in parts if not ok]
-    return matched, "; ".join(chosen)
+            chosen = [detail for _ok, detail, _near in parts]
+    else:
+        matched = all(ok for ok, _detail, _near in parts)
+        leaving_soon = not matched and all(ok or near for ok, _detail, near in parts)
+        if matched or leaving_soon:
+            chosen = [detail for _ok, detail, _near in parts]
+        else:
+            chosen = [detail for ok, detail, _near in parts if not ok]
+    return matched, "; ".join(chosen), leaving_soon
 
 
 def _eval_condition(condition: Mapping[str, Any], fact: Mapping[str, Any], now: datetime) -> tuple[bool, str]:
@@ -786,6 +892,8 @@ def _eval_condition(condition: Mapping[str, Any], fact: Mapping[str, Any], now: 
         return _eval_request(condition, fact, now)
     if condition_type == "watched_by":
         return _eval_watched_by(condition, fact)
+    if condition_type == "disk":
+        return _eval_disk(condition, fact)
     raise RuleSchemaError(f"unknown condition {condition_type}")
 
 
@@ -971,6 +1079,81 @@ def _eval_watched_by(condition: Mapping[str, Any], fact: Mapping[str, Any]) -> t
     return True, "none clear"
 
 
+def _eval_disk(condition: Mapping[str, Any], fact: Mapping[str, Any]) -> tuple[bool, str]:
+    state, detail = _eval_disk_state(condition, fact)
+    return state == "below", detail
+
+
+def _eval_disk_state(condition: Mapping[str, Any], fact: Mapping[str, Any]) -> tuple[str, str]:
+    """Classify free space as ``below``, ``near``, ``above``, or ``unknown``.
+
+    ``unknown`` means the caller gathered no usable evidence, which does not
+    match. A source whose fetch failed raises ``RuleEvaluationError`` so the
+    item is reported as ``error`` and is never a delete.
+    """
+    disk = fact.get("disk")
+    if not isinstance(disk, Mapping):
+        return "unknown", "disk facts missing"
+
+    source = condition["source"]
+    names = sorted(DISK_SOURCES - {"any"}) if source == "any" else [source]
+    entries: list[tuple[str, Mapping[str, Any]]] = []
+    gathered = False
+    for name in names:
+        data = disk.get(name)
+        if data is None:
+            continue
+        gathered = True
+        if not isinstance(data, Mapping) or data.get("error"):
+            raise RuleEvaluationError(f"disk: {name} disk space unavailable")
+        source_entries = data.get("entries")
+        if not isinstance(source_entries, (list, tuple)):
+            raise RuleEvaluationError(f"disk: {name} disk space malformed")
+        for entry in source_entries:
+            if isinstance(entry, Mapping):
+                entries.append((name, entry))
+    if not gathered:
+        return "unknown", f"{source} disk facts missing"
+
+    target = condition.get("path") or fact.get("root_folder") or item_root_folder(fact.get("arr_item"))
+    if not isinstance(target, str) or not target.strip():
+        return "unknown", "root_folder missing"
+    chosen = select_disk_entry(
+        [dict(entry, _source=name) for name, entry in entries],
+        target,
+    )
+    if chosen is None:
+        return "unknown", f"no disk entry covers {target}"
+
+    label = f"{chosen['_source']} {chosen.get('path')}"
+    free = _as_number(chosen.get("free_bytes"))
+    total = _as_number(chosen.get("total_bytes"))
+    if free is None or free < 0:
+        raise RuleEvaluationError(f"disk: {label} free space invalid")
+    if total is not None and total <= 0:
+        total = None
+
+    op = condition["op"]
+    value = float(condition["value"])
+    offset = float(condition.get("leaving_soon_offset_percent") or 0)
+    if op == "free_percent_below":
+        if total is None:
+            raise RuleEvaluationError(f"disk: {label} total space invalid")
+        measured = free / total * 100.0
+        near_limit = value + offset
+        unit = "%"
+    else:
+        measured = free / BYTES_PER_GB
+        near_limit = value + (offset / 100.0 * total / BYTES_PER_GB if total else 0.0)
+        unit = "GB"
+    described = f"{label} {measured:.4g}{unit} free"
+    if measured < value:
+        return "below", f"{described} {op} {value:g}"
+    if offset and measured < near_limit:
+        return "near", f"{described} within {offset:g}% of {op} {value:g}"
+    return "above", f"{described} not {op} {value:g}"
+
+
 def _build_report(
     items: list[dict],
     ruleset: Mapping[str, Any],
@@ -987,11 +1170,13 @@ def _build_report(
             "decisive": 0,
             "shadowed": 0,
             "not_matched": 0,
+            "leaving_soon": 0,
             "disabled": 0,
             "media_type_mismatch": 0,
             "error": 0,
             "would_delete": 0,
             "would_keep": 0,
+            "would_leave_soon": 0,
         }
         for item in items:
             row = next(entry for entry in item["rules"] if entry["id"] == rule["id"]) if item["rules"] else None
@@ -1020,6 +1205,9 @@ def _build_report(
             elif row["decisive"] and item["decision"] == "would_keep":
                 counts["decisive"] += 1
                 counts["would_keep"] += 1
+            elif row["decisive"] and item["decision"] == "would_leave_soon":
+                counts["decisive"] += 1
+                counts["would_leave_soon"] += 1
             rows.append({
                 "index": item["index"],
                 "media_type": item["media_type"],
@@ -1055,6 +1243,7 @@ def _build_report(
         "items": len(items),
         "would_delete": sum(1 for item in items if item["decision"] == "would_delete"),
         "would_keep": sum(1 for item in items if item["decision"] == "would_keep"),
+        "would_leave_soon": sum(1 for item in items if item["decision"] == "would_leave_soon"),
         "no_match": sum(1 for item in items if item["decision"] == "no_match"),
         "errors": sum(1 for item in items if item["decision"] == "error"),
         "rules": len(rules_out),
@@ -1089,25 +1278,35 @@ def _render_rule_section(rule: Mapping[str, Any]) -> list[str]:
         f"- Not matched: **{counts.get('not_matched', 0)}**",
         f"- Would delete: **{counts.get('would_delete', 0)}**",
         f"- Would keep: **{counts.get('would_keep', 0)}**",
+        f"- Would enter Leaving Soon: **{counts.get('would_leave_soon', 0)}**",
         "",
     ]
-    matched_rows = [
-        row for row in (rule.get("items") or [])
-        if row.get("status") in {"matched", "shadowed"}
-    ]
-    if not matched_rows:
+    rows = rule.get("items") or []
+    matched_rows = [row for row in rows if row.get("status") in {"matched", "shadowed"}]
+    leaving_rows = [row for row in rows if row.get("status") == "leaving_soon"]
+    if not matched_rows and not leaving_rows:
         lines.append("_No items matched._")
         lines.append("")
         return lines
-    lines.append("Matched items:")
-    lines.append("")
-    for row in matched_rows:
-        decisive = "decisive" if row.get("decisive") else "shadowed"
-        lines.append(
-            f"- [{row.get('media_type')}] {row.get('media_title')} — {decisive} "
-            f"`{row.get('would') or rule.get('action')}` — {row.get('reason')}"
-        )
-    lines.append("")
+    if matched_rows:
+        lines.append("Matched items:")
+        lines.append("")
+        for row in matched_rows:
+            decisive = "decisive" if row.get("decisive") else "shadowed"
+            lines.append(
+                f"- [{row.get('media_type')}] {row.get('media_title')} — {decisive} "
+                f"`{row.get('would') or rule.get('action')}` — {row.get('reason')}"
+            )
+        lines.append("")
+    if leaving_rows:
+        lines.append("Approaching a disk threshold (Leaving Soon, not deleted):")
+        lines.append("")
+        for row in leaving_rows:
+            decisive = "decisive" if row.get("decisive") else "not decisive"
+            lines.append(
+                f"- [{row.get('media_type')}] {row.get('media_title')} — {decisive} — {row.get('reason')}"
+            )
+        lines.append("")
     return lines
 
 

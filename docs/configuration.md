@@ -75,7 +75,7 @@ Example: Alice watched S1E3, Bob has not. With the default policy and no user ta
 
 ## Rule-based cleanup policies (issue #76)
 
-Operators can compose tags, household watch policy, age, ratings, and Seerr request source in a versioned JSON ruleset. `cleanarr.rules` evaluates that document by calling `cleanarr.policy` and returns a dry-run report grouped per rule. Evaluation does not delete and does not replace the scheduled job or webhook delete path. The schema, the built-in default rules, and the report shape are in [rules.md](rules.md).
+Operators can compose tags, household watch policy, age, ratings, Seerr request source, and disk free space in a versioned JSON ruleset. `cleanarr.rules` evaluates that document by calling `cleanarr.policy` and returns a dry-run report grouped per rule. Evaluation does not delete and does not replace the scheduled job or webhook delete path. The schema, the built-in default rules, and the report shape are in [rules.md](rules.md).
 
 `default_ruleset()` expresses the current runtime behavior: keep `safe`, `kids`, and exclusion tags; optionally keep eligible Seerr requests; delete when the household watch policy passes; delete earlier episodes when watched-ahead viewers satisfy that same policy.
 

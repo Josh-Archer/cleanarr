@@ -4,7 +4,7 @@ Cleanarr can evaluate a declarative ruleset and report what each rule would do. 
 
 Live scheduled jobs and webhooks still delete through those same policy helpers directly. A ruleset does not change that path. Grace period and Leaving Soon still apply only after the runtime has already decided to delete.
 
-Use this when you want Maintainerr-style composition: tags, who watched, age, ratings, and request source, checked before any delete.
+Use this when you want Maintainerr-style composition: tags, who watched, age, ratings, request source, and disk free space, checked before any delete.
 
 ## Load a ruleset
 
@@ -38,9 +38,10 @@ Rules run in ascending `priority`. Equal priorities keep document order. Every e
 | `would_keep` | The first matching rule has action `keep`. |
 | `would_delete` | The first matching rule has action `delete`. Nothing is deleted. |
 | `no_match` | No rule matched. This does not delete. |
-| `error` | A rule raised while evaluating, or the fact was not an object. This does not delete. |
+| `would_leave_soon` | No rule decided the item, and a `delete` rule is held back only by a `disk` threshold that free space is approaching. Nothing is deleted. See [Condition `disk`](#condition-disk). |
+| `error` | A rule raised while evaluating, a disk source could not be read, or the fact was not an object. This does not delete. |
 
-Missing age, rating, watch, or request evidence does not match. A condition that cannot prove its claim fails closed.
+Missing age, rating, watch, request, or disk evidence does not match. A condition that cannot prove its claim fails closed.
 
 `match` combines conditions inside one rule:
 
@@ -139,6 +140,40 @@ The fact must include `arr_item` (and `episode_item` when a season filter matter
 
 This tests specific accounts in `watched_by`. It does not apply the household policy. Use `watched` for that.
 
+### Condition `disk`
+
+Matches when the disk holding the item is low on free space. Use it to gate age rules so cleanup gets more aggressive as the disk fills and does nothing while there is room.
+
+| Field | Meaning |
+| --- | --- |
+| `source` | `radarr`, `sonarr`, or `any`. Default `any`. Which Arr's disk report to read. |
+| `op` | `free_percent_below` or `free_gb_below`. Both are strict: free space equal to `value` does not match. |
+| `value` | Number greater than or equal to 0. A percentage (at most 100) or a size in GB (1024³ bytes, the unit the Arr UI shows). |
+| `path` | Optional. Measure the disk holding this path instead of the item's root folder. |
+| `leaving_soon_offset_percent` | Optional number from 0 to 100. Only allowed on `delete` rules. See below. |
+
+Free space comes from the fact's `disk` entry, which the caller reads from `GET /api/v3/diskspace` on Radarr or Sonarr. The evaluator does not fetch it, and the job needs no filesystem mount.
+
+The disk entry used is the one whose path is the longest prefix of the item's root folder, compared by whole path segments. `/media/movies` is covered by `/media` and not by `/med`. The root folder is `path` on the condition, then the fact's `root_folder`, then `arr_item.rootFolderPath`, then `arr_item.path`. With `any`, entries from both Arrs are candidates. If two entries share the winning path, the one with more free space is used.
+
+The condition does not match when the fact has no `disk` entry for the source, when no root folder is known, or when no disk entry covers the path.
+
+A disk source that could not be read never deletes. If the fact records an `error` for a source the condition reads, the rule's status is `error` and the item decision is `error`. `any` reads both sources, so one failed source is enough. That matches how the cleanup runtime skips work when Radarr or Sonarr is unreachable.
+
+#### Leaving Soon offset
+
+`leaving_soon_offset_percent` widens a threshold so the report can show what is about to be deleted before the threshold is crossed. With `free_percent_below` 10 and an offset of 2, free space from 10% up to (not including) 12% is inside the band. For `free_gb_below` the offset is that percentage of the disk's total size, added to `value`.
+
+A `delete` rule whose other conditions all match and whose disk conditions are inside the band gets the status `leaving_soon`. It is not a match. With `match: any`, a rule that matches nothing is `leaving_soon` when at least one disk condition is inside the band.
+
+The first `leaving_soon` rule decides the item as `would_leave_soon` unless something decides it first:
+
+- A rule that matched earlier wins as usual.
+- A later `delete` rule that fully matches wins, as long as no `keep` rule matched in between. The item is already deletable under that rule.
+- A later `keep` rule does not win. Once the threshold is crossed the earlier `delete` rule will outrank it, so the item is leaving soon.
+
+`would_leave_soon` never deletes.
+
 ## Facts
 
 A fact is a plain object the caller already gathered. The evaluator does not fetch it.
@@ -163,6 +198,21 @@ A fact is a plain object the caller already gathered. The evaluator does not fet
 | `episode_item` | Optional Sonarr episode dict for season filters. |
 | `requests_matched` | When true, `requests` are already for this item and are not matched again. |
 | `requests_unavailable` | Seerr was enabled but the request list could not be loaded. |
+| `disk` | Map of `radarr` and/or `sonarr` to `{"entries": [{"path", "free_bytes", "total_bytes"}]}`, or to `{"error": "..."}` when the fetch failed. Leave a source out when it was not fetched. |
+| `root_folder` | Optional root folder path of the item. When omitted, `arr_item.rootFolderPath` and then `arr_item.path` are used. |
+
+### Gathering disk facts
+
+`cleanarr.disk` reads free space for the `disk` condition:
+
+```python
+from cleanarr.disk import attach_disk_facts, fetch_disk_facts
+
+disk_facts = fetch_disk_facts({"radarr": radarr_client, "sonarr": sonarr_client})
+facts = [attach_disk_facts(fact, disk_facts) for fact in facts]
+```
+
+`fetch_disk_facts` calls `diskspace` once per source and records a failed or malformed response as `{"error": ...}`. Call it once per run and reuse the result for every item. `attach_disk_facts` copies the result onto a fact and fills `root_folder` from `arr_item`. Inside the cleanup runtime, `MediaCleanup.get_disk_facts()` does the fetch and caches it for the run.
 
 Example:
 
@@ -312,6 +362,76 @@ Keep a movie Alice requested through Seerr. Otherwise delete it when it has been
 ```
 <!-- example-ruleset:end -->
 
+## Example: tiered cleanup by disk pressure
+
+Delete nothing while the movie disk has room. Below 10% free, delete watched movies added at least 30 days ago. Below 5% free, drop that to 15 days. Movies enter Leaving Soon when free space is within 2 points of a tier.
+
+<!-- disk-tiers-ruleset:start -->
+```json
+{
+  "version": 1,
+  "name": "disk-pressure-tiers",
+  "rules": [
+    {
+      "id": "protect-tags",
+      "priority": 10,
+      "action": "keep",
+      "conditions": [
+        {"type": "tag", "op": "has_any", "labels": ["keep", "kids", "safe"]}
+      ]
+    },
+    {
+      "id": "delete-critical-disk",
+      "name": "Below 5% free: delete watched movies older than 15 days",
+      "priority": 100,
+      "action": "delete",
+      "media_types": ["movie"],
+      "conditions": [
+        {
+          "type": "disk",
+          "source": "radarr",
+          "op": "free_percent_below",
+          "value": 5,
+          "leaving_soon_offset_percent": 2
+        },
+        {"type": "age", "field": "added", "op": "older_than", "days": 15},
+        {"type": "watched", "scope": "exact", "policy": "require_all_users"}
+      ]
+    },
+    {
+      "id": "delete-low-disk",
+      "name": "Below 10% free: delete watched movies older than 30 days",
+      "priority": 110,
+      "action": "delete",
+      "media_types": ["movie"],
+      "conditions": [
+        {
+          "type": "disk",
+          "source": "radarr",
+          "op": "free_percent_below",
+          "value": 10,
+          "leaving_soon_offset_percent": 2
+        },
+        {"type": "age", "field": "added", "op": "older_than", "days": 30},
+        {"type": "watched", "scope": "exact", "policy": "require_all_users"}
+      ]
+    }
+  ]
+}
+```
+<!-- disk-tiers-ruleset:end -->
+
+For a watched movie on the Radarr disk:
+
+| Free space | Added 20 days ago | Added 40 days ago |
+| --- | --- | --- |
+| 20% | `no_match` | `no_match` |
+| 11% | `no_match` | `would_leave_soon` (`delete-low-disk`) |
+| 8% | `no_match` | `would_delete` (`delete-low-disk`) |
+| 6% | `would_leave_soon` (`delete-critical-disk`) | `would_delete` (`delete-low-disk`) |
+| 4% | `would_delete` (`delete-critical-disk`) | `would_delete` (`delete-critical-disk`) |
+| Radarr unreachable | `error` | `error` |
+
 ## Dry-run report
 
 `evaluate_rules_dry_run(facts, ruleset)` returns schema version 1. `mode` is always `dry-run`. `write_rule_dry_run_artifacts` writes:
@@ -321,7 +441,7 @@ Keep a movie Alice requested through Seerr. Otherwise delete it when it has been
 | `cleanarr-rule-dry-run-report.json` | Machine-readable report. |
 | `cleanarr-rule-dry-run-report.md` | The same report, grouped under a heading per rule. |
 
-`summary` counts items that `would_delete`, `would_keep`, `no_match`, or `error`. `summary.per_rule` and `rules[]` repeat that picture for each rule: how many items matched, how many were decisive, how many were shadowed, and how many would be kept or deleted by that rule. Each rule lists every evaluated item with `status` (`matched`, `shadowed`, `not_matched`, `disabled`, `media_type_mismatch`, or `error`) and the condition reason.
+`summary` counts items that `would_delete`, `would_keep`, `would_leave_soon`, `no_match`, or `error`. `summary.per_rule` and `rules[]` repeat that picture for each rule: how many items matched, how many were decisive, how many were shadowed, and how many would be kept, deleted, or moved to Leaving Soon by that rule. Each rule lists every evaluated item with `status` (`matched`, `shadowed`, `not_matched`, `leaving_soon`, `disabled`, `media_type_mismatch`, or `error`) and the condition reason.
 
 `items[]` is the same information grouped by media item, including `decisive_rule_id`. Sensitive values are redacted with the same rules as the existing decision reports.
 
