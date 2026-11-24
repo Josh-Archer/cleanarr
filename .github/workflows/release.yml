@@ -20,6 +20,9 @@ permissions:
   packages: write
   id-token: write
 
+env:
+  DOCKER_BUILD_RECORD_RETENTION_DAYS: 3
+
 jobs:
   runner:
     permissions:
@@ -268,6 +271,7 @@ jobs:
         with:
           name: release-metadata-${{ matrix.image_name }}
           path: .release-metadata/${{ matrix.image_name }}.json
+          retention-days: 7
       - name: Summarize published image
         if: always()
         shell: bash
@@ -367,6 +371,7 @@ jobs:
         with:
           name: release-metadata
           path: release-metadata/release-metadata.json
+          retention-days: 7
 
   github-release:
     name: Create GitHub release
